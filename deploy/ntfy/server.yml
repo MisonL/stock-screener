@@ -1,0 +1,18 @@
+# ntfy 服务配置（挂载到容器 /etc/ntfy/server.yml）。
+# 改完重启：docker compose -f deploy/docker-compose.yml --project-directory . restart ntfy
+
+# 公网地址；必须换成你自己的域名（与 config/notify.yaml 的 public_host 同一域名）。
+base-url: "https://ntfy.example.com"
+
+# 前面是 cloudflared，按反向代理处理（信任 X-Forwarded-*）。
+behind-proxy: true
+
+# 默认拒绝一切访问：必须用 `ntfy user add --role=admin` 建用户、
+# `ntfy token add` 发 token，带 token 才能订阅/发布。
+auth-default-access: "deny-all"
+
+# 缓存与凭据落盘路径（与 compose 的 ./ntfy/cache、./ntfy/auth 挂载对应）。
+cache-file: "/var/lib/ntfy/cache.db"
+# 上限 1000 条（spec §7.1）：只限时间会随推送量无限增长。
+cache-size: 1000
+auth-file: "/var/lib/ntfy/auth/user.db"

@@ -1,0 +1,213 @@
+# 所有命令一律带路径基准参数（D15）：
+#   docker compose -f deploy/docker-compose.yml --project-directory . <cmd>
+# 否则 ./data ./config ./cf 会被按 deploy/ 解析成 deploy/data …
+#
+# 不发布任何宿主机端口：唯二入口是 cloudflared 的 stock.<域名> → api:5000、
+# ntfy.<域名> → ntfy:2586。三个服务都显式把代理置空，避免宿主环境变量漏进容器。
+
+# **日志轮转必须写在仓库里**：VM 的 /etc/docker/daemon.json 也配了同一组值，
+# 但那是机器状态、不进版本控制——换机器/重装 Docker 就丢，届时 json-file 默认
+# **无上限**，日志会一直涨到写满磁盘（而且不会报错）。放这里跟着仓库走。
+# 实测用量约 500KB/天（jobs 783B、api 78KB 且 99.6% 是 /healthz、ntfy 407KB），
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
+name: stock-screener
+
+services:
+  api:
+    logging: *default-logging
+    image: stock-screener:${TAG:-latest}
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+      target: prod
+    # --host 0.0.0.0 不能省：uvicorn 默认绑 127.0.0.1，cloudflared 在另一个容器里
+    # 按 http://api:5000 转发，绑回环就是公网全断而容器内 healthcheck 照样绿。
+    command: uvicorn api.main:app --host 0.0.0.0 --port 5000
+    env_file:
+      - ${HOME}/.config/stock-screener/llm.env
+      - ${HOME}/.config/stock-screener/notify.env
+      # **网页口令**：只在 api 上生效（agent/jobs 不对外）。文件缺失也不影响启动。
+      - path: ${HOME}/.config/stock-screener/web.env
+        required: false
+    environment:
+      # 全仓库的时间口径都是 Asia/Shanghai（交易日、EOD、预算自然日）；
+      # 容器默认 UTC 会让「今天」比人多 8 小时
+      TZ: Asia/Shanghai
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      ALL_PROXY: ""
+    # 与宿主机 ~/.config/stock-screener 属主一致（RUNBOOK 第 6 节）：/state 写续期凭据
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config:ro
+      - ${HOME}/.config/stock-screener/state:/state:rw
+    mem_limit: 512m
+    restart: unless-stopped
+    init: true
+    healthcheck:
+      # python:3.12-slim 没有 curl/wget，用 urllib 探活。
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5000/healthz',timeout=3).status==200 else 1)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  jobs:
+    logging: *default-logging
+    # 只跑调度与抓取：eod / 清理 / 备份 / 盘中快照三循环（D18 规定只有 jobs 与 backfill 碰上游）。
+    image: stock-screener:${TAG:-latest}
+    command: python -m jobs.main
+    user: "${UID:-1000}:${GID:-1000}"
+    env_file:
+      - ${HOME}/.config/stock-screener/llm.env
+      - ${HOME}/.config/stock-screener/notify.env
+    environment:
+      # 全仓库的时间口径都是 Asia/Shanghai（交易日、EOD、预算自然日）；
+      # 容器默认 UTC 会让「今天」比人多 8 小时
+      TZ: Asia/Shanghai
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      ALL_PROXY: ""
+      # **westock 扫码登录态路径**：显式传给 wb_auth_headless.mjs（见 jobs/westock_renew.py）
+      WB_CLIENT_CACHE: /host-config/wb_client.json
+      WB_SESSION_CACHE: /host-config/wb_session.json
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config:ro
+      - ${HOME}/.config/stock-screener/state:/state:rw
+      # **westock 静默续期需要扫码登录态**：wb_client/wb_session 存着上次扫码的
+      # 登录态，没有它们每次续期都要重新扫码（=永远失败，扫码只有人能做）。
+      # **只挂这两个文件**，不挂整个 ~/.config/stock-screener：
+      # 那目录里还有 web.env（网页口令）、llm.env、notify.env，容器通过 env_file
+      # 已经拿到了需要的密钥，再整目录 rw 只会白白多暴露一份口令。
+      # rw 是必须的：refresh_token 会轮换，脚本要写回 wb_session.json
+      # （它用 writeFileSync 就地覆盖，不做 rename，所以单文件绑挂可行）。
+      - ${HOME}/.config/stock-screener/wb_client.json:/host-config/wb_client.json:rw
+      - ${HOME}/.config/stock-screener/wb_session.json:/host-config/wb_session.json:rw
+    mem_limit: 1g
+    restart: unless-stopped
+    init: true
+    healthcheck:
+      # 判「最近 2 分钟刷新过」而不是「文件存在」：文件一旦 touch 就永远在，
+      # 主循环卡死时照样绿。心跳线程无条件每 30 秒 touch，非交易时段也刷。
+      # compose 里 $ 要写成 $$，否则被插值吞掉。
+      test:
+        - CMD-SHELL
+        - test -n "$$(find /tmp/jobs_healthy -mmin -2 2>/dev/null)" || exit 1
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      # 冷启动（DB 迁移 + 首次快照）最长 5 分钟；定时任务在 08:50/15:05/16:00 才有动作
+      start_period: 300s
+
+  agent:
+    logging: *default-logging
+    # 第一批只有心跳空壳（不 import llm）。
+    image: stock-screener:${TAG:-latest}
+    command: python -m agent.main
+    user: "${UID:-1000}:${GID:-1000}"
+    env_file:
+      - ${HOME}/.config/stock-screener/llm.env
+      - ${HOME}/.config/stock-screener/notify.env
+    environment:
+      # 全仓库的时间口径都是 Asia/Shanghai（交易日、EOD、预算自然日）；
+      # 容器默认 UTC 会让「今天」比人多 8 小时
+      TZ: Asia/Shanghai
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      ALL_PROXY: ""
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config:ro
+      - ${HOME}/.config/stock-screener/state:/state:rw
+    mem_limit: 512m
+    restart: unless-stopped
+    init: true
+
+  ntfy:
+    logging: *default-logging
+    image: binwiederhier/ntfy:v2.15.0
+    # 与宿主机 ntfy/cache、ntfy/auth 属主一致：默认 root 会在 bind mount 里留下 root 文件
+    user: "${UID:-1000}:${GID:-1000}"
+    # --listen-http :2586 必须显式给：镜像默认监听 :80。
+    # --auth-file 必须给：否则 ntfy user add / token add 报 auth is unconfigured。
+    command: serve --listen-http :2586 --cache-duration 7d --visitor-request-limit-burst 120 --auth-file /var/lib/ntfy/auth/user.db
+    environment:
+      # 全仓库的时间口径都是 Asia/Shanghai（交易日、EOD、预算自然日）；
+      # 容器默认 UTC 会让「今天」比人多 8 小时
+      TZ: Asia/Shanghai
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      ALL_PROXY: ""
+    volumes:
+      - ./ntfy/cache:/var/lib/ntfy
+      - ./ntfy/auth:/var/lib/ntfy/auth
+      - ./deploy/ntfy/server.yml:/etc/ntfy/server.yml:ro
+    expose:
+      - "2586"
+    mem_limit: 64m
+    restart: unless-stopped
+    init: true
+
+  backfill:
+    logging: *default-logging
+    # 一次性工具（Task 11）：首次全量回填 / 小批量验证 / 复权对拍。
+    # **执行前必须 `docker compose stop jobs`**——backfill 与 jobs 共用同一上游限速出口（D18）。
+    # 用法：docker compose -f deploy/docker-compose.yml --project-directory . --profile tools \
+    #         run --rm backfill python -m jobs.backfill --limit 300
+    image: stock-screener:${TAG:-latest}       # 复用 prod 镜像，不重复 build
+    # 与 jobs 同一个 uid：backfill 写出的 market.db 若归 root，随后非 root 的 jobs 读写被拒。
+    user: "${UID:-1000}:${GID:-1000}"
+    env_file:
+      - ${HOME}/.config/stock-screener/llm.env
+      - ${HOME}/.config/stock-screener/notify.env
+    environment:
+      # 全仓库的时间口径都是 Asia/Shanghai（交易日、EOD、预算自然日）；
+      # 容器默认 UTC 会让「今天」比人多 8 小时
+      TZ: Asia/Shanghai
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      ALL_PROXY: ""
+      SS_FORCE_FALLBACK: "${SS_FORCE_FALLBACK:-}"
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config:ro
+      # 只挂 state/ 子目录：同目录还有 llm.env / notify.env，整目录可写等于让所有容器都能改写密钥。
+      - ${HOME}/.config/stock-screener/state:/state:rw
+    mem_limit: 1g
+    init: true
+    profiles:
+      - tools
+
+  cloudflared:
+    logging: *default-logging
+    # 锁定具体版本，不用 latest：latest 会在某次 up 时静默升级并改掉 --config 行为。
+    # 2026.10.3 是 spec §7.0 记录的全链路实测版本。
+    image: cloudflare/cloudflared:2026.10.3
+    user: "${UID:-1000}:${GID:-1000}"
+    command: tunnel --no-autoupdate --config /etc/cloudflared/config.yml run
+    environment:
+      # 全仓库的时间口径都是 Asia/Shanghai（交易日、EOD、预算自然日）；
+      # 容器默认 UTC 会让「今天」比人多 8 小时
+      TZ: Asia/Shanghai
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      ALL_PROXY: ""
+    volumes:
+      - ./cf:/etc/cloudflared:ro
+    mem_limit: 64m
+    restart: unless-stopped
+    init: true
+    depends_on:
+      - api
+      - ntfy

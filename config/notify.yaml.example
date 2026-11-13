@@ -1,0 +1,19 @@
+# public_host 必须与 cf/config.yml 的第一个 hostname、deploy/ntfy/server.yml 的 base-url 同域；
+# 占位符统一用 example.com 系，换域名时三处一起改（RUNBOOK 第 1 节有清单）。
+public_host: stock.example.com
+ntfy_url: http://ntfy:2586
+topic: stock-alerts
+daily_cap: 60
+dedupe_min: 30
+p1_merge:
+  count: 3
+  window_s: 60
+sector_merge:
+  count: 3
+  window_s: 300
+overflow_digest_s: 300
+open_brief_top: 15
+p0:
+  score: 80
+  vol: 2.5
+p1_score: 60

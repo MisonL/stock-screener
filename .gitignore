@@ -1,0 +1,36 @@
+.firecrawl/
+
+# 运行时数据与密钥（密钥只在 VM 的 ~/.config/stock-screener/，不进仓库）
+# 目录模式一律根锚定（前导 /）：不锚定的 `cf/` 会连 deploy/cf/ 一起忽略，
+# 把部署模板 deploy/cf/config.yml.example 挡在 git 外。
+/data/
+*.db*
+*.sqlite*
+# `.env` / `.env.local` / `.env.production` 全部忽略；`.env.example` 仍可提交
+.env
+.env.*
+**/.env
+**/.env.*
+!**/*.env.example
+
+# 部署运行时目录（仓库根）
+/cf/
+/ntfy/auth/
+/ntfy/cache/
+
+# 依赖与构建产物
+node_modules/
+/web/node_modules/
+/web/dist/
+**/__pycache__/
+**/.pytest_cache/
+
+# 本地工具临时目录
+/.superpowers/
+.tmp_smoke/
+/.runtime/
+
+# 编辑器与系统文件
+.DS_Store
+.idea/
+.vscode/

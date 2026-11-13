@@ -1,0 +1,283 @@
+"""Codex 复核 P1/P2 的回归钉（每条都对着一个「单测全绿、生产必挂」的失败模式）。"""
+from __future__ import annotations
+
+import ast
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from llm.client import LlmResult
+
+
+# ---- P1-2：真实 SDK 返回的是 message，调用方读 result.content ----
+
+
+def test_llm_result_exposes_content_and_tool_calls():
+    """真实 `LlmResult.message` 是 pydantic 模型；没有这两个视图属性，
+    生产路径每一次正常回复都会 AttributeError（假对象自带 content，永远发现不了）。"""
+    msg = SimpleNamespace(content=" 你好 ", tool_calls=[{"id": "c1"}])
+    r = LlmResult(message=msg, usage=None, attempts=1, latency_ms=10)
+    assert r.content == " 你好 "
+    assert r.tool_calls == [{"id": "c1"}]
+    r2 = LlmResult(message=SimpleNamespace(content=None), usage=None, attempts=1, latency_ms=1)
+    assert r2.content is None and r2.tool_calls == []
+
+
+def test_tool_call_id_works_on_sdk_objects():
+    """SDK 的工具调用对象没有 `.get()`：`c.get("id")` 在生产路径会 AttributeError。"""
+    from agent.loop import _call_id
+
+    class SdkCall:
+        id = "call_abc"
+
+    assert _call_id(SdkCall()) == "call_abc"
+    assert _call_id({"id": "call_x"}) == "call_x"
+    assert _call_id(SimpleNamespace()) is None
+
+
+# ---- P1-1 / P1-3：agent 进程入口 ----
+
+
+def test_agent_main_entry_awaits_run_and_starts_heartbeat():
+    """compose 跑 `python -m agent.main`。
+
+    两条都是「容器秒退、单测全绿」的类型：
+    - `AgentMain(...).run()` 是协程，不 `asyncio.run` 就只是建了个协程对象；
+    - 没有 Heartbeat 线程，watchdog 120 秒后判 agent_down。
+    """
+    src = Path("agent/main.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    main_fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
+    text = ast.get_source_segment(src, main_fn) or ""
+    assert "asyncio.run(" in text, "入口没 await 主循环"
+    assert "Heartbeat(" in text, "入口没启动心跳线程"
+    assert "budget_exhausted" in text, "心跳没带 budget_exhausted（规则 3 抑制读不到）"
+
+
+# ---- P1-4：通道 B 的开口必须走 agent_note ----
+
+
+def test_loop_routes_channel_b_to_agent_note():
+    """通道 B 事件由 jobs 模板发第一段，agent 没有第一段可追加。
+
+    一律走 second_segment 的话，B 事件的开口决定会被静默丢弃。
+    """
+    src = Path("agent/loop.py").read_text(encoding="utf-8")
+    assert 'trigger.channel == "A"' in src
+    # B 分支必须存在，且不是二段
+    idx = src.index('trigger.wake_kind == "event" and trigger.channel == "A"')
+    tail = src[idx:]
+    assert "agent_note" in tail[:1200]
+
+
+# ---- P1-5：标题跟着方向走 ----
+
+
+def test_push_title_follows_direction_not_model_title():
+    from agent.decision import TurnDecision
+    from agent.push import _title
+
+    d = TurnDecision(kind="speak", speak=True, level="P1", direction="breakdown",
+                     title="贵州茅台 放量突破")
+    assert "跌破" in _title(d, "600519")
+    assert "突破" not in _title(d, "600519"), "标题与正文方向矛盾"
+
+
+# ---- P1-7：推送是同步阻塞，必须放线程 ----
+
+
+def test_pushes_happen_off_the_event_loop():
+    """ntfy 一次可阻塞 10 秒、westock 15 秒；在 wait_for 里同步调，取消就失效。"""
+    src = Path("agent/loop.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    threaded = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        if not (isinstance(fn, ast.Attribute) and fn.attr == "to_thread"):
+            continue
+        first = node.args[0] if node.args else None
+        if isinstance(first, ast.Attribute):
+            threaded.add(first.attr)
+    for name in ("second_segment", "agent_note", "open_second_segment"):
+        assert name in threaded, f"{name} 是同步阻塞调用，没放 asyncio.to_thread"
+
+
+# ---- P1-8：失败尝试也要记账 ----
+
+
+def test_failed_attempt_usage_is_charged():
+    """失败的尝试也不能白花额度。
+
+    普通扣减模型下"记账"发生在发请求**之前**（`deduct` 不可退），所以失败
+    路径的正确断言是「扣过」而不是「事后补记一次」。
+    """
+    src = Path("agent/loop.py").read_text(encoding="utf-8")
+    # 断言「接了扣减回调」用前缀匹配：签名后面可能带 state（轮数统计要用）
+    assert "deduct=_deduct(deps" in src, "主回合没有接扣减回调"
+    assert "_charge_usage" not in src, "旧的事后补记 helper 不该留着"
+
+
+# ---- P2-4：回合级工具返回 ----
+
+
+def test_grounding_uses_per_turn_returns_not_cumulative():
+    """`ToolRegistry._returns` 跨回合累计：上一回合查过报价、本回合没查却引用同一个
+    旧数字时，用累计值校验会「恰好通过」——正是出处校验要防的事。"""
+    src = Path("agent/loop.py").read_text(encoding="utf-8")
+    assert "tool_returns: dict[str, list[dict]] = {}" in src
+    assert "returns_this_turn" not in src
+
+
+# ---- P2-5：闹钟带回标的 ----
+
+
+def test_alarm_wakeup_carries_target():
+    src = Path("agent/main.py").read_text(encoding="utf-8")
+    assert 'target=alarm.get("target")' in src
+    assert "_first_target(trigger)" in src
+
+
+# ---- P2-1：每轮都要查预算 ----
+
+
+def test_budget_checked_every_round_not_just_once():
+    """见 `tests/agent/test_token_accounting.py::test_budget_exhausted_stops_further_llm_calls`。
+
+    这里原来是源码字符串断言（`"deps.budget.allow(" in loop_body`）：把条件改成
+    `and False`（行为已失效）它仍然绿，而且新模型里 `budget.allow` 根本不在回合
+    循环里——这条测试只是在「看起来有测试」。已换成真跑 `run_turn` 的行为测试。
+    """
+    pytest.skip("已由 test_budget_exhausted_stops_further_llm_calls 行为级覆盖")
+
+
+# ---- P2-2 / P2-3：注意力层 ----
+
+
+def test_merge_does_not_duplicate_single_events(tmp_path):
+    """锚点重新起窗时不能把同一事件 append 两次（会多跑回合、日志里出现重复 id）。"""
+    import json as _json
+    from datetime import datetime as _dt, timedelta as _td
+
+    from agent.attention import AttentionLayer
+    from core.clock import FixedClock as _FC
+    from core.db import connect as _connect, migrate as _migrate
+    from tests.helpers import SH as _SH
+
+    conn = _connect(tmp_path / "a.db")
+    _migrate(conn)
+    t0 = _dt(2026, 10, 30, 10, 30, tzinfo=_SH)
+    cfg = SimpleNamespace(notify=SimpleNamespace(
+        sector_merge=SimpleNamespace(window_s=300), dedupe_min=30, daily_cap=60),
+        agent=SimpleNamespace(attention=SimpleNamespace(shadow_mode=False), channel_b_daily_cap=15,
+                              fatigue=SimpleNamespace(free=10, step=10, **{"raise": 0.1})),
+        strategy=SimpleNamespace(attention=SimpleNamespace(salience_min=0.1, base=0.5)))
+    # 同行业 2 只（不足 3 只）→ 不进合并组，也不该被重复收进 singles
+    for i in range(2):
+        conn.execute(
+            "INSERT INTO event_log(id, ts, trade_date, market, kind, scope, target, payload,"
+            " salience, escalated, agent_status, dedupe_key) VALUES"
+            " (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (i + 1, (t0 + _td(seconds=i * 10)).isoformat(), 20261030, "cn_main", "near_breakout",
+             "stock", f"sh60000{i}",
+             _json.dumps({"code": f"sh60000{i}", "industry": "半导体"}), 0.6, 0, "new", f"k{i}"))
+    conn.commit()
+    groups = AttentionLayer(conn, cfg, _FC(t0)).poll()
+    ids = [e.id for g in groups for e in g.events]
+    assert sorted(ids) == [1, 2], f"事件被重复收进组：{ids}"
+
+
+def test_merged_group_members_are_deduped(tmp_path):
+    """合并组成员也要过 30 分钟去重，且去重后不足 3 只就不再是「板块级」。
+
+    原来的做法只对 singles 去重：组里某只 20 分钟前刚说过，仍会被合并条带一遍
+    ——同一只票一天说两遍，还占一次通道 B 额度。
+    """
+    from datetime import datetime as _dt
+
+    from agent.attention import AttentionLayer
+    from core.clock import FixedClock as _FC
+    from core.db import connect as _connect, migrate as _migrate
+    from core.config import load_config as _lc
+    from pathlib import Path as _P
+    from tests.helpers import SH as _SH
+
+    CFG = _lc(_P("config"))
+    conn = _connect(tmp_path / "b.db")
+    _migrate(conn)
+    t0 = _dt(2026, 10, 30, 10, 30, tzinfo=_SH)
+    cfg = SimpleNamespace(notify=SimpleNamespace(
+        sector_merge=SimpleNamespace(window_s=300), dedupe_min=30, daily_cap=60),
+        agent=SimpleNamespace(attention=SimpleNamespace(shadow_mode=False), channel_b_daily_cap=15,
+                              fatigue=SimpleNamespace(free=10, step=10, **{"raise": 0.1})),
+        # 显著性来自真配置：手搓 SimpleNamespace 会一路漏字段（base/breadth/focus…）
+        strategy=CFG.strategy)
+
+    def ev(eid, code, ts, status="new"):
+        conn.execute(
+            "INSERT INTO event_log(id, ts, trade_date, market, kind, scope, target, payload,"
+            " salience, escalated, agent_status, dedupe_key) VALUES"
+            " (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (eid, ts.isoformat(), 20261030, "cn_main", "breakdown", "stock", code,
+             '{"industry": "半导体"}', 0.6, 1 if status != "new" else 0, status, f"k{eid}"))
+        conn.commit()
+
+    # 三只同行业：**同一批都是 new**，但 A 在 20 分钟前（另一批）已经说过。
+    # 1 只留一个 done 行（同 code 同 kind 的「已说过」记录）+ 本批的 new 行。
+    ev(1, "sh600001", t0.replace(minute=10), status="done")
+    for eid, code in ((11, "sh600001"), (12, "sh600002"), (13, "sh600003")):
+        ev(eid, code, t0)
+    groups = AttentionLayer(conn, cfg, _FC(t0)).poll()
+    ids = [e.id for g in groups for e in g.events]
+    assert ids == [12, 13], f"去重后应只剩 12、13（各自成组），实际 {ids}"
+    assert all(g.kind == "event" for g in groups), "不足 3 只不该再产出合并条"
+    row = conn.execute("SELECT count(*) FROM agent_turn WHERE decision='deduped'").fetchone()[0]
+    assert row == 1, "被去重的成员要有留痕"
+
+
+# ---- 第四轮：记账参数类型（漏账根因）--------------------------------------
+
+
+def test_auditor_records_usage_for_logs():
+    """真实用量要进 `state["usage"]`（日志页 tokens 读它），且写进审计表。
+
+    第四轮的教训：记账 helper 取错字段 → 用量静默漏记、日志 tokens 恒 NULL。
+    这里用真实回放验证「记进去了」。
+    """
+    from agent.loop import _make_auditor
+
+    class _Budget:
+        def __init__(self):
+            self.seen = []
+
+        def audit(self, usage, **kw):
+            self.seen.append(usage)
+
+    budget = _Budget()
+    state: dict = {"usage": None}
+    usage = SimpleNamespace(prompt_tokens=100, completion_tokens=50, total_tokens=150)
+    _make_auditor(SimpleNamespace(budget=budget), state)(1, usage, False, 100, 200)
+    assert len(budget.seen) == 1, "用量没进审计"
+    assert state["usage"] is usage
+
+
+def test_main_round_charges_real_usage():
+    """主回合三条出口（成功/失败/取消）各自记账一次，且都在构造结果之前。
+
+    行为验证在 `tests/agent/test_token_accounting.py`；这里只钉住「不再用 finally」
+    这件事——用 finally 时 except 分支先构造结果、后补账，导致日志 tokens 恒为 NULL。
+    """
+    src = Path("agent/loop.py").read_text(encoding="utf-8")
+    start = src.index("result = await deps.llm.chat(msgs, tools, max_tokens=MAX_TOKENS")
+    end = src.index('usage = state.get("usage") or usage')
+    chat_block = src[start:end]
+    # 额度在 chat 内部按 attempt 扣；审计在 on_attempt 回调里做
+    assert "deduct=_deduct(deps" in chat_block, "主回合没接扣减回调"
+    assert "on_attempt=" in chat_block, "没有审计回调"
+    assert "finally" not in chat_block, "记账不能放在 finally 里（结果先构造、账后补）"
+    assert "except (asyncio.CancelledError, GeneratorExit)" in chat_block, "取消路径没接"
+    assert "def _charge(deps" not in src, "旧的 result 版 helper 不能留（会被误用）"
+
+

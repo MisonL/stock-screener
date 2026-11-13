@@ -1,0 +1,48 @@
+# agent 段的全部阈值（批2）。阈值只住在这里，代码里不写默认值。
+heartbeat:
+  base_min: 5
+  tight_min: 2
+  max_min: 10
+  # 开盘与尾盘的密集时段：这两段是「错过就没了」的窗口
+  tight:
+    - ["09:15", "10:00"]
+    - ["14:30", "15:00"]
+  # 中午与午后刚开盘：没什么可看的，放松
+  relaxed:
+    - ["11:00", "11:30"]
+    - ["13:00", "13:30"]
+
+event:
+  rounds: 3
+  deadline_s: 25
+
+heartbeat_turn:
+  rounds: 6
+  deadline_s: 60
+
+context:
+  max_chars: 6000
+  sector_events: 8
+  own_history: 10
+  own_history_trim: 5
+
+channel_b_daily_cap: 15        # 通道 B（agent 主动开口）的日上限；通道 A 不计入
+
+fatigue:
+  free: 10
+  step: 5
+  raise: 0.5
+
+memory:
+  judgment_days: 5
+  per_target: 3
+  ignored_focus: 0.7
+
+pending_action_ttl_h: 24
+
+llm_down:
+  consecutive: 5
+  minutes: 10
+
+attention:
+  shadow_mode: true            # 上线头两周只记录不升级（§10）

@@ -1,0 +1,21 @@
+# 构建上下文里不送的东西：secrets、运行时数据、宿主机产物、VCS
+# 目录一律根锚定（前导 /），避免将来 web/src/data 之类同名子目录被误排除。
+.git
+.superpowers
+/tmp_smoke
+/.tmp_smoke
+/.firecrawl
+/data
+**/*.env
+**/.env
+**/.env.*
+!/**/*.env.example
+/cf
+/ntfy/auth
+/ntfy/cache
+/node_modules
+/web/node_modules
+/web/dist
+**/__pycache__
+**/.pytest_cache
+/docs

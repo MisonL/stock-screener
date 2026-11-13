@@ -1,0 +1,12 @@
+# 市场开关与时段常量同放一份文件；代码里不再写另一套默认值。
+cn_main: true
+cn_gem: true
+cn_star: true
+cn_bse: false
+hk: false
+us: false
+
+# §6.4 冻结时刻；TradingCalendar.open_time/close_time 读这两个键。
+session:
+  open_time: "09:30"
+  close_time: "14:57"

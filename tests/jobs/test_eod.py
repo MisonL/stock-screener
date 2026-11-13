@@ -1,0 +1,544 @@
+"""Task 12：每日增量（15:05 快照 append）、除权检测、ST 区间与停牌日历。"""
+from datetime import datetime as dt
+
+import pytest
+
+from core.clock import FixedClock, TradingCalendar
+from core.datasource.westock import CorpAction
+from core.models import Quote
+from jobs.eod import (
+    refresh_actions,
+    refresh_sector_members,
+    refresh_suspensions,
+    resume_dates,
+    run_eod,
+    st_status_of,
+)
+from tests.helpers import FakeWestockCli
+
+TODAY = 20261030
+
+
+def _run(env, reg, when):
+    return run_eod(env.cfg, reg, env.conn, FixedClock(when))
+
+
+def test_non_trading_day_skips(env):            # Review Focus #5：快照时间戳是 09-30，今天 10-05
+    rep = _run(env, env.reg_holiday, dt(2026, 10, 5, 15, 5))
+    assert rep.skipped
+    assert env.count("daily_bars", code="sz000001", date=20261005) == 0
+
+
+def test_eod_time_gate(env):                    # S-A13：当日 bar 只在 now ≥ close_time + 5min 才入库
+    rep = _run(env, env.reg_today, dt(2026, 10, 30, 14, 58))   # close_time 14:57 + 5min = 15:02
+    assert env.count("daily_bars", date=20261030) == 0 and rep.appended == 0
+
+
+def test_placeholder_gates(env):                # Review Focus #5：盘前占位不入库，历史一字板保留
+    env.conn.execute(
+        "INSERT INTO daily_bars VALUES ('sz000001', 20261029, 11.9, 11.9, 11.9, 11.9, 1000, 10000, 'backfill')"
+    )
+    env.conn.commit()
+    rep = _run(env, env.reg_placeholder, dt(2026, 10, 30, 15, 5))
+    assert rep.placeholders == 1 and env.count("daily_bars", code="sz000001", date=20261030) == 0
+    assert env.count("daily_bars", code="sh600080", date=20260812) == 1   # 四价相等但 volume>0
+
+
+def test_appends_today_bar_and_adj(env):        # f[5]/f[33]/f[34]/f[3] 落成当日 bar，并立即进 adj
+    rep = _run(env, env.reg_today, dt(2026, 10, 30, 15, 5))
+    assert rep.appended == 3 and env.count("daily_bars", date=20261030) == 3
+    row = env.one("daily_bars", code="sz000001", date=20261030)
+    assert (row["open"], row["high"], row["low"], row["close"]) == (12.0, 12.12, 11.88, 12.0)
+    assert row["volume"] == 2000 and row["amount"] == 24000 and row["source"] == "tencent"
+    assert env.count("daily_bars_adj", code="sz000001", date=20261030) == 1     # Task 10：新增 bar 立刻进 adj
+
+
+def test_exright_detected_writes_implied(env):  # f[4] 11.35 vs 库里 11.60
+    env.conn.execute(
+        "INSERT INTO daily_bars VALUES ('sz000001', 20260923, 11.6, 11.6, 11.6, 11.6, 1000, 10000, 'backfill')"
+    )
+    env.conn.commit()
+    for source in (env.reg_today.primary, env.reg_today.fallback):
+        source.ts = dt(2026, 9, 24, 15, 0)
+    env.reg_today.primary.set("sz000001", prev_close=11.35, price=11.20, open=11.30, high=11.40, low=11.10)
+
+    _run(env, env.reg_today, dt(2026, 9, 24, 15, 5))
+
+    row = env.one("corporate_actions", code="sz000001", ex_date=20260924)
+    assert row["source"] == "snapshot_implied"
+    assert row["implied_factor"] == pytest.approx(11.60 / 11.35)
+
+
+def test_exright_insert_is_idempotent(env):     # 与 Task 22 的盘中写者同键 → INSERT OR IGNORE，不撞 PK
+    env.conn.execute(
+        "INSERT INTO daily_bars VALUES ('sz000001', 20260923, 11.6, 11.6, 11.6, 11.6, 1000, 10000, 'backfill')"
+    )
+    env.conn.commit()
+    for source in (env.reg_today.primary, env.reg_today.fallback):
+        source.ts = dt(2026, 9, 24, 15, 0)
+    env.reg_today.primary.set("sz000001", prev_close=11.35, price=11.20, open=11.30, high=11.40, low=11.10)
+
+    _run(env, env.reg_today, dt(2026, 9, 24, 15, 5))
+    rep = _run(env, env.reg_today, dt(2026, 9, 24, 15, 5))
+
+    assert env.count("corporate_actions", code="sz000001", ex_date=20260924) == 1
+    assert rep.exrights == 0                    # 第二次被 OR IGNORE 静默跳过
+
+
+def test_exright_skipped_when_westock_dividend_exists(env):
+    env.conn.execute(
+        "INSERT INTO daily_bars VALUES ('sz000001', 20260923, 11.6, 11.6, 11.6, 11.6, 1000, 10000, 'backfill')"
+    )
+    env.conn.execute(
+        "INSERT INTO corporate_actions(code, ex_date, source, cash_per_share) "
+        "VALUES ('sz000001', 20260924, 'westock_dividend', 0.25)"
+    )
+    env.conn.commit()
+    for source in (env.reg_today.primary, env.reg_today.fallback):
+        source.ts = dt(2026, 9, 24, 15, 0)
+    env.reg_today.primary.set("sz000001", prev_close=11.35, price=11.20, open=11.30, high=11.40, low=11.10)
+
+    _run(env, env.reg_today, dt(2026, 9, 24, 15, 5))
+
+    assert env.count("corporate_actions", code="sz000001", ex_date=20260924) == 1
+    assert env.one("corporate_actions", code="sz000001", ex_date=20260924)["source"] == "westock_dividend"
+
+
+def test_gap_backfills_but_suspension_does_not(env):   # 停牌股不触发补拉，真缺口触发一次 kline_daily(code, 30)
+    env.conn.executemany(
+        "INSERT INTO daily_bars VALUES (?, 20260901, 10, 10, 10, 10, 1000, 10000, 'backfill')",
+        [("sh600519",), ("sz000001",)],
+    )
+    env.conn.commit()
+    env.reg_today.primary.set("sh600519", volume=0)        # 当日量为 0 = 停牌
+    env.reg_today.primary.pop("sz000001")                  # 快照缺行 + 历史停在 09-01 = 真缺口
+
+    rep = _run(env, env.reg_today, dt(2026, 10, 30, 15, 5))
+
+    # 缺口口径是「缺上一交易日那一根」：sz000001（历史停在 09-01）与 sh600080（历史只有 08-12）
+    # 都算真缺口；sh600519 当日在停牌集合里，不补拉。
+    assert rep.suspended == 1 and rep.gaps == 2
+    calls = set(env.reg_today.primary.kline_calls)
+    assert calls == {("sz000001", 30), ("sh600080", 30)}
+    assert env.count("daily_bars", code="sh600519", date=20261030) == 0
+
+
+def test_st_interval_opened_on_name_change(env):        # 「中国平安」→「ST平安」
+    env.conn.execute(
+        "INSERT INTO stock_status_history(code, start_date, end_date, st_status) "
+        "VALUES ('sz000001', 19900101, NULL, 'normal')"
+    )
+    env.conn.commit()
+    env.reg_today.primary.set("sz000001", name="ST平安")
+
+    _run(env, env.reg_today, dt(2026, 10, 30, 15, 5))
+
+    old = env.conn.execute(
+        "SELECT end_date FROM stock_status_history WHERE code='sz000001' AND start_date=19900101"
+    ).fetchone()
+    new = env.one("stock_status_history", code="sz000001", start_date=20261030)
+    assert old[0] == 20261029                 # 旧区间关闭在上一交易日
+    assert new["st_status"] == "ST" and new["end_date"] is None
+
+
+def test_st_first_deploy_writes_19900101(env):          # 决定 #8：首次部署按当时状态写 19900101
+    env.reg_today.primary.set("sz000001", name="ST平安")
+
+    _run(env, env.reg_today, dt(2026, 10, 30, 15, 5))
+
+    row = env.one("stock_status_history", code="sz000001", start_date=19900101)
+    assert row["st_status"] == "ST" and row["end_date"] is None
+
+
+@pytest.mark.parametrize(
+    "name,status",
+    [
+        ("中国平安", "normal"),
+        ("ST平安", "ST"),
+        ("*ST平安", "*ST"),
+        ("S平安", "ST"),          # 未股改的 S 前缀（历史变体，数字 F12）
+        ("SST天海", "ST"),        # 同时带 S 与 ST，仍按 ST 记
+        ("退市平安", "delisting"),
+    ],
+)
+def test_st_prefix_variants(name, status):
+    assert st_status_of(name) == status
+
+
+def test_refresh_suspensions_writes_calendar(env):      # D24：落 suspension_calendar
+    assert refresh_suspensions(env.cfg, env.westock, env.conn, codes=["sh600519"]) == 1
+    assert env.count("suspension_calendar", code="sh600519") == 1
+    row = env.one("suspension_calendar", code="sh600519")
+    assert (row["start_date"], row["end_date"]) == (20260901, 20260903)
+
+
+def test_refresh_suspensions_filters_by_codes(env):
+    env.westock.suspensions["sz000001"] = (20260910, 20260911)
+    assert refresh_suspensions(env.cfg, env.westock, env.conn, codes=["sh600519"]) == 1
+    assert env.count("suspension_calendar", code="sz000001") == 0
+
+
+def test_resume_dates_derived_from_calendar(env):       # end_date == 上一交易日 的 code 集合
+    env.conn.executemany(
+        "INSERT INTO suspension_calendar(code, start_date, end_date) VALUES (?, ?, ?)",
+        [("sh600519", 20260901, 20261029), ("sz000001", 20260901, 20261028)],
+    )
+    env.conn.commit()
+    assert resume_dates(env.conn, TradingCalendar(env.conn), TODAY) == {"sh600519"}
+
+
+def test_refresh_actions_overwrites_snapshot_implied(env):
+    env.conn.execute(
+        "INSERT INTO corporate_actions(code, ex_date, source, implied_factor) "
+        "VALUES ('sz000001', 20260924, 'snapshot_implied', 1.02)"
+    )
+    env.conn.commit()
+    westock = FakeWestockCli(dividends={"sz000001": [CorpAction("sz000001", 20260924, 0.25, 0.0, 0.0)]})
+
+    assert refresh_actions(env.cfg, westock, env.conn, ["sz000001"]) == 1
+    assert westock.calls == [("batch_dividend", ("sz000001",), 10)]
+
+    row = env.one("corporate_actions", code="sz000001", ex_date=20260924)
+    assert row["source"] == "westock_dividend" and row["cash_per_share"] == 0.25
+    assert env.count("corporate_actions", code="sz000001", ex_date=20260924) == 1
+
+
+class _FakeSina:
+    """`refresh_sector_members` 只需要三个方法（参数是 SinaSource，不是 registry）。"""
+
+    def __init__(self):
+        self.member_calls = []
+
+    def fetch_sector_list(self):
+        return [("new_blhy", "玻璃行业"), ("new_dzxx", "电子信息")]
+
+    def fetch_sector_members(self, sector):
+        self.member_calls.append(sector)
+        return ["sh600519", "sz000001"]
+
+
+def test_refresh_sector_members(env):
+    sina = _FakeSina()
+    assert refresh_sector_members(sina, env.conn) == 4
+    assert sina.member_calls == ["new_blhy", "new_dzxx"]
+    assert env.count("sector_member", sector="new_blhy") == 2
+    row = env.one("sector_meta", sector="new_blhy")
+    assert row["name"] == "玻璃行业" and row["kind"] == "industry"
+
+
+def test_snapshot_missing_code_is_logged(env):
+    env.reg_today.primary.pop("sh600519")
+    _run(env, env.reg_today, dt(2026, 10, 30, 15, 5))
+    assert env.one("fetch_log", code="sh600519", purpose="snapshot_eod")["status"] == "empty"
+
+
+def test_quote_model_used_for_bar(env):
+    """当日 bar 的四价来自快照 `f[5]/f[33]/f[34]/f[3]`（Quote 已按索引归位）。"""
+    q = Quote("sz000001", "中国平安", 12.0, 11.9, 12.1, 12.2, 11.8, 2000, 24000, None, None, None,
+              dt(2026, 10, 30, 15, 0), [])
+    assert (q.open, q.high, q.low, q.price) == (12.1, 12.2, 11.8, 12.0)
+
+
+def test_stale_snapshot_is_skipped_not_written(env):
+    """15:05 跑 eod 拿到 10:00 的快照：量只累计了半天，绝不能当收盘 bar 写库。"""
+    from datetime import datetime
+
+    env.reg_today.primary.set("sh600519", ts=datetime(2026, 10, 30, 10, 0))
+    rep = _run(env, env.reg_today, datetime(2026, 10, 30, 15, 5))
+
+    assert rep.stale >= 1
+    assert env.count("daily_bars", code="sh600519", date=20261030) == 0
+
+
+def test_gap_backfill_does_not_overwrite_today_snapshot(env):
+    """补拉只补今天之前：若把上游今天的盘中 K 线写回来，会覆盖刚验收的收盘 bar。"""
+    from datetime import datetime
+
+    env.conn.execute("INSERT INTO daily_bars VALUES ('sz000001', 20261028, 10,10,10,10, 1e6, 1e7, 'backfill')")
+    env.conn.commit()
+    # 快照前收 = 补回来的 10-29 收盘（10.0），现价 10.9：正常涨跌，不是除权
+    from tests.conftest import quote_row
+
+    env.reg_today.primary.rows["sz000001"] = quote_row("中国平安", 10.9, 10.0, 123456,
+                                                       open=10.5, high=10.95, low=10.45)
+    env.reg_today.primary.gap_bars = [
+        ("sz000001", 20261029, 10.0, 10.0, 10.0, 10.0, 1e6, 1e7),
+        ("sz000001", 20261030, 10.5, 10.5, 10.5, 10.5, 1.0, 1e5),   # 上游的盘中行：必须被丢弃
+    ]
+    _run(env, env.reg_today, datetime(2026, 10, 30, 15, 5))
+
+    row = env.conn.execute(
+        "SELECT close, volume FROM daily_bars WHERE code='sz000001' AND date=20261030").fetchone()
+    assert row is not None and row["volume"] == 123456.0        # 是快照的值，不是补拉的
+    assert env.count("daily_bars", code="sz000001", date=20261029) == 1      # 缺的那根补上了
+
+
+def test_snapshot_one_minute_before_close_is_stale(env):
+    """14:56 的快照不含收盘集合竞价量：不能宽限放行，必须判陈旧。"""
+    from datetime import datetime
+
+    env.reg_today.primary.ts = datetime(2026, 10, 30, 14, 56)
+    rep = _run(env, env.reg_today, datetime(2026, 10, 30, 15, 5))
+    assert rep.stale >= 1 and rep.appended == 0
+
+
+# ---- 缺口补拉的上限与去重（调研发现的三处）-------------------------------
+# 最坏情形：某天 eod 没跑成 → 次日 `last_date != prev_day` 对**全宇宙**成立，
+# 5577 只逐只 kline = 28 分钟、5577 次请求，而且这段时间独占 jobs 唯一的
+# 限速出口，三循环全部排队。上游被 WAF 封过（spec:2481），这是雪崩风险。
+
+
+def test_gap_backfill_is_capped(env, monkeypatch):
+    """缺口票数超过上限时**停止补拉并计数**，不能无限制地打上游。"""
+    from jobs import eod as eod_mod
+
+    monkeypatch.setattr(eod_mod, "GAP_MAX", 1)
+    # 三只票都缺 T-1：sz000001 / sh600080 / sh600519
+    rep = _run(env, env.reg_today, dt(2026, 10, 30, 15, 5))
+    calls = env.reg_today.primary.kline_calls
+    assert len(calls) <= 1, f"超过上限还在补拉：{calls}"
+    assert rep.gaps_deferred >= 1, "被推迟的缺口没有计数（事后查不出来）"
+
+
+def test_gap_backfill_does_not_retry_same_code(env):
+    """同一只票在一次 eod 里只补一次。
+
+    两遍循环都会命中「缺 T-1」的票，第一遍补完的必须进第二遍的排除集，
+    否则同一只票当天被拉两次。
+    """
+    rep = _run(env, env.reg_today, dt(2026, 10, 30, 15, 5))
+    calls = [c for c, _ in env.reg_today.primary.kline_calls]
+    dupes = {c for c in calls if calls.count(c) > 1}
+    assert not dupes, f"同一只票被补拉多次：{dupes}"
+
+
+def test_gap_failure_does_not_clobber_ok_log(env):
+    """缺口补拉失败不能把当天已成功的 `snapshot_eod` 行改成 0/error。
+
+    那一行代表「这只票今天的快照已入库」，被补拉失败覆盖后，
+    事后完全看不出它其实成功了。
+    """
+    from jobs import eod as eod_mod
+
+    original = eod_mod._backfill_gap
+
+    def _boom(reg, conn, code, now):
+        # 走**真实**的错误分支：记 gap_backfill，而不是手写 snapshot_eod
+        eod_mod._log(conn, code, 0, "error", now, purpose="gap_backfill")
+        return False
+
+    eod_mod._backfill_gap = _boom
+    try:
+        _run(env, env.reg_today, dt(2026, 10, 30, 15, 5))
+    finally:
+        eod_mod._backfill_gap = original
+    row = env.one("fetch_log", code="sz000001", purpose="snapshot_eod")
+    assert row["status"] == "ok" and row["n"] == 1, f"补拉失败覆盖了成功记录：{dict(row)}"
+
+
+# ---- 复用盘中 market 快照（调研：eod 又发 10 个请求拿同一份数据）---------
+
+
+def test_eod_reuses_fresh_market_snapshot(env):
+    """`snapshot_cache('market')` 是今天且不早于收盘 → **不发快照请求**。
+
+    eod 的全宇宙快照与 market 盘中快照是同一个请求（同 universe、同 CHUNK、
+    同 registry 出口）。15:05 market 循环刚写过一份，eod 却又发 10 个。
+    """
+    import json
+
+    from jobs import eod as eod_mod
+
+    # 造一份「今天、收盘后」的 market 缓存
+    rows = []
+    for code in ("sz000001", "sh600080", "sh600519"):
+        rows.append({"code": code, "name": code, "price": 12.0, "prev_close": 12.0,
+                     "open": 12.0, "high": 12.12, "low": 11.88, "volume": 2000,
+                     "amount": 24000, "ts": "2026-10-30T15:04:00"})
+    env.conn.execute(
+        "INSERT OR REPLACE INTO snapshot_cache(scope, as_of, payload) VALUES (?,?,?)",
+        ("market", "2026-10-30T15:04:00", json.dumps({"as_of": "2026-10-30T15:04:00",
+                                                      "rows": rows})))
+    env.conn.commit()
+
+    before = len(env.reg_today.primary.snapshot_calls) if hasattr(
+        env.reg_today.primary, "snapshot_calls") else 0
+    rep = _run(env, env.reg_today, dt(2026, 10, 30, 15, 5))
+    # 复用了缓存 → 没有走快照抓取
+    assert rep.reused_snapshot is True, "没有识别出可复用的 market 快照"
+
+
+def test_eod_does_not_reuse_stale_market_snapshot(env):
+    """缓存的 as_of 早于收盘时间 → 必须自己拉（否则把 10:00 的量当收盘量）。"""
+    import json
+
+    env.conn.execute(
+        "INSERT OR REPLACE INTO snapshot_cache(scope, as_of, payload) VALUES (?,?,?)",
+        ("market", "2026-10-30T10:00:00",
+         json.dumps({"as_of": "2026-10-30T10:00:00", "rows": []})))
+    env.conn.commit()
+    rep = _run(env, env.reg_today, dt(2026, 10, 30, 15, 5))
+    assert rep.reused_snapshot is False, "复用了过期快照"
+
+
+def test_eod_reuse_requires_close_buffer_not_just_close_time(env):
+    """`close_time`(14:57) 之后的缓存**仍然可能早于收盘**。
+
+    14:57 是集合竞价开始，真正的收盘价 15:00 才定。market 循环拉到 15:05，
+    所以 14:57:05 那份缓存会让复用路径把「不含收盘竞价」的量写成收盘 bar
+    ——正是本文件 `_is_stale` 声称要拦的情形。
+    """
+    import json
+
+    env.conn.execute(
+        "INSERT OR REPLACE INTO snapshot_cache(scope, as_of, payload) VALUES (?,?,?)",
+        ("market", "2026-10-30T14:57:05",
+         json.dumps({"as_of": "2026-10-30T14:57:05", "rows": [
+             {"code": "sz000001", "name": "x", "price": 12.0, "prev_close": 12.0,
+              "open": 12.0, "high": 12.12, "low": 11.88, "volume": 2000,
+              "amount": 24000, "ts": "2026-10-30T14:57:05"}]})))
+    env.conn.commit()
+    rep = _run(env, env.reg_today, dt(2026, 10, 30, 15, 5))
+    assert rep.reused_snapshot is False, "复用了 14:57:05（早于 15:00 收盘）的快照"
+
+
+def test_gap_failure_must_not_fabricate_exrights(env):
+    """补昨日失败时**不能**拿 T-2 的收盘去反推除权。
+
+    缺 T-1 时 `last_close` 是 T-2 的收盘，跟今天的 `prev_close`（T-1 收盘）比
+    必然有差——那是「正常涨跌 + 缺一根」，不是除权。写进 `snapshot_implied`
+    会污染复权价（实测偏低约 1.96%），而它正是选股输入。
+    """
+    from jobs import eod as eod_mod
+
+    # 造「有 T-2、缺 T-1」：T-2(20261028) 收盘 11.5，T-1(20261029) 缺失。
+    # 今天快照 price=11.9 / prev_close=11.9 → 若拿 T-2 的 11.5 去比，
+    # 会误判成除权 11.5/11.9 = 0.966
+    env.conn.execute(
+        "INSERT INTO daily_bars VALUES ('sz000001', 20261028, 11.5, 11.5, 11.5, 11.5, 1000, 10000, 'backfill')")
+    env.conn.commit()
+
+    original = eod_mod._backfill_gap
+    eod_mod._backfill_gap = lambda reg, conn, code, now: False      # 补拉失败
+    try:
+        rep = _run(env, env.reg_today, dt(2026, 10, 30, 15, 5))
+    finally:
+        eod_mod._backfill_gap = original
+
+    implied = env.conn.execute(
+        "SELECT * FROM corporate_actions WHERE code='sz000001' AND source='snapshot_implied'"
+    ).fetchall()
+    assert not implied, f"补拉失败仍伪造了除权因子：{[dict(r) for r in implied]}"
+
+
+def test_gap_cap_covers_both_passes_and_failures(env):
+    """`GAP_MAX` 必须约束**两遍合计的请求尝试数**，失败也算。
+
+    旧实现：第一遍的「除权前补拉」没有闸门、`report.gaps` 只数成功，
+    205 只全失败时会发 **410 次**（每只两遍各一次），而 `gaps_deferred=0`。
+
+    **不能用 `_backfill_gap` 的 lambda 替身**：那样根本不经过 registry，
+    断言 `kline_calls` 永远看不到真实请求数（这正是 Codex 抓到的假绿）。
+    这里保留真实 `_backfill_gap`，只让上游抛错。
+    """
+    from jobs import eod as eod_mod
+    from core.datasource.tencent import UpstreamError
+
+    # **必须同时进假快照**：不在快照里的票会先被「empty/stale」分支拦掉，
+    # 根本走不到缺口分支（上版测试就栽在这，变异也不会红）
+    from tests.conftest import quote_row
+
+    codes = [f"sz00{i:04d}" for i in range(6)]
+    for c in codes:
+        env.conn.execute(
+            "INSERT OR IGNORE INTO stock_meta(code, name, market, updated_at)"
+            " VALUES (?, ?, 'cn_main', '2026-10-30T00:00:00+08:00')", (c, c))
+        env.conn.execute(
+            "INSERT INTO daily_bars VALUES (?, 20261028, 10, 10, 10, 10, 1000, 10000, 'backfill')", (c,))
+        for src in (env.reg_today.primary, env.reg_today.fallback):
+            src.set(c, **quote_row("测试", 10.5, 10.0, 1000))
+    # **移除 fixture 自带的票**：sh600080 有 20260812 的 bar、sh600519/sz000001 也会
+    # 被算进缺口，混在一起就无法断言「6 只票、上限 2」
+    for src in (env.reg_today.primary, env.reg_today.fallback):
+        for c in ("sh600519", "sh600080"):
+            src.pop(c)
+    env.conn.commit()
+
+    # **包装原函数**而不是替换：`kline_calls.append` 在假源内部，
+    # 直接换成抛错的 lambda 会让计数器永远是空，断言恒真（就是假绿来源）。
+    src = env.reg_today.primary
+    real_kline = src.fetch_kline_daily
+
+    def boom(code, count=1700, end=None, scope="backfill"):
+        src.kline_calls.append((code, count))     # 先记账（真实请求已经发出）
+        raise UpstreamError("upstream down")
+
+    old_max = eod_mod.GAP_MAX
+    eod_mod.GAP_MAX = 2
+    src.fetch_kline_daily = boom
+    src.kline_calls.clear()
+    try:
+        rep = _run(env, env.reg_today, dt(2026, 10, 30, 15, 5))
+    finally:
+        eod_mod.GAP_MAX = old_max
+        src.fetch_kline_daily = real_kline
+
+    calls = len(src.kline_calls)
+    assert calls == 2, f"失败的缺口补拉没有被上限约束：{calls} 次（上限 2）"
+    assert rep.gaps_deferred >= 1, "被推迟的缺口没有计数"
+
+
+
+def test_deferred_gaps_are_persisted_for_next_run(env):
+    """被推迟的缺口必须**落库**，否则下次 eod 看不到、backfill 也会跳过它。
+
+    旧实现只有一个内存计数 `gaps_deferred`：今天的 bar 照样追加，明天
+    `last_date` 已经是昨天，eod 认为没有缺口；而 `backfill` 的 resume 按
+    `fetch_log purpose='backfill' status='ok'` 跳过，这 5 只票永远不会被补。
+    历史空洞就此永久留在 raw/adj 里。
+    """
+    from jobs import eod as eod_mod
+
+    env.conn.execute(
+        "INSERT INTO daily_bars VALUES ('sz000001', 20261028, 11.5, 11.5, 11.5, 11.5, 1000, 10000, 'backfill')")
+    env.conn.commit()
+
+    old = eod_mod.GAP_MAX
+    eod_mod.GAP_MAX = 0                      # 全部推迟
+    try:
+        rep = _run(env, env.reg_today, dt(2026, 10, 30, 15, 5))
+    finally:
+        eod_mod.GAP_MAX = old
+
+    assert rep.gaps_deferred >= 1
+    rows = env.conn.execute(
+        "SELECT code, missing_through FROM gap_pending ORDER BY code").fetchall()
+    assert len(rows) >= 1, "推迟的缺口没有落库，下次运行无从得知"
+    # 落库条数 = 推迟的 − 之后补拉成功被清掉的
+    assert len(rows) == rep.gaps_deferred - rep.gaps, (
+        f"推迟 {rep.gaps_deferred}、补成功 {rep.gaps}、落库 {len(rows)}，对不上")
+
+
+def test_deferred_gap_still_appends_today_bar(env):
+    """配额用尽只推迟**K 线补拉**，当天快照 bar 必须照常写入。
+
+    我加配额时写了 `continue`，把同一次循环里的当日 bar 组装也跳过了——
+    205 只超限时只有 199 只写了当天 bar，6 只有效快照被丢弃。
+    用一次补拉请求换一天的数据，方向反了。
+    """
+    from jobs import eod as eod_mod
+
+    env.conn.execute(
+        "INSERT INTO daily_bars VALUES ('sz000001', 20261028, 11.5, 11.5, 11.5, 11.5, 1000, 10000, 'backfill')")
+    env.conn.commit()
+
+    old = eod_mod.GAP_MAX
+    eod_mod.GAP_MAX = 0                       # 全部推迟补拉
+    try:
+        rep = _run(env, env.reg_today, dt(2026, 10, 30, 15, 5))
+    finally:
+        eod_mod.GAP_MAX = old
+
+    assert rep.gaps_deferred >= 1
+    assert env.count("daily_bars", code="sz000001", date=20261030) == 1, \
+        "补拉被推迟，但当天快照 bar 也一起丢了"

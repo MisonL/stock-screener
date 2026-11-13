@@ -1,0 +1,620 @@
+"""每日增量（15:05 快照 append）：把当日快照落成 raw 日线。
+
+一天只做四件事，顺序固定：
+
+1. **快照与入库**：按 600 只/请求拉全宇宙（`stock_meta`）快照 → 快照时间戳不是今天就
+   整体跳过（非交易日/上游还停在上一个交易日）→ 每只由快照组装当日 `Bar` → 过
+   `Bar.is_placeholder` 的三重门（含时间门：当日 bar 只在 `close_time + 5min` 之后才定盘）。
+2. **除权**：`f[4]`（快照前收）与库里上一根 raw 收盘差超过 `universe.price_eps` 即当日除权，
+   当日没有 `westock_dividend` 记录时补一条 `source='snapshot_implied'`（**`INSERT OR IGNORE`**：
+   Task 22 的盘中路径也写同一个 `(code, ex_date, source)`，两个写者同键值一致，先到者胜）。
+3. **停牌与缺口**：当日量为 0 或时间戳停滞 = 停牌，不写 bar；最后一根 bar 早于上一交易日
+   且不是停牌 = 缺口，单只 `kline_daily(code, 30)` 补拉。
+4. **名称与复权**：名称前缀（`ST`/`*ST`/`S`/`SST`/`退`）变化时关闭旧 `stock_status_history`
+   区间、开新区间；对改动过的代码 `rebuild_adj`（新增当日 bar 必须立刻能在 adj 里读到）。
+
+**只 append 当日**，不补历史：历史回填是 `jobs/backfill.py` 的事，两者不同时运行（D18）。
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
+
+from core.adjust import rebuild_adj
+from core.clock import SH, TradingCalendar, snapshot_is_today
+from core.models import Bar
+
+# 快照 600 只/请求（§6.1.2.2 的运营值）
+CHUNK = 600
+# 缺口补拉只取最近 30 根：缺口是「最后一天没落库」，不是重放全历史
+GAP_COUNT = 30
+# 单次 eod 最多补拉多少只。**必须有上限**：某天 eod 没跑成时，次日
+# `last_date != prev_day` 对全宇宙成立，5577 只 × 300ms ≈ 28 分钟，而且
+# 这段时间独占 jobs 唯一的限速出口，三循环全部排队。上游被 WAF 封过一次
+# （spec:2481「不是 60 秒能恢复的，代价是整条 K 线链路不可用」），
+# 无上限补拉正好撞在这个雷上。超出的记 `gaps_deferred`，交给 backfill。
+GAP_MAX = 200
+# 当日 bar 只有到 close_time + 5min 才是收盘 bar（S-A13）
+CLOSE_BUFFER_MIN = 5
+# 决定 #8：首次部署按当时状态写一条从上线日（1990-01-01）起的区间
+FIRST_DEPLOY_DATE = 19900101
+# 停牌日历的回看窗口（D24：近 250 日）
+SUSPENSION_DAYS = 250
+
+# 名称前缀 → stock_status_history.st_status。**顺序不能换**（`*ST` 先于 `ST`，
+# `SST`/`ST`/`S` 都是「特别处理」的历史写法，数字 F12）。
+ST_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("退", "delisting"),
+    ("*ST", "*ST"),
+    ("SST", "ST"),
+    ("ST", "ST"),
+    ("S", "ST"),
+)
+
+
+@dataclass
+class EodReport:
+    skipped: bool = False       # 非交易日 / 错日快照 / 时间门未到，整体没做事
+    appended: int = 0
+    placeholders: int = 0
+    exrights: int = 0
+    gaps: int = 0
+    gaps_deferred: int = 0      # 超过 `GAP_MAX` 被推迟的缺口票数（交给 backfill）
+    reused_snapshot: bool = False   # 复用了盘中 market 快照（省掉 10 个请求）
+    suspended: int = 0
+    stale: int = 0              # 快照是今天的但早于收盘（15:05 拿到 10:00 那份）
+
+
+def st_status_of(name: str) -> str:
+    """名称 → `st_status`（`normal` / `ST` / `*ST` / `delisting`）。"""
+    text = (name or "").strip()
+    if not text:
+        return "normal"
+    for prefix, status in ST_PREFIXES:
+        if text.startswith(prefix):
+            return status
+    return "normal"
+
+
+def run_eod(cfg, reg, conn, clock) -> EodReport:
+    """15:05 的每日增量。`reg` 是 `SourceRegistry`，`clock` 是 `Clock`。"""
+    today = clock.today()
+    report = EodReport()
+
+    codes = [row[0] for row in conn.execute("SELECT code FROM stock_meta ORDER BY code")]
+    if not codes:
+        report.skipped = True                 # 宇宙还没回填，什么也没有可标的
+        return report
+
+    today_date = _as_date(today)
+
+    cal = TradingCalendar(conn)
+    close_time = cal.close_time(today) or str(cfg.markets.session.close_time)
+    now = clock.now()
+    if _minutes(now.time()) < _minutes(close_time) + CLOSE_BUFFER_MIN:
+        report.skipped = True                 # 时间门：当日 bar 还没定盘
+        return report
+
+    # 快照放最后取：只有确定要出 bar 才花请求，且此时已知 close_time（复用判据要用）
+    reused = _reuse_market_snapshot(conn, codes, today, close_time, now)
+    if reused is not None:
+        quotes, source_of = reused
+        report.reused_snapshot = True
+    else:
+        quotes, source_of = _snapshot(reg, codes)
+
+    # **交易日闸必须在拿到快照之后**：复用的缓存行和现拉的结果都要过这一关，
+    # 否则非交易日（上游还停在上一交易日）会被当成当天出 bar。
+    if not any(q.ts is not None and snapshot_is_today(q.ts, today_date) for q in quotes.values()):
+        report.skipped = True
+        return report
+
+    prev_day = _prev(cal, today)
+    eps = float(cfg.strategy.universe.price_eps)
+
+    changed: set[str] = set()
+    suspended: set[str] = set()
+    filled: set[str] = set()
+    # **两遍共用的尝试配额**：成功与失败都消耗，避免「第一遍没闸门、
+    # 失败被两遍各拉一次」把限流保护绕过去（实测 205 只全失败会发 410 次）。
+    attempted: set[str] = set()
+    reported: set[str] = set()          # 本轮已补拉并计入 gaps 的票，第二遍不再重复补
+    last_dates: dict[str, int | None] = {}
+
+    with conn:                                # 跨表写入单事务
+        for code in codes:
+            # 只看到「今天之前」的最后一根：重复跑 eod 时昨天那根仍是除权比对的基准，
+            # 拿今天自己的 bar 当天会天天误判一次除权。
+            last = conn.execute(
+                "SELECT date, close FROM daily_bars WHERE code = ? AND date < ? "
+                "ORDER BY date DESC LIMIT 1",
+                (code, today),
+            ).fetchone()
+            last_date, last_close = (last[0], last[1]) if last else (None, None)
+            last_dates[code] = last_date
+
+            quote = quotes.get(code)
+            if quote is None:
+                _log(conn, code, 0, "empty", now)
+                continue
+
+            _sync_status(conn, code, quote.name, today, prev_day)
+
+            if _is_suspended(quote, today_date):
+                suspended.add(code)
+                report.suspended += 1
+                _log(conn, code, 0, "empty", now)
+                continue
+
+            if _is_stale(quote, today_date, close_time, now):
+                # 陈旧快照（15:05 拿到 10:00 那份）：量只累计了半天，写成收盘 bar 会把
+                # 量能压低、并让 C2 的折算基准永久偏小。记 stale 而不是 suspended——
+                # 它今天可能是正常交易的，只是我们这份快照太旧。
+                report.stale += 1
+                _log(conn, code, 0, "error", now)
+                continue
+
+            # 判除权前先补昨日：缺 T-1 时 last_close 是 T-2 的收盘，拿它跟今天的 f[4] 比
+            # 会把「正常涨跌 + 缺少一根」误判成除权，写出一个不存在的 snapshot_implied。
+            if prev_day is not None and last_date is not None and last_date < prev_day:
+                # 配额在**发请求前**认领：失败也消耗，且同一只票两遍只试一次
+                gapped = False
+                if code not in attempted:
+                    if len(attempted) >= GAP_MAX:
+                        # **不要 `continue`**：配额只推迟「K 线补拉」，当天快照 bar
+                        # 必须照常写。用一次补拉请求换掉一天的数据，方向反了。
+                        attempted.add(code)
+                        if _defer_gap(conn, code, last_date, now):
+                            report.gaps_deferred += 1
+                    else:
+                        attempted.add(code)
+                        gapped = _backfill_gap(reg, conn, code, now)
+                if gapped:
+                    report.gaps += 1
+                    _clear_gap(conn, code)
+                    filled.add(code)
+                    reported.add(code)
+                    row = conn.execute(
+                        "SELECT date, close FROM daily_bars WHERE code = ? AND date < ? "
+                        "ORDER BY date DESC LIMIT 1", (code, today)).fetchone()
+                    if row is not None:
+                        last_date, last_close = row[0], row[1]
+                        last_dates[code] = last_date
+
+            # **只有确认手里的收盘就是 T-1 才敢反推除权**：补拉失败/被上限推迟时
+            # `last_close` 还是 T-2 的，拿它跟今天的 `prev_close`（T-1）比，
+            # 会把「正常涨跌 + 缺一根」写成一个不存在的除权因子，污染复权价
+            # （实测偏低约 1.96%），而复权价正是选股输入。
+            comparable = prev_day is None or last_date == prev_day
+            if (comparable and last_close is not None and quote.prev_close is not None
+                    and abs(quote.prev_close - last_close) > eps):
+                if _write_implied(conn, code, today, last_close / quote.prev_close):
+                    report.exrights += 1
+                    changed.add(code)
+
+            bar = _bar(code, quote, today, source_of.get(code, "tencent"))
+            if bar.is_placeholder(today, prev_close=last_close, close_time=close_time, now=now):
+                report.placeholders += 1
+                _log(conn, code, 0, "empty", now)
+                continue
+
+            conn.execute(
+                "INSERT OR REPLACE INTO daily_bars(code,date,open,high,low,close,volume,amount,source) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (bar.code, bar.date, bar.open, bar.high, bar.low, bar.close, bar.volume, bar.amount, bar.source),
+            )
+            report.appended += 1
+            # 注意：**不要**把 last_dates 覆盖成 today。缺口检查比的是「追加之前的最后一根」，
+            # 覆盖掉就永远看不出 20261028 → 20261030 这种中间空洞（gaps 恒为 0）。
+            changed.add(code)
+            _log(conn, code, 1, "ok", now)
+
+    # 缺口补拉必须在 rebuild_adj 之前：补进来的 bar 也要进 adj，否则 raw/adj 长度不等，
+    # _evaluate 会以 no_adj 把这只票整只淘汰（等于补了个寂寞）。
+    # 判据是「有没有**昨天**那根」（上一交易日），不是「有没有今天之前某一根」：
+    # 后者会从 9 月一直补到 10 月，把每只票的 30 根重拉一遍。
+    if prev_day is not None:
+        for code in codes:
+            if code in suspended:
+                continue
+            # **`filled` 也要排除**：它只可能在第一遍被加进来，但万一以后控制流
+            # 改成多遍，缺这一条就会对同一只票反复补拉。
+            # **`attempted` 是两遍共用的配额**：第一遍试过的（无论成败）不再试
+            if code in reported or code in filled or code in attempted:
+                continue
+            last_date = last_dates.get(code)
+            if last_date == prev_day:
+                continue
+            if len(attempted) >= GAP_MAX:
+                attempted.add(code)
+                if _defer_gap(conn, code, last_date, now):
+                    report.gaps_deferred += 1
+                continue
+            attempted.add(code)
+            if _backfill_gap(reg, conn, code, now):
+                report.gaps += 1
+                _clear_gap(conn, code)
+                filled.add(code)
+
+    for code in sorted(changed | filled):
+        rebuild_adj(conn, code)               # Task 10：新增 bar 必须立刻进 adj
+    return report
+
+
+# ---- 周期任务（jobs/main.py 调度） ---------------------------------------
+
+
+def refresh_actions(cfg, westock, conn, codes) -> int:
+    """全量重拉 `dividend --years 10`，覆盖同日的 `snapshot_implied`。
+
+    **没有周期触发器**：只由 `startup_recovery` 在「距上次 ≥7 天」时补跑。
+    """
+    actions = westock.batch_dividend(list(codes), years=10)
+    written = 0
+    with conn:
+        for code, items in actions.items():
+            for action in items:
+                # 同日两源并存时 westock 是真值：先删掉快照反推的那条，再写官方那条
+                conn.execute(
+                    "DELETE FROM corporate_actions WHERE code = ? AND ex_date = ? AND source = 'snapshot_implied'",
+                    (code, action.ex_date),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO corporate_actions"
+                    "(code, ex_date, source, cash_per_share, bonus_ratio, tran_ratio, implied_factor) "
+                    "VALUES (?,?,?,?,?,?,NULL)",
+                    (code, action.ex_date, action.source, action.cash_per_share,
+                     action.bonus_ratio, action.tran_ratio),
+                )
+                written += 1
+    return written
+
+
+def refresh_suspensions(cfg, westock, conn, codes=None) -> int:
+    """停牌日历（D24）：一次区间查询落 `suspension_calendar`。
+
+    `codes` 给定时只保留这几只（`jobs/main.py` 传 `stock_meta` 全体，测试传单只）。
+    """
+    end = datetime.now(SH).date()
+    start = end - timedelta(days=SUSPENSION_DAYS)
+    rows = westock.suspension(start.isoformat(), end.isoformat())
+    wanted = None if codes is None else set(codes)
+    written = 0
+    with conn:
+        for code, begin, finish in rows:
+            if wanted is not None and code not in wanted:
+                continue
+            conn.execute(
+                "INSERT OR REPLACE INTO suspension_calendar(code, start_date, end_date) VALUES (?,?,?)",
+                (code, begin, finish),
+            )
+            written += 1
+    return written
+
+
+def resume_dates(conn, cal, today: int) -> set[str]:
+    """复牌日期 = 上一交易日 的 code 集合（`universe.resume_cooldown` 的输入）。"""
+    prev_day = _prev(cal, today)
+    if prev_day is None:
+        return set()
+    rows = conn.execute("SELECT code FROM suspension_calendar WHERE end_date = ?", (prev_day,))
+    return {row[0] for row in rows}
+
+
+def fetch_sector_members(sina) -> list[tuple[str, str, list[str]]]:
+    """**只发请求、不碰数据库**：返回 `[(sector, name, members)]`。
+
+    单独拆出来是为了让调用方能「先抓完、再加锁写」——原来 `refresh_sector_members`
+    把请求和写库交替做在同一把锁里，抓完几十个板块要好几分钟，把每秒的 tick 和
+    30 秒的心跳全堵在锁上（实测 2026-11-13 08:50 心跳因等锁超过 30 秒被跳过）。
+    """
+    out: list[tuple[str, str, list[str]]] = []
+    for sector, name in sina.fetch_sector_list():
+        out.append((sector, name, list(sina.fetch_sector_members(sector))))
+    return out
+
+
+def write_sector_members(conn, sectors: list[tuple[str, str, list[str]]]) -> int:
+    """把 `fetch_sector_members` 的结果写库（**纯本地操作，应持写锁调用**）。"""
+    written = 0
+    stamp = datetime.now(SH).isoformat()
+    with conn:
+        for sector, name, members in sectors:
+            conn.execute(
+                "INSERT OR REPLACE INTO sector_meta(sector, name, kind) VALUES (?,?,'industry')",
+                (sector, name),
+            )
+            conn.execute("DELETE FROM sector_member WHERE sector = ?", (sector,))
+            conn.executemany(
+                "INSERT OR REPLACE INTO sector_member(sector, code, updated_at) VALUES (?,?,?)",
+                [(sector, code, stamp) for code in members],
+            )
+            written += len(members)
+    return written
+
+
+def refresh_sector_members(sina, conn) -> int:
+    """每天 08:50 刷行业成分股，返回写入的成分股条数。
+
+    参数是 `SinaSource` 实例（`reg.sina`），不是 registry：板块没有降级路由。
+
+    **保留这个一次做完的入口**（测试与脚本用）；`jobs/main.py` 的定时任务走
+    `fetch_sector_members` + `write_sector_members` 两段，以便把网络请求移出锁。
+    """
+    return write_sector_members(conn, fetch_sector_members(sina))
+
+
+# ---- 内部件 ---------------------------------------------------------------
+
+
+def _reuse_market_snapshot(conn, codes: list[str], today: int, close_time: str,
+                           now: datetime):
+    """复用 `snapshot_cache('market')`：它和 eod 要的是**同一个请求**。
+
+    market 循环与 eod 用同一 universe、同一 CHUNK、同一 registry 出口，
+    15:05 时盘中循环刚写过一份（`_in_session` 含 15:05）。直接复用能省 10 个请求。
+
+    判据必须**同时**满足，否则宁可自己拉：
+    - 缓存日期是今天（隔夜的不能用）
+    - `as_of` 不早于**定盘时刻**（`close_time` + `CLOSE_BUFFER_MIN`）。注意不能只比
+      `close_time`：14:57 只是集合竞价开始，真正的收盘价 15:00 才定；market 循环
+      一直拉到 15:05，所以 14:57:05 那份缓存是「合法存在但早于收盘」的，拿它当
+      收盘 bar 会把 14:57–15:00 的收盘竞价量额静默丢掉（`_is_stale` 拦的正是这个）。
+    """
+    row = conn.execute("SELECT as_of, payload FROM snapshot_cache WHERE scope = 'market'"
+                       ).fetchone()
+    if not row or not row[1]:
+        return None
+    try:
+        import json as _json
+
+        body = _json.loads(row[1])
+        as_of = datetime.fromisoformat(body.get("as_of") or row[0])
+    except (TypeError, ValueError):
+        return None
+    if as_of.date() != _as_date(today):
+        return None
+    try:
+        hh, mm = (int(x) for x in close_time.split(":"))
+    except (ValueError, AttributeError):
+        return None
+    settled_min = hh * 60 + mm + CLOSE_BUFFER_MIN
+    if as_of.hour * 60 + as_of.minute < settled_min:
+        return None                      # 早于定盘：陈旧，宁可自己拉
+
+    want = set(codes)
+    quotes: dict = {}
+    source_of: dict[str, str] = {}
+    for item in body.get("rows") or []:
+        code = item.get("code")
+        if code not in want:
+            continue
+        quotes[code] = _quote_from_row(item)
+        source_of[code] = item.get("source") or "tencent"
+    if not quotes:
+        return None
+    return quotes, source_of
+
+
+def _quote_from_row(item: dict):
+    """`snapshot_cache` 的一行 → `Quote` 形状（`run_eod` 只读这几个字段）。"""
+    from types import SimpleNamespace
+
+    ts = item.get("ts")
+    if isinstance(ts, str):
+        try:
+            ts = datetime.fromisoformat(ts)
+        except ValueError:
+            ts = None
+    return SimpleNamespace(code=item.get("code"), name=item.get("name"),
+                           price=item.get("price"), prev_close=item.get("prev_close"),
+                           open=item.get("open"), high=item.get("high"),
+                           low=item.get("low"), volume=item.get("volume"),
+                           amount=item.get("amount"), ts=ts)
+
+
+def _snapshot(reg, codes: list[str]) -> tuple[dict, dict]:
+    """按 600 只/请求拉全宇宙；返回值名字是实际应答的源（写 `daily_bars.source`）。"""
+    quotes: dict = {}
+    source_of: dict[str, str] = {}
+    for start in range(0, len(codes), CHUNK):
+        part = codes[start:start + CHUNK]
+        chunk, used = reg.snapshot(part, scope="eod")
+        for code, quote in chunk.items():
+            quotes[code] = quote
+            source_of[code] = used
+    return quotes, source_of
+
+
+def _defer_gap(conn, code: str, missing_through: int, now: datetime) -> bool:
+    """把推迟的缺口**落库**，否则下次运行无从得知（内存计数随进程消失）。
+
+    没有这条记录时，今天的 bar 照样追加 → 明天 `last_date` 已是昨天、eod 认为
+    没有缺口；`backfill` 的默认 resume 又按 `fetch_log(backfill, ok)` 跳过。
+    两条续跑路径之后历史空洞仍然在。
+    """
+    # **先查再写**：UPSERT 的 `rowcount`/`lastrowid` 在 DO UPDATE 分支上不可靠
+    # （实测恒报「有变更」），而两遍循环会重复命同一只票，必须按「是否新增」计数，
+    # 否则 `gaps_deferred` 与 `gap_pending` 条数对不上。
+    existed = conn.execute("SELECT 1 FROM gap_pending WHERE code = ?", (code,)).fetchone()
+    if existed:
+        conn.execute(
+            "UPDATE gap_pending SET missing_through = MIN(missing_through, ?) WHERE code = ?",
+            (int(missing_through or 0), code))
+        return False
+    conn.execute(
+        "INSERT INTO gap_pending(code, missing_through, first_seen, attempts) VALUES (?,?,?,0)",
+        (code, int(missing_through or 0), now.isoformat()))
+    return True
+
+
+def _clear_gap(conn, code: str) -> None:
+    conn.execute("DELETE FROM gap_pending WHERE code = ?", (code,))
+
+
+def _is_suspended(quote, today: date) -> bool:
+    """停牌判据：当日量为 0、四价缺字段，或快照时间戳不是今天（停滞）。"""
+    if quote.volume is None or quote.volume == 0:
+        return True
+    if quote.price is None or quote.open is None or quote.high is None or quote.low is None:
+        return True
+    return quote.ts is None or not snapshot_is_today(quote.ts, today)
+
+
+def _is_stale(quote, today: date, close_time: str, now: datetime) -> bool:
+    """快照是否早于收盘（陈旧）：15:05 跑 eod 时拿到 10:00 那份，量只累计了半天，
+    写成收盘 bar 会把量能压低一截，还骗过 C2 的后续判定。
+
+    判据是「时间戳早于 close_time」，**不设宽限**——14:56 的快照只差 1 分钟，
+    但它不含收盘集合竞价的量，写进 daily_bars 会把量能基准永久压小。"""
+    if quote.ts is None:
+        return True
+    ts = quote.ts if quote.ts.tzinfo is not None else quote.ts.replace(tzinfo=SH)
+    h, m = close_time.split(':')[:2]
+    close_at = datetime.combine(ts.astimezone(SH).date(), time(int(h), int(m)), tzinfo=SH)
+    return ts.astimezone(SH) < close_at
+
+
+def _bar(code: str, quote, today: int, source: str) -> Bar:
+    """快照 → 当日 raw bar。四价 `f[5]/f[33]/f[34]/f[3]` 已由数据源按索引归位到 Quote。"""
+    return Bar(
+        code=code,
+        date=today,
+        open=quote.open,
+        high=quote.high,
+        low=quote.low,
+        close=quote.price,
+        volume=quote.volume or 0.0,
+        amount=quote.amount or 0.0,
+        source=source,
+    )
+
+
+def _write_implied(conn, code: str, ex_date: int, implied_factor: float) -> bool:
+    """写一条快照反推的除权事件；已有 `westock_dividend` 或已写过的同日记录则不动。"""
+    official = conn.execute(
+        "SELECT 1 FROM corporate_actions WHERE code = ? AND ex_date = ? AND source = 'westock_dividend'",
+        (code, ex_date),
+    ).fetchone()
+    if official is not None:
+        return False
+    if not (implied_factor and implied_factor > 0):
+        return False
+    existing = conn.execute(
+        "SELECT implied_factor FROM corporate_actions"
+        " WHERE code = ? AND ex_date = ? AND source = 'snapshot_implied'", (code, ex_date)).fetchone()
+    if existing is not None:
+        # 盘中快照已写过（口径可能是「现价/昨收」，差一个数量级）。eod 有真实日线，
+        # 是更权威的一方：值不同就**覆盖**，相同则不算一次新发现（避免 exrights 重复计数）
+        if existing[0] is not None and abs(float(existing[0]) - float(implied_factor)) < 1e-9:
+            return False
+        conn.execute(
+            "UPDATE corporate_actions SET implied_factor = ?"
+            " WHERE code = ? AND ex_date = ? AND source = 'snapshot_implied'",
+            (implied_factor, code, ex_date))
+        return True
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO corporate_actions"
+        "(code, ex_date, source, cash_per_share, bonus_ratio, tran_ratio, implied_factor) "
+        "VALUES (?,?,'snapshot_implied',0,0,0,?)",
+        (code, ex_date, implied_factor),
+    )
+    return cur.rowcount > 0
+
+
+def _sync_status(conn, code: str, name: str, today: int, prev_day: int | None) -> None:
+    """名称前缀变化时关旧区间、开新区间（决定 #8：首次部署写 `19900101`）。"""
+    status = st_status_of(name)
+    row = conn.execute(
+        "SELECT start_date, st_status FROM stock_status_history "
+        "WHERE code = ? ORDER BY start_date DESC LIMIT 1",
+        (code,),
+    ).fetchone()
+    if row is None:
+        conn.execute(
+            "INSERT OR IGNORE INTO stock_status_history(code, start_date, end_date, st_status) "
+            "VALUES (?,?,NULL,?)",
+            (code, FIRST_DEPLOY_DATE, status),
+        )
+        return
+    if row[1] == status:
+        return
+    conn.execute(
+        "UPDATE stock_status_history SET end_date = ? WHERE code = ? AND start_date = ?",
+        (prev_day or today, code, row[0]),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO stock_status_history(code, start_date, end_date, st_status) "
+        "VALUES (?,?,NULL,?)",
+        (code, today, status),
+    )
+
+
+def _backfill_gap(reg, conn, code: str, now: datetime) -> bool:
+    """单只补拉最近 30 根；上游全挂时不拖垮整轮 eod。
+
+    **只写今天之前的 bar**：`kline_daily` 会带上今天的盘中 K 线，直接 INSERT OR REPLACE
+    会把刚验收的快照收盘价/成交量覆盖成上游那一刻的值（15:05 的收盘被 14:00 的覆盖）。
+    **只写主源的 bar**：新浪日线在本设计里只用于校验，不落 `daily_bars`（决定 #3）。
+    """
+    from core.http import ForbiddenHost, UpstreamBlocked, UpstreamError, UpstreamTimeout
+
+    try:
+        bars, used = reg.kline_daily(code, GAP_COUNT)
+    except (UpstreamError, UpstreamBlocked, UpstreamTimeout, ForbiddenHost):
+        # **不覆盖已成功的 ok 行**：`snapshot_eod` 那一行表示「今天的快照已入库」，
+        # 改写成 error/0 之后，事后完全看不出这只票其实成功了
+        # （补拉失败另记 `gap_backfill` 用途，见下）。
+        # 单独记一行 `gap_backfill`（schema 004 加的 purpose），不去碰
+        # `snapshot_eod` 那行——那一行代表「今天的快照已入库」
+        _log(conn, code, 0, "error", now, purpose="gap_backfill")
+        return False
+    today = int(now.strftime("%Y%m%d"))
+    bars = [b for b in bars if b.date < today and (used == "tencent" or b.source == "tencent")]
+    if bars:
+        with conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO daily_bars(code,date,open,high,low,close,volume,amount,source) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                [(b.code, b.date, b.open, b.high, b.low, b.close, b.volume, b.amount, b.source) for b in bars],
+            )
+    return True
+
+
+def _log(conn, code: str, n: int, status: str, now: datetime,
+         purpose: str = "snapshot_eod", keep_ok: bool = False) -> None:
+    """写 `fetch_log`。
+
+    `keep_ok=True` 时不覆盖已经 `ok` 的行：同一个 `(code, purpose)` 只有一行，
+    后来的失败不该把「已成功」抹掉。
+    """
+    if keep_ok:
+        conn.execute(
+            "INSERT INTO fetch_log(code, purpose, n, status, ts) VALUES (?,?,?,?,?) "
+            "ON CONFLICT(code, purpose) DO UPDATE SET n=excluded.n, status=excluded.status,"
+            " ts=excluded.ts WHERE fetch_log.status <> 'ok'",
+            (code, purpose, n, status, now.isoformat()),
+        )
+        return
+    conn.execute(
+        "INSERT INTO fetch_log(code, purpose, n, status, ts) VALUES (?,?,?,?,?) "
+        "ON CONFLICT(code, purpose) DO UPDATE SET n=excluded.n, status=excluded.status, ts=excluded.ts",
+        (code, purpose, n, status, now.isoformat()),
+    )
+
+
+def _prev(cal: TradingCalendar, today: int) -> int | None:
+    try:
+        return cal.prev(today)
+    except LookupError:
+        return None
+
+
+def _as_date(ymd: int) -> date:
+    return datetime.strptime(str(ymd), "%Y%m%d").date()
+
+
+def _minutes(value) -> int:
+    """`time(14, 57)` 或 `"14:57"` → 当日第几分钟（跨小时比较也正确）。"""
+    parts = str(value).split(":")
+    return int(parts[0]) * 60 + int(parts[1])

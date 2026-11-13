@@ -1,0 +1,14 @@
+# cloudflared named tunnel 配置模板。
+# 复制为 cf/config.yml，把 <TUNNEL-UUID> 与两个域名换成本机的真实值；
+# 凭据文件 cf/<TUNNEL-UUID>.json 由 `cloudflared tunnel create` 生成后拷进来。
+tunnel: <TUNNEL-UUID>
+credentials-file: /etc/cloudflared/<TUNNEL-UUID>.json
+
+ingress:
+  - hostname: stock.example.com
+    service: http://api:5000
+  - hostname: ntfy.example.com
+    service: http://ntfy:2586
+  # 最后一条必须是显式 404 兜底：不给兜底时 cloudflared 会用默认规则
+  # 把未匹配的域名也转给第一个服务。
+  - service: http_status:404

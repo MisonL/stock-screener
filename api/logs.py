@@ -65,6 +65,13 @@ class HealthzFilter(logging.Filter):
                 # 元组是不可变的，重建一份；只替换路径这一项
                 record.args = tuple(
                     _redact_query(str(a)) if i == 2 else a for i, a in enumerate(args))
+            return True
+        # **非元组形状**（uvicorn 换过 access log 的参数结构，或 `%()` 的 dict 风格）。
+        # 原来这里直接放行：一旦格式变了，票据就**明文进日志**，而且没有任何测试
+        # 会发现。这里退而求其次——整条消息里出现 `t=`/`exp=` 就打码。
+        record.msg = _redact_query(str(record.msg))
+        if record.args:
+            record.args = _redact_query(str(record.args))
         return True
 
 

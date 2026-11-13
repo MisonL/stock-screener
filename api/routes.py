@@ -101,7 +101,8 @@ def create_app(cfg, conn_factory, clock, dispatcher=None, mcp=None) -> FastAPI:
     register_agent_log(app, conn_factory, clock, cfg)
     # **单例**：ChatSession 在 api 进程启动时构造一次，路由不每次新建（D18）
     chat_session = ChatSession(conn_factory(), cfg, clock)
-    register_chat(app, chat_session)
+    # 传 public_host 才会启用同源校验（它花 LLM 预算，和 /api/watch 同级）
+    register_chat(app, chat_session, str(cfg.notify.public_host).strip())
     snap = SnapshotCache(conn_factory)
 
     # ---- 依赖助手 --------------------------------------------------------

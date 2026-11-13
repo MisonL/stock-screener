@@ -54,12 +54,20 @@ def _load_secret(conn_factory) -> bytes | None:
     最长要等一分钟的操作——安全开关不该有延迟。缓存还曾让测试互相污染
     （单跑通过、合跑失败），这种隐蔽性不值得那点查询开销换。
     """
+    global _secret_failures
     try:
         from notify.hmac_sign import ensure_secret
 
         return ensure_secret(conn_factory())
     except Exception:                        # noqa: BLE001 —— 取不到就退化为仅 Basic
-        _log.warning("取不到签名密钥，退化为仅 Basic 鉴权", exc_info=True)
+        # 这里**不受"只记一次"限制地打 ERROR**：一旦密钥取不到，所有在飞的
+        # 免密链接和 ntfy 按钮会同时失效，用户看到的是"点了没反应"。
+        # 只在日志里留一条 warning 等于没人知道——提级成 error 并计数，
+        # `/healthz` 也不报这个错（它不碰鉴权），所以必须靠日志/指标发现。
+        _secret_failures += 1
+        if _secret_failures == 1 or _secret_failures % 100 == 0:
+            _log.error("取不到签名密钥，退化为仅 Basic 鉴权（累计 %d 次）",
+                       _secret_failures, exc_info=True)
         return None
 
 USER_ENV = "SS_WEB_USER"
@@ -115,9 +123,17 @@ ANON_BLOCK_S = 120            # 触发后锁多久（短：误判的代价要小
 # 而每个只失败一次连封锁都不会触发——看起来「什么都没发生」。
 MAX_TRACKED = 10_000
 
-# ip -> (窗口起点, 失败次数, 封锁到何时)。**进程内内存**：
+# ip -> (窗口起点, 次数, 封锁到何时)。**进程内内存**：
 # 重启即清空——这是有意的，否则一次内存损坏/PID 复用会把正常用户永久挡在门外。
-_fails: dict[str, tuple[float, int, float]] = {}
+#
+# **两个桶必须分开**：匿名 401（首屏几个请求要不到凭据）和带口令的失败
+# （真的在猜）是两种完全不同的行为。共用一个桶会互相污染——网页首屏的十几个
+# 匿名 401 把 IP 顶到封锁，用户随后就算输对也进不来；反过来，攻击者猜到第 9 次
+# 时用户只是刷新了一次页面，就直接被锁死。
+_fails: dict[str, tuple[float, int, float]] = {}    # 带口令的失败（在猜）
+_anon: dict[str, tuple[float, int, float]] = {}     # 匿名 401（只是要不到凭据）
+#: 累计取不到签名密钥的次数（DB 故障时票据全失效，靠它被发现）
+_secret_failures = 0
 # 上次清扫时刻：批量清理不能每个请求都全表扫一遍（那是另一种拒绝服务）
 _last_sweep = 0.0
 SWEEP_EVERY_S = 60.0
@@ -240,16 +256,16 @@ def _client_key(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-def _blocked_until(key: str, now: float) -> float:
+def _blocked_until(key: str, now: float, anonymous: bool = False) -> float:
     """返回封锁截止时刻；未封锁返回 0，并顺手清掉过期记录。"""
-    entry = _fails.get(key)
+    entry = (_anon if anonymous else _fails).get(key)
     if entry is None:
         return 0.0
     window_start, count, blocked = entry
     if blocked > now:
         return blocked
     if now - window_start > FAIL_WINDOW_S:
-        _fails.pop(key, None)          # 窗口已过，清零（也防内存无限增长）
+        (_anon if anonymous else _fails).pop(key, None)   # 窗口已过，清零
         return 0.0
     return 0.0
 
@@ -265,9 +281,10 @@ def _sweep(now: float) -> None:
     if now - _last_sweep < SWEEP_EVERY_S and len(_fails) <= MAX_TRACKED:
         return
     _last_sweep = now
-    for k, (window_start, _count, blocked) in list(_fails.items()):
-        if blocked <= now and now - window_start > FAIL_WINDOW_S:
-            _fails.pop(k, None)
+    for bucket in (_fails, _anon):
+        for k, (window_start, _count, blocked) in list(bucket.items()):
+            if blocked <= now and now - window_start > FAIL_WINDOW_S:
+                bucket.pop(k, None)
     # 扫完仍超上限（说明是短时间内的海量不同 IP）：按窗口起点丢最旧的，
     # 宁可放弃对老条目的跟踪，也不能让内存无界增长。
     #
@@ -297,14 +314,15 @@ def _note_failure(key: str, now: float, anonymous: bool = False) -> None:
     两档阈值：带口令的（在猜）10 次；匿名的 200 次。见 `ANON_MAX` 的注释。
     """
     _sweep(now)
+    bucket = _anon if anonymous else _fails
     limit = ANON_MAX if anonymous else FAIL_MAX
     block_s = ANON_BLOCK_S if anonymous else BLOCK_S
-    window_start, count, _blocked = _fails.get(key, (now, 0, 0.0))
+    window_start, count, _blocked = bucket.get(key, (now, 0, 0.0))
     if now - window_start > FAIL_WINDOW_S:
         window_start, count = now, 0
     count += 1
     blocked = now + block_s if count >= limit else 0.0
-    _fails[key] = (window_start, count, blocked)
+    bucket[key] = (window_start, count, blocked)
     if blocked:
         _log.error("%s %d 次，封锁 %s 至 %.0f（%d 秒）",
                    "匿名请求" if anonymous else "口令连续失败",
@@ -312,7 +330,9 @@ def _note_failure(key: str, now: float, anonymous: bool = False) -> None:
 
 
 def _note_success(key: str) -> None:
+    """认证成功：**两个桶都清**。真的登进来了就不该再背任何计数。"""
     _fails.pop(key, None)
+    _anon.pop(key, None)
 
 
 def _too_many(until: float) -> JSONResponse:
@@ -412,7 +432,13 @@ def make_middleware(conn_factory=None):
 
         # ④ 到这里还没有有效凭据：只对"猜口令"限流
         if until > now:
-            return _too_many(until)
+            # **带口令的（在猜）给 429**；**匿名的给 401 + challenge**。
+            # 429 不带 `WWW-Authenticate`，iOS Safari / Chrome 不会弹原生登录框，
+            # 用户只看到一坨 JSON——登录入口事实上消失。匿名请求本来就没在猜，
+            # 给它 401 既保留背压（不继续跑业务），又让人还能登进来。
+            if request.headers.get("authorization"):
+                return _too_many(until)
+            return _challenge()
 
         if password_ok:
             # 口令在 ③-2 已验过、也已计过（如果错的话早返回了）。
@@ -428,12 +454,14 @@ def make_middleware(conn_factory=None):
         if got is None:
             # **只有「合法签发但已过期」的票据才不计失败**：用户点了一条旧通知，
             # 不该被锁。伪造/垃圾票据照常计数——否则 `?t=garbage` 可无限试探。
+            anon_blocked = _blocked_until(key, now, anonymous=True)
+            if anon_blocked > now:
+                return _challenge()          # 已限流：401 + challenge，不再计数
             if not (secret is not None and _is_stale_ticket(request, secret, now)):
                 _note_failure(key, now, anonymous=True)
-                # 刚触发封锁：这一次就该回 429，别再多给一次尝试
-                until = _blocked_until(key, now)
-                if until > now:
-                    return _too_many(until)
+                # 刚触发限流也**不返回 429**：匿名请求没有 `WWW-Authenticate`
+                # 就弹不出登录框（见 ④ 的注释），统一 401 + challenge。
+                # 背压照样生效——请求止步于此，不会进业务。
             return _challenge()
         want_user, want_pw = creds
         # **常量时间比较**：普通 == 会因为提前返回泄露前缀长度

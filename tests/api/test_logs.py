@@ -84,3 +84,21 @@ def test_business_query_params_are_kept():
     logged = str(rec.args[2])
     assert "tab=k" in logged
     assert "secret123" not in logged
+
+
+def test_redaction_survives_an_unexpected_args_shape():
+    """uvicorn 若改了 access log 的参数结构，票据也不能明文进日志。
+
+    过滤器原先只处理 5 元组；形状变了就整条放行，票据会**明文写进 docker logs**
+    而没有任何测试会发现——"保留原日志"这个取舍在凭据面前不成立。
+    """
+    import logging
+
+    from api.logs import HealthzFilter
+
+    rec = logging.LogRecord(
+        "uvicorn.access", logging.INFO, __file__, 1,
+        "%s", ("GET /stock/sh600519?t=abc123&exp=99 HTTP/1.1",), None)
+    assert HealthzFilter().filter(rec) is True
+    logged = str(rec.msg) + str(rec.args)
+    assert "abc123" not in logged, f"非元组形状时票据明文进了日志：{logged}"

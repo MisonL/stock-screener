@@ -117,9 +117,16 @@ def test_missing_credentials_use_the_loose_bucket(api, tmp_db, passwd):
     「打开首页就把自己锁 15 分钟」——正是免密功能要解决的问题本身。
     匿名请求不带口令、猜不出口令，放宽它不削弱防护。
     """
-    for _ in range(auth.ANON_MAX - 1):
+    for _ in range(auth.ANON_MAX):
         assert _get(api).status_code == 401
-    assert _get(api).status_code == 429
+    # 超过上限后**仍然返回 401 而不是 429**：429 不带 `WWW-Authenticate`，
+    # 手机浏览器不会弹原生登录框，用户只看到 JSON——登录入口就消失了。
+    # 401 既保留背压（不再跑业务），又让人还能输口令进来。
+    r = _get(api)
+    assert r.status_code == 401
+    assert "www-authenticate" in {k.lower() for k in r.headers}, "401 没有 challenge 头"
+    # 而且真的还能登进来
+    assert _get(api, headers=_cred("u", "p")).status_code == 200
 
 
 def test_healthz_is_never_throttled(api, tmp_db, passwd):

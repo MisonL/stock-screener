@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import sqlite3
 import time
 
 import httpx
@@ -41,10 +42,11 @@ def _cred(user: str, pw: str) -> dict[str, str]:
     return {"Authorization": "Basic " + base64.b64encode(f"{user}:{pw}".encode()).decode()}
 
 
-def _post(api, path: str, headers=None):
+def _post(api, path: str, headers=None, json=None):
     async def run():
         async with api() as client:
-            return await client.post(path, headers=headers or {}, follow_redirects=False)
+            return await client.post(path, headers=headers or {},
+                                     json=json, follow_redirects=False)
 
     return asyncio.run(run())
 
@@ -272,41 +274,56 @@ def test_hook_prefix_is_not_a_general_bypass(api, tmp_db, passwd):
     assert _raw_get(api, "/healthz/../api/status") == 401
 
 
-def test_every_hook_route_verifies_its_own_signature():
+def test_every_hook_route_enforces_its_own_signature(api, tmp_db, passwd, secret):
     """`/api/hook/` 前缀在中间件里是放行的——**每条路由都必须自己验签**。
 
-    放行靠的是「路由内部 `verify()`」这个前提。将来有人在这里加一条不验签的
-    路由，它就静默变成公开接口——中间件不会再挡。这条守卫按 AST 检查
-    `verify(` 调用是否出现在每个 hook 路由的函数体里。
+    这条守卫**在运行时真发请求**，不用字符串/AST 检查。AST 版本只看函数体里
+    有没有出现 `verify(`，三种写法都会漏：校验挪进辅助函数、被 `try/except` 包住、
+    或者用 FastAPI 惯用的 `Depends(require_hook_token)`——最后一种最现实，
+    而 AST 检查会逼着开发者绕开它。
+
+    正反两面都要验：
+      - **负面**：无票请求不能返回 401（那说明中间件拦死了，按钮点不动）；
+        也不能返回 200（那说明路由根本没验签，成了公开接口）。
+      - **正面**：带**合法**票据时不能是 403/401（说明验签真的在工作）。
     """
-    import ast
-    from pathlib import Path
+    from api.routes import create_app  # noqa: F401  —— 只要它的路由表
 
-    src = Path("api/routes.py").read_text(encoding="utf-8")
-    tree = ast.parse(src)
+    # **先把数据备好**：路由是先查对象再验签的，库是空的就会直接 404，
+    # 请求根本走不到 `verify()`——负面断言会变成空转（变异也不会红）。
+    trade_date = 20261113
+    tmp_db.execute(
+        "INSERT INTO signals(ts, trade_date, market, code, kind, level, event_id, seq, payload) "
+        "VALUES ('2026-11-13T09:35:00', ?, 'cn_main', 'sh600519', 'breakout', 'P1', 0, 1, '{}')",
+        (trade_date,))
+    tmp_db.commit()
+    sid = tmp_db.execute("SELECT max(id) FROM signals").fetchone()[0]
 
-    checked = []
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        for dec in node.decorator_list:
-            if not isinstance(dec, ast.Call) or not dec.args:
-                continue
-            arg = dec.args[0]
-            if not (isinstance(arg, ast.Constant) and isinstance(arg.value, str)):
-                continue
-            if not arg.value.startswith("/api/hook/"):
-                continue
-            calls = {n.func.id for n in ast.walk(node)
-                     if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
-            attrs = {n.func.attr for n in ast.walk(node)
-                     if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
-            assert "verify" in calls | attrs, (
-                f"{arg.value} 在 /api/hook/ 下但没有调用 verify()："
-                "中间件对该前缀放行，它就变成公开接口了")
-            checked.append(arg.value)
+    app = api()._transport.app
+    hook_routes = [r for r in app.routes
+                   if getattr(r, "path", "").startswith("/api/hook/")]
+    assert hook_routes, "没有 /api/hook/ 路由，守卫失效"
 
-    assert checked, "没找到任何 /api/hook/ 路由，守卫失效"
+    for route in hook_routes:
+        # 把 {param} 换成 1；无票 POST
+        concrete = route.path.replace("{signal_id}", "1").replace("{turn_id}", "1")
+        codes = {m: _post(api, concrete) for m in (route.methods or {"POST"})}
+        for method, r in codes.items():
+            assert r.status_code != 200, (
+                f"{route.path} [{method}] 无票请求返回 200：中间件对该前缀放行，"
+                "而路由没有验签，等于公开接口")
+            assert r.status_code != 401, (
+                f"{route.path} [{method}] 被中间件拦成 401：ntfy 按钮（服务端直接 "
+                "POST、无浏览器凭据）永远点不动")
+
+    # 正面：read 路由带一张合法票据必须能通过验签
+    from notify.hmac_sign import day_end_ts
+
+    exp = day_end_ts(trade_date)
+    token = sign(secret, "read", sid, exp)
+    ok = _post(api, f"/api/hook/signals/{sid}/read?t={token}")
+    assert ok.status_code == 200, (
+        f"带合法票据仍被拒（{ok.status_code}）：验签或数据前置条件有问题")
 
 
 def test_blocked_ip_with_valid_session_still_gets_in(api, tmp_db, passwd, secret):
@@ -385,3 +402,46 @@ def test_ticket_is_scrubbed_even_when_already_logged_in(api, tmp_db, passwd, sec
     assert r.status_code == 302, (
         f"已登录时带票据的请求返回 {r.status_code}，地址栏里的票据不会被抹掉")
     assert "t=" not in (r.headers.get("location") or "")
+
+
+def test_secret_load_failure_is_logged_as_error(monkeypatch, caplog):
+    """取不到签名密钥必须打 ERROR，不能只是 warning。
+
+    密钥取不到时，所有在飞的免密链接和 ntfy 按钮会同时失效，用户看到的是
+    "点了没反应"。`/healthz` 不碰鉴权、报不出这个错，所以日志/计数是唯一线索。
+    """
+    import logging
+
+    def boom():
+        raise sqlite3.OperationalError("database is locked")
+
+    auth._secret_failures = 0
+    with caplog.at_level(logging.ERROR):
+        got = auth._load_secret(boom)
+    assert got is None, "取不到密钥时不应该返回任何值（无法验签）"
+    assert auth._secret_failures == 1
+    assert any(r.levelno == logging.ERROR for r in caplog.records), "没有打 ERROR"
+
+
+def test_chat_requires_same_origin(api, tmp_db, passwd):
+    """`/api/chat` 每调一次都花 LLM 预算，必须有同源校验。
+
+    `/api/watch` 早就有了，`/api/chat` 原先没有。`SameSite=Lax` 确实挡住了
+    跨站 POST，但那是浏览器行为——服务端自己判一次 Origin 才不依赖别人。
+    """
+    # **必须带口令**：不带就停在中间件 401，走不到同源校验（那样测的是鉴权）
+    cred = _cred("u", "p")
+    body = {"text": "hi"}
+    bad = _post(api, "/api/chat", headers={**cred, "Origin": "https://evil.example"},
+                json=body)
+    assert bad.status_code == 400, f"跨源 chat 没被拒：{bad.status_code}"
+
+    # 同源：Origin 必须等于 https://<public_host>。这里只验"通过校验"，
+    # 不关心 LLM 回答（没配 key 时它自己会失败，那是另一层的事）
+    from core.config import load_config
+    from pathlib import Path
+
+    host = str(load_config(Path("config")).notify.public_host).strip()
+    same = _post(api, "/api/chat", headers={**cred, "Origin": f"https://{host}"},
+                 json=body)
+    assert same.status_code != 400, "同源请求被误拒"

@@ -50,8 +50,16 @@ from notify.ntfy import NtfyClient
 _cfg = load_config(Path("config"))
 _warn_if_placeholder_config(_cfg)
 _clock = SystemClock()
-_factory = make_conn_factory()
+# **`migrate_each=False`**：`core/db.py` 的注释明确要求 api 这么用。每次 HTTP 请求
+# 都跑 `migrate()` 等于每个请求一次 `BEGIN IMMEDIATE`，会跟 jobs 的写事务互撞
+# （busy_timeout 一过就是 500 database is locked），而未鉴权的公网请求也会触发它。
+# 迁移在下面启动时做一次就够。
+_factory = make_conn_factory(migrate_each=False)
+# 启动时**迁移一次**（`migrate_each=False` 之后就没有别的地方做了）
+from core.db import migrate  # noqa: E402  —— 紧跟 factory 便于阅读
+
 _conn = _factory()
+migrate(_conn)
 _dispatcher = Dispatcher(
     _conn,
     NtfyClient(_cfg.notify.ntfy_url, _cfg.notify.topic, os.environ.get("NTFY_TOKEN")),

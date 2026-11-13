@@ -99,8 +99,16 @@ def _has_dotdot_segment(path: str) -> bool:
 #
 # 阈值故意宽松：正常用户输错一两次不该被锁。10 次 / 5 分钟已经远超手滑。
 FAIL_WINDOW_S = 300          # 统计窗口
-FAIL_MAX = 10                # 窗口内允许的失败次数
+FAIL_MAX = 10                # 窗口内允许的**带口令**失败次数（真的是在猜）
 BLOCK_S = 900                # 触发后锁多久
+
+# **匿名请求单独一档**，阈值宽松得多。
+# 网页首屏会并行打十几个 /api/*，用户换手机、清 Cookie、或从通知点进一个没有
+# 票据的页面，一个全新的浏览器就会连着收到十几次 401。用 10 次那档等于
+# 「打开首页就把自己锁 15 分钟」——而这正是免密功能要解决的问题本身。
+# 匿名请求猜不出口令（它们不带口令），所以放宽它不会削弱防护。
+ANON_MAX = 200                # 窗口内允许的匿名 401 次数
+ANON_BLOCK_S = 120            # 触发后锁多久（短：误判的代价要小）
 
 # 跟踪的 IP 上限。**必须有上限**：`CF-Connecting-IP` 是客户端可设置的头，
 # 每次换一个、各失败一次，就能让这个 dict 无限增长（100 万个 IP ≈ 100MB），
@@ -283,17 +291,24 @@ def _sweep(now: float) -> None:
                         len(_fails), MAX_TRACKED)
 
 
-def _note_failure(key: str, now: float) -> None:
+def _note_failure(key: str, now: float, anonymous: bool = False) -> None:
+    """记一次失败。`anonymous=True` 表示请求**没带口令**（只是要不到凭据）。
+
+    两档阈值：带口令的（在猜）10 次；匿名的 200 次。见 `ANON_MAX` 的注释。
+    """
     _sweep(now)
+    limit = ANON_MAX if anonymous else FAIL_MAX
+    block_s = ANON_BLOCK_S if anonymous else BLOCK_S
     window_start, count, _blocked = _fails.get(key, (now, 0, 0.0))
     if now - window_start > FAIL_WINDOW_S:
         window_start, count = now, 0
     count += 1
-    blocked = now + BLOCK_S if count >= FAIL_MAX else 0.0
+    blocked = now + block_s if count >= limit else 0.0
     _fails[key] = (window_start, count, blocked)
     if blocked:
-        _log.error("口令连续失败 %d 次，封锁 %s 至 %.0f（%d 秒）",
-                   count, key, blocked, BLOCK_S)
+        _log.error("%s %d 次，封锁 %s 至 %.0f（%d 秒）",
+                   "匿名请求" if anonymous else "口令连续失败",
+                   count, key, blocked, block_s)
 
 
 def _note_success(key: str) -> None:
@@ -351,19 +366,15 @@ def make_middleware(conn_factory=None):
         until = _blocked_until(key, now)
         secret = _load_secret(conn_factory) if conn_factory is not None else None
         days = _session_days()
+        # 口令是否已在 ③-2 校验通过（已验证过的请求不再走 ⑤ 的校验与计数）
+        password_ok = False
 
         if secret is not None:
-            # ③-1 会话 Cookie：最省事的一条路，手机刷新/换页都不会再弹框
-            token = _cookie_value(request)
-            exp = _as_int(request.cookies.get(SESSION_COOKIE + "_exp"))
-            if token and session_ok(secret, token, exp, now):
-                _note_success(key)
-                return await call_next(request)
-
-            # ③-2 带了口令就先校验口令（不能因为票据有效就跳过）
-            auth_header = request.headers.get("authorization")
-            if auth_header:
-                got = _parse_basic(auth_header)
+            # ③-0 **带了口令就先校验口令**：`有效票据 + 错误口令`不能因为票据
+            # 就放过，否则错误口令既不失败也不计数，限流形同虚设。
+            # 放在票据之前是因为口令是"显式声明要认证"的最强意图。
+            if request.headers.get("authorization"):
+                got = _parse_basic(request.headers.get("authorization"))
                 want_user, want_pw = creds
                 if got is None or not (
                         hmac.compare_digest(got[0].encode(), want_user.encode())
@@ -372,8 +383,12 @@ def make_middleware(conn_factory=None):
                     _note_failure(key, now)
                     until = _blocked_until(key, now)
                     return _too_many(until) if until > now else _challenge()
+                password_ok = True
 
-            # ③-3 推送链接里的票据：验过就发 Cookie，再把 URL 上的凭据抹掉
+        if secret is not None:
+            # ③-1 **URL 里带有效票据就抹掉**，不管当前是否已登录。
+            # 先判 Cookie 会让"已登录 + 带票据的链接"直接 200，
+            # 票据就留在地址栏和历史里（30 天可用）。
             q_token = (request.query_params.get("t") or "").strip()
             q_exp = _as_int(request.query_params.get("exp"))
             if q_token and q_exp and session_ok(secret, q_token, q_exp, now):
@@ -384,18 +399,41 @@ def make_middleware(conn_factory=None):
                 from fastapi.responses import RedirectResponse
 
                 resp = RedirectResponse(path + (f"?{qs}" if qs else ""), status_code=302)
+                resp.headers.setdefault("Cache-Control", "no-store")
                 return _set_session_cookie(resp, q_token, q_exp)
+
+            # ③-2 会话 Cookie：最省事的一条路，手机刷新/换页都不会再弹框
+            token = _cookie_value(request)
+            exp = _as_int(request.cookies.get(SESSION_COOKIE + "_exp"))
+            if token and session_ok(secret, token, exp, now):
+                _note_success(key)
+                return await call_next(request)
+
 
         # ④ 到这里还没有有效凭据：只对"猜口令"限流
         if until > now:
             return _too_many(until)
+
+        if password_ok:
+            # 口令在 ③-2 已验过、也已计过（如果错的话早返回了）。
+            # 这里直接放行并补发 Cookie，**绝不重复计数**。
+            _note_success(key)
+            response = await call_next(request)
+            if secret is not None:
+                exp_ts = int(now + days * 24 * 3600)
+                _set_session_cookie(response, issue_session(secret, exp_ts), exp_ts)
+            return response
 
         got = _parse_basic(request.headers.get("authorization"))
         if got is None:
             # **只有「合法签发但已过期」的票据才不计失败**：用户点了一条旧通知，
             # 不该被锁。伪造/垃圾票据照常计数——否则 `?t=garbage` 可无限试探。
             if not (secret is not None and _is_stale_ticket(request, secret, now)):
-                _note_failure(key, now)
+                _note_failure(key, now, anonymous=True)
+                # 刚触发封锁：这一次就该回 429，别再多给一次尝试
+                until = _blocked_until(key, now)
+                if until > now:
+                    return _too_many(until)
             return _challenge()
         want_user, want_pw = creds
         # **常量时间比较**：普通 == 会因为提前返回泄露前缀长度
@@ -417,5 +455,8 @@ def make_middleware(conn_factory=None):
     return middleware
 
 
-# 兼容旧装配：没有 conn_factory 时只认 Basic（不会突然变宽松）
-middleware = make_middleware()
+# **故意不导出**模块级的 `middleware = make_middleware()`：它是"只认 Basic、
+# 不发票"的降级入口，一旦有人 `app.middleware("http")(auth.middleware)`，
+# 免密登录会**静默失效**且不报错。要装配就显式传 conn_factory：
+#     app.middleware("http")(make_middleware(conn_factory))
+# `make_middleware()` 不传参仍然可用（测试要只认 Basic 时用），但不留全局别名。

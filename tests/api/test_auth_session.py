@@ -41,6 +41,14 @@ def _cred(user: str, pw: str) -> dict[str, str]:
     return {"Authorization": "Basic " + base64.b64encode(f"{user}:{pw}".encode()).decode()}
 
 
+def _post(api, path: str, headers=None):
+    async def run():
+        async with api() as client:
+            return await client.post(path, headers=headers or {}, follow_redirects=False)
+
+    return asyncio.run(run())
+
+
 def _get(api, path: str = "/api/status", headers=None):
     async def run():
         async with api() as client:
@@ -239,14 +247,18 @@ def test_hook_buttons_work_without_browser_credentials(api, tmp_db, passwd):
     于是"标记已读"从来没能生效（生产库证据：94 条信号 `read_at` 全为空）。
     放行是安全的：两个路由都强制 `verify()` + 过期判断。
     """
+    # **必须用 POST**：这两条路由都是 POST。用 GET 会打到 SPA 兜底返回 404
+    # `{"detail":"不是前端路由"}`，根本没走到 hook 路由——旧版本断言
+    # `in (403, 404)` 恰好放过了它，是假绿。
     for path in ("/api/hook/signals/1/read", "/api/hook/agent/1/confirm"):
-        r = _get(api, path)
-        # **不能只断言"不是 401"**：500 也能过。这里要的是"中间件放行了，
-        # 由路由自己拒绝"——403（验签失败）或 404（对象不存在）都证明请求到达了路由。
-        # 401 = 被中间件拦死；5xx = 路由炸了。
+        r = _post(api, path)
+        # 403 = 路由验签失败（对象存在）；404 = 路由先查对象、查不到（测试库里
+        # 没有这一行）。两者都证明**请求到达了路由**。关键是不能是 401。
         assert r.status_code in (403, 404), (
             f"{path} 期望 403/404（路由自己处理），实际 {r.status_code}："
-            "401 说明被中间件拦死，5xx 说明路由崩了")
+            "401 = 被中间件拦死")
+        assert r.json().get("detail") != "需要口令才能访问", (
+            f"{path} 返回了中间件的口令提示，说明被拦在中间件")
 
 
 def test_hook_prefix_is_not_a_general_bypass(api, tmp_db, passwd):
@@ -314,3 +326,62 @@ def test_blocked_ip_with_valid_session_still_gets_in(api, tmp_db, passwd, secret
              headers={"Cookie": f"{auth.SESSION_COOKIE}={token}; "
                                 f"{auth.SESSION_COOKIE}_exp={exp}"})
     assert r.status_code == 200, "有效会话被口令限流连累，锁在门外了"
+
+
+def test_one_request_counts_exactly_one_failure(api, tmp_db, passwd):
+    """**一次请求只记一次失败**，无论它带不带垃圾票据。
+
+    ③-0（带口令先校验）与 ⑤（Basic 分支）是两段代码。如果两段都计数，
+    每次请求记 2 次，10 次配额只够 5 次猜测——攻击者把候选口令塞进 `?t=`
+    就能把窗口内的猜测次数翻倍。
+
+    **必须直接量计数**：用状态码推断测不出来（密码正确时两段都不计数，
+    双计数不改变状态码；密码错误时 ③-0 就返回了，根本到不了 ⑤）。
+
+    **注意本测试的边界**：在当前结构下，"双计数"这个具体变异是测不出来的
+    （③-0 返回后不会继续执行）。它守的是"每请求恰好记 1 次"这个可观测性质，
+    而不是某段代码是否存在——后者在密码正确的路径上根本不可观测。
+    """
+    for suffix in ("?t=garbage&exp=1", ""):
+        key = f"203.0.113.{80 + len(suffix)}"
+        headers = {**_cred("u", "bad"), "CF-Connecting-IP": key}
+        assert _get(api, "/api/status" + suffix, headers=headers).status_code == 401
+        counted = auth._fails.get(key, (0, 0, 0))[1]
+        assert counted == 1, (
+            f"一次错误口令请求记了 {counted} 次失败（应为 1），suffix={suffix!r}")
+
+
+def test_browser_first_paint_does_not_lock_the_user_out(api, tmp_db, passwd, secret):
+    """新浏览器首屏的十几个 401 不能把人锁在外面。
+
+    网页首屏并行请求十几个 `/api/*`。用户换手机、清 Cookie、或从通知点进一个
+    没有票据的页面，就会连收十几次 401。如果这些匿名 401 用"猜口令"那档
+    （10 次）计数，打开首页就被锁 15 分钟——正是免密功能要解决的问题本身。
+    """
+    for _ in range(15):
+        assert _get(api).status_code == 401
+    # 首屏之后，手动输正确口令必须能进
+    assert _get(api, headers=_cred("u", "p")).status_code == 200, \
+        "首屏的匿名 401 把用户锁在外面了"
+
+
+def test_ticket_is_scrubbed_even_when_already_logged_in(api, tmp_db, passwd, secret):
+    """已经登录时，URL 里的票据也必须抹掉。
+
+    否则手机浏览器会把带票据的地址留在地址栏和历史里——票据还能用 30 天。
+    """
+    _first, _second = _browser_flow(api, f"/signals?t={_ticket(secret)[0]}&exp={_ticket(secret)[1]}")
+    token, exp = _ticket(secret)
+
+    async def run():
+        async with api() as client:
+            client.base_url = httpx.URL("https://test")
+            # 先登录拿 Cookie
+            await client.get(f"/signals?t={token}&exp={exp}")
+            # 再点一条带票据的链接
+            return await client.get(f"/signals?t={token}&exp={exp}")
+
+    r = asyncio.run(run())
+    assert r.status_code == 302, (
+        f"已登录时带票据的请求返回 {r.status_code}，地址栏里的票据不会被抹掉")
+    assert "t=" not in (r.headers.get("location") or "")

@@ -109,9 +109,15 @@ def test_block_expires_after_block_seconds(api, tmp_db, passwd, monkeypatch):
     assert _get(api, _cred("u", "p")).status_code == 200
 
 
-def test_missing_credentials_count_as_failure(api, tmp_db, passwd):
-    """不带凭据也要计数——否则攻击者只要省略 header 就能绕开限流。"""
-    for _ in range(auth.FAIL_MAX):
+def test_missing_credentials_use_the_loose_bucket(api, tmp_db, passwd):
+    """不带凭据的 401 走**宽松档**（`ANON_MAX`），不是猜口令那档。
+
+    网页首屏会并行打十几个 `/api/*`：用户换手机、清 Cookie、或从通知点进一个
+    没有票据的页面，一个全新浏览器首屏就收到十几次 401。用 10 次那档等于
+    「打开首页就把自己锁 15 分钟」——正是免密功能要解决的问题本身。
+    匿名请求不带口令、猜不出口令，放宽它不削弱防护。
+    """
+    for _ in range(auth.ANON_MAX - 1):
         assert _get(api).status_code == 401
     assert _get(api).status_code == 429
 

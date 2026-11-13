@@ -81,6 +81,17 @@ OPEN_PATHS = ("/healthz", "/auth")
 #: **新增 `/api/hook/` 下的路由时必须自己验签**，守卫测试会检查这一点。
 SELF_SIGNED_PREFIXES = ("/api/hook/",)
 
+
+def _has_dotdot_segment(path: str) -> bool:
+    """路径里有没有 `..` 段。
+
+    有的话**一律不放行**（当成需要口令的普通路径），即使它看起来落在
+    `/healthz/` 或 `/api/hook/` 前缀下。现在的路由不会解析 `..`（实测返回 404），
+    所以这条不是修补某个已知漏洞，而是不把「前缀放行」建立在
+    「路由器恰好不规范化路径」这个假设上。
+    """
+    return ".." in path.split("/")
+
 # ---- 失败限流 -----------------------------------------------------------
 # 没有限流时，外网可以对 `/api/...` 无限次猜口令（实测连打 10 次全是 401、
 # 毫无延迟）。口令又是人起的一串字，被慢慢穷举只是时间问题；一旦猜中，
@@ -145,6 +156,21 @@ def session_ok(secret: bytes, token: str, exp_ts: int, now: float) -> bool:
     if not token or exp_ts <= 0 or now >= exp_ts:
         return False
     return verify(secret, "session", 0, exp_ts, token)
+
+
+def _as_int(raw) -> int:
+    """把 Cookie / 查询参数转成 int；不是数字就是 0（当"没有"处理）。"""
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_stale_ticket(request: Request, secret: bytes, now: float) -> bool:
+    """票据签名有效但已过期——这种不该计入失败（用户点了一条旧通知）。"""
+    token = (request.query_params.get("t") or "").strip()
+    exp = _as_int(request.query_params.get("exp"))
+    return bool(token and exp) and session_signature_valid(secret, token, exp) and exp <= now
 
 
 def _cookie_value(request: Request) -> str:
@@ -291,13 +317,30 @@ def make_middleware(conn_factory=None):
     """
 
     async def middleware(request: Request, call_next):
-        """口令校验。挂在整个 app 上，**逐请求读环境变量**（改了不用重启构造）。"""
+        """口令校验。挂在整个 app 上，**逐请求读环境变量**（改了不用重启构造）。
+
+        判定顺序（**顺序本身就是语义**，改之前先读这段）：
+
+        1. 免鉴权路径 / 自带签名的回调 → 放行
+        2. 没配口令 → 放行（本机开发）
+        3. **已认证凭据优先**，且**不看封锁**：
+           a. 会话 Cookie —— 已是"认证通过"的证据。
+              否则手机上口令手滑几次被锁 15 分钟、连点通知链接都进不来，
+              而那正是这个功能要解决的问题。
+           b. 带了口令就先校验口令 —— `有效票据 + 错误口令`不能因为票据就放过，
+              否则错误口令既不失败也不计数，限流形同虚设。
+           c. 推送票据 → 302 + 发 Cookie。
+        4. **封锁判断**：到这里还没有有效凭据，才是"猜口令"，限流只挡这个。
+        5. Basic 校验；成功后也发 Cookie，手动输过一次就不再弹框。
+
+        过期票据不计失败、垃圾票据照常计数——见 `_is_stale_ticket`。
+        """
         path = request.url.path
-        if any(path == p or path.startswith(p + "/") for p in OPEN_PATHS):
-            return await call_next(request)
-        # 自带 HMAC 验签的回调端点：ntfy 直接 POST，没有浏览器凭据
-        if any(path.startswith(prefix) for prefix in SELF_SIGNED_PREFIXES):
-            return await call_next(request)
+        if not _has_dotdot_segment(path):
+            if any(path == p or path.startswith(p + "/") for p in OPEN_PATHS):
+                return await call_next(request)
+            if any(path.startswith(prefix) for prefix in SELF_SIGNED_PREFIXES):
+                return await call_next(request)
 
         creds = _credentials()
         if creds is None:
@@ -306,64 +349,52 @@ def make_middleware(conn_factory=None):
         key = _client_key(request)
         now = time.time()
         until = _blocked_until(key, now)
-        if until > now:
-            return _too_many(until)
-
-        days = _session_days()
         secret = _load_secret(conn_factory) if conn_factory is not None else None
+        days = _session_days()
 
-        # ① 已有会话 Cookie：最省事的一条路，手机刷新/换页都不会再弹框
         if secret is not None:
+            # ③-1 会话 Cookie：最省事的一条路，手机刷新/换页都不会再弹框
             token = _cookie_value(request)
-            exp_raw = request.cookies.get(SESSION_COOKIE + "_exp") or ""
-            try:
-                exp = int(exp_raw)
-            except ValueError:
-                exp = 0
+            exp = _as_int(request.cookies.get(SESSION_COOKIE + "_exp"))
             if token and session_ok(secret, token, exp, now):
                 _note_success(key)
                 return await call_next(request)
 
-            # ② 推送链接里带的票据：验过就发 Cookie，然后把 URL 上的凭据抹掉
-            q_token = (request.query_params.get("t") or "").strip()
-            q_exp = (request.query_params.get("exp") or "").strip()
-            # **带了口令就先校验口令**：否则「有效票据 + 错误口令」会被票据直接放行，
-            # 错误口令既不失败也不计数——限流形同虚设。
-            if request.headers.get("authorization"):
-                bad = _parse_basic(request.headers.get("authorization"))
+            # ③-2 带了口令就先校验口令（不能因为票据有效就跳过）
+            auth_header = request.headers.get("authorization")
+            if auth_header:
+                got = _parse_basic(auth_header)
                 want_user, want_pw = creds
-                if bad is None or not (
-                        hmac.compare_digest(bad[0].encode(), want_user.encode())
-                        and hmac.compare_digest(bad[1].encode(), want_pw.encode())):
-                    _log.warning("口令错误（票据请求）：path=%s", path)
+                if got is None or not (
+                        hmac.compare_digest(got[0].encode(), want_user.encode())
+                        and hmac.compare_digest(got[1].encode(), want_pw.encode())):
+                    _log.warning("口令错误：path=%s", path)
                     _note_failure(key, now)
-                    return _challenge()
-            if q_token and q_exp.isdigit() and session_ok(secret, q_token, int(q_exp), now):
+                    until = _blocked_until(key, now)
+                    return _too_many(until) if until > now else _challenge()
+
+            # ③-3 推送链接里的票据：验过就发 Cookie，再把 URL 上的凭据抹掉
+            q_token = (request.query_params.get("t") or "").strip()
+            q_exp = _as_int(request.query_params.get("exp"))
+            if q_token and q_exp and session_ok(secret, q_token, q_exp, now):
                 _note_success(key)
-                # 去掉 t/exp 后 302，避免票据留在地址栏、历史和 Referer 里
                 rest = [(k, v) for k, v in request.query_params.multi_items()
                         if k not in ("t", "exp")]
                 qs = "&".join(f"{k}={v}" for k, v in rest)
-                target = path + (f"?{qs}" if qs else "")
                 from fastapi.responses import RedirectResponse
 
-                resp = RedirectResponse(target, status_code=302)
-                return _set_session_cookie(resp, q_token, int(q_exp))
+                resp = RedirectResponse(path + (f"?{qs}" if qs else ""), status_code=302)
+                return _set_session_cookie(resp, q_token, q_exp)
+
+        # ④ 到这里还没有有效凭据：只对"猜口令"限流
+        if until > now:
+            return _too_many(until)
 
         got = _parse_basic(request.headers.get("authorization"))
         if got is None:
             # **只有「合法签发但已过期」的票据才不计失败**：用户点了一条旧通知，
-            # 不该被锁 15 分钟。伪造/垃圾票据**照常计数**——上一版只看 `t` 是否
-            # 非空，于是加一个 `?t=garbage` 就能无限试探而不进限流表。
-            # 带 Authorization 的情况已在上面校验过并计数，走不到这里。
-            stale_but_real = False
-            if secret is not None:
-                t = (request.query_params.get("t") or "").strip()
-                e = (request.query_params.get("exp") or "").strip()
-                if t and e.isdigit():
-                    stale_but_real = (session_signature_valid(secret, t, int(e))
-                                      and int(e) <= now)
-            if not stale_but_real:
+            # 不该被锁。伪造/垃圾票据照常计数——否则 `?t=garbage` 可无限试探。
+            if not (secret is not None and _is_stale_ticket(request, secret, now)):
                 _note_failure(key, now)
             return _challenge()
         want_user, want_pw = creds
@@ -373,10 +404,11 @@ def make_middleware(conn_factory=None):
         if not (ok_user and ok_pass):
             _log.warning("口令错误：user=%r path=%s", got[0][:40], path)
             _note_failure(key, now)
-            return _challenge()
+            until = _blocked_until(key, now)
+            return _too_many(until) if until > now else _challenge()
         _note_success(key)
         response = await call_next(request)
-        # ③ Basic 成功后也发 Cookie：手动输过一次之后就不再弹原生框
+        # ⑤ Basic 成功后也发 Cookie：手动输过一次之后就不再弹原生框
         if secret is not None:
             exp_ts = int(now + days * 24 * 3600)
             _set_session_cookie(response, issue_session(secret, exp_ts), exp_ts)

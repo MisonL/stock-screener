@@ -54,6 +54,36 @@ def _ticket(secret, days: int = 30) -> tuple[str, int]:
     return sign(secret, "session", 0, exp), exp
 
 
+def _raw_get(api, path: str) -> int:
+    """发**未经规范化的**原始路径，返回状态码。
+
+    httpx 会在客户端做 `..` 归一，所以这类"前缀放行是否被路径穿越绕过"的问题
+    只能用 ASGI 直接调，否则测试永远绿。
+    """
+    app = api()
+    # fixture 返回的是 AsyncClient 工厂；真正的 app 挂在 transport 上
+    transport = getattr(app, "_transport", None)
+    asgi_app = getattr(transport, "app", None)
+    assert asgi_app is not None, "拿不到 ASGI app，无法发原始请求"
+
+    captured = {}
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        captured.update(message)
+
+    scope = {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+        "method": "GET", "path": path, "raw_path": path.encode(),
+        "query_string": b"", "root_path": "", "headers": [(b"host", b"test")],
+        "scheme": "https", "client": ("192.0.2.1", 1234), "server": ("test", 443),
+    }
+    asyncio.run(asgi_app(scope, receive, send))
+    return captured.get("status", 0)
+
+
 def test_unsigned_request_still_asks_for_password(api, tmp_db, passwd):
     """裸敲域名必须仍然要口令——否则等于把鉴权去掉了。"""
     assert _get(api).status_code == 401
@@ -141,8 +171,9 @@ def test_ticket_plus_wrong_password_still_counts(api, tmp_db, passwd, secret):
     exp = int(time.time() + 3600)
     good = sign(secret, "session", 0, exp)
     for i in range(auth.FAIL_MAX):
+        # 前几次 401；打满阈值后立即 429——说明错误口令确实在计数
         assert _get(api, f"/api/status?t={good}&exp={exp}",
-                    headers=_cred("u", f"bad{i}")).status_code in (401, 302)
+                    headers=_cred("u", f"bad{i}")).status_code in (401, 429)
     blocked = _get(api, headers=_cred("u", "p"))
     assert blocked.status_code == 429, "带票据的错误口令没有计入限流"
 
@@ -210,11 +241,76 @@ def test_hook_buttons_work_without_browser_credentials(api, tmp_db, passwd):
     """
     for path in ("/api/hook/signals/1/read", "/api/hook/agent/1/confirm"):
         r = _get(api, path)
-        assert r.status_code != 401, (
-            f"{path} 被中间件拦成 401，ntfy 按钮永远点不动")
+        # **不能只断言"不是 401"**：500 也能过。这里要的是"中间件放行了，
+        # 由路由自己拒绝"——403（验签失败）或 404（对象不存在）都证明请求到达了路由。
+        # 401 = 被中间件拦死；5xx = 路由炸了。
+        assert r.status_code in (403, 404), (
+            f"{path} 期望 403/404（路由自己处理），实际 {r.status_code}："
+            "401 说明被中间件拦死，5xx 说明路由崩了")
 
 
 def test_hook_prefix_is_not_a_general_bypass(api, tmp_db, passwd):
     """放行 `/api/hook/` 不能顺带放行别的路径。"""
     assert _get(api, "/api/status").status_code == 401
     assert _get(api, "/api/hookx/status").status_code == 401
+    # 带 `..` 的路径不能借前缀放行（不把安全性建立在"路由器不规范化路径"上）。
+    # **必须发原始 ASGI 请求**：httpx 会在客户端把 `..` 规范化掉，
+    # 用普通 client 测这条等于测了个不存在的路径（变异不会变红）。
+    assert _raw_get(api, "/api/hook/../api/status") == 401
+    assert _raw_get(api, "/healthz/../api/status") == 401
+
+
+def test_every_hook_route_verifies_its_own_signature():
+    """`/api/hook/` 前缀在中间件里是放行的——**每条路由都必须自己验签**。
+
+    放行靠的是「路由内部 `verify()`」这个前提。将来有人在这里加一条不验签的
+    路由，它就静默变成公开接口——中间件不会再挡。这条守卫按 AST 检查
+    `verify(` 调用是否出现在每个 hook 路由的函数体里。
+    """
+    import ast
+    from pathlib import Path
+
+    src = Path("api/routes.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+
+    checked = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for dec in node.decorator_list:
+            if not isinstance(dec, ast.Call) or not dec.args:
+                continue
+            arg = dec.args[0]
+            if not (isinstance(arg, ast.Constant) and isinstance(arg.value, str)):
+                continue
+            if not arg.value.startswith("/api/hook/"):
+                continue
+            calls = {n.func.id for n in ast.walk(node)
+                     if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+            attrs = {n.func.attr for n in ast.walk(node)
+                     if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+            assert "verify" in calls | attrs, (
+                f"{arg.value} 在 /api/hook/ 下但没有调用 verify()："
+                "中间件对该前缀放行，它就变成公开接口了")
+            checked.append(arg.value)
+
+    assert checked, "没找到任何 /api/hook/ 路由，守卫失效"
+
+
+def test_blocked_ip_with_valid_session_still_gets_in(api, tmp_db, passwd, secret):
+    """被封的 IP 拿着有效会话必须能进。
+
+    限流是为了挡**猜口令**。会话 Cookie / 票据本身已经是「认证通过」的证明，
+    再拿它去挡等于：手机上口令手滑几次 → 被锁 15 分钟 → 连点通知链接也进不去。
+    而用户当初要的就是「点一下就开」。
+    """
+    token, exp = _ticket(secret)
+    # 先把本机 IP 打满失败次数
+    for i in range(auth.FAIL_MAX):
+        _get(api, headers=_cred("u", f"bad{i}"))
+    assert _get(api, headers=_cred("u", "p")).status_code == 429, "前置条件：应该已被封锁"
+    # 但有效会话仍然能进
+    r = _get(api, "/api/status",
+             headers={"Cookie": f"{auth.SESSION_COOKIE}={token}; "
+                                f"{auth.SESSION_COOKIE}_exp={exp}"})
+    assert r.status_code == 200, "有效会话被口令限流连累，锁在门外了"

@@ -41,8 +41,9 @@ def test_repeated_failures_get_throttled(api, tmp_db, passwd):
     """连续失败到阈值后必须返回 429，而不是继续给 401。"""
     for i in range(auth.FAIL_MAX - 1):
         assert _get(api, _cred("u", f"bad{i}")).status_code == 401
-    # 第 FAIL_MAX 次：仍然校验（返回 401），但这次之后就该封了
-    assert _get(api, _cred("u", "bad-last")).status_code == 401
+    # 第 FAIL_MAX 次：**这一次就回 429**。原先"第 10 次给 401、第 11 次才 429"
+    # 让封锁在统计上永远晚一轮，也让攻击者多拿到一次尝试机会。
+    assert _get(api, _cred("u", "bad-last")).status_code == 429
     blocked = _get(api, _cred("u", "bad-after"))
     assert blocked.status_code == 429, f"达到 {auth.FAIL_MAX} 次失败后没有限流"
     assert int(blocked.headers["retry-after"]) > 0

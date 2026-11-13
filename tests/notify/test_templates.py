@@ -33,6 +33,18 @@ def sig(**kw):
 
 # ---- 突破模板（与 spec §7.2.2 示例逐字一致）-------------------------------
 
+def _path_of(url: str) -> str:
+    """取 URL 的 scheme://host/path，丢掉查询串。
+
+    通知里的链接现在会带免密票据 `?t=..&exp=..`（点开不用再登录），
+    票据是动态的，断言不该写死它。票据本身另有专门测试。
+    """
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    return f"{parts.scheme}://{parts.netloc}{parts.path}"
+
+
 def test_breakout_text_exact():
     m = render_breakout(sig(), SECRET, CFG)
     assert m.title == "🚨 贵州茅台 放量突破" and m.priority == 5
@@ -209,7 +221,7 @@ def test_open_brief_matches_spec():
     rows = [BriefRow(f"6005{i:02d}", f"票{i}", 10.0, 92 - i, 1.0) for i in range(15)]
     m = render_open_brief(rows, n=15, secret=SECRET, cfg=CFG, pool_date=20261030)
     assert m.priority == 4
-    assert m.click == f"https://{CFG.notify.public_host}/pool"
+    assert _path_of(m.click) == f"https://{CFG.notify.public_host}/pool"
     assert m.title == "📋 今日观察池 15 只"
     head, first = m.body.splitlines()[:2]
     assert head == "Top 15（按总分）："
@@ -229,20 +241,27 @@ def test_click_uses_prefixed_code():
     """`/stock/600519` 在 api 侧 404（要 `sh600519`）；展示文案仍是 6 位。"""
     m = render_breakout(sig(code="sh600519"), SECRET, CFG)
     host = f"https://{CFG.notify.public_host}"
-    assert m.click == f"{host}/stock/sh600519"
+    assert _path_of(m.click) == f"{host}/stock/sh600519"
     assert m.body.splitlines()[0].startswith("600519 贵州茅台")
-    assert m.actions[0].url == f"{host}/stock/sh600519"
-    assert m.actions[1].url == f"{host}/stock/sh600519?tab=k"
+    assert _path_of(m.actions[0].url) == f"{host}/stock/sh600519"
+    # K 线链接的 `tab=k` 是业务参数，不能被票据顶掉：两者必须同时存在
+    from urllib.parse import parse_qs, urlsplit
+
+    kline = urlsplit(m.actions[1].url)
+    assert f"{kline.scheme}://{kline.netloc}{kline.path}" == f"{host}/stock/sh600519"
+    kq = parse_qs(kline.query)
+    assert kq.get("tab") == ["k"], "tab=k 丢了（点进去会落到默认页签）"
+    assert kq.get("t") and kq.get("exp"), "票据没带上，同一条通知里的 K 线按钮还要再登录"
 
 
 def test_breakdown_and_batch_click_use_prefixed_code():
     from notify.templates import render_batch
 
     bd = render_breakdown(sig(kind="breakdown", code="sz000001"), SECRET, CFG)
-    assert bd.click == f"https://{CFG.notify.public_host}/stock/sz000001"
+    assert _path_of(bd.click) == f"https://{CFG.notify.public_host}/stock/sz000001"
     # 合并条是「N 只同向」的列表提醒，点进去应是 /signals 而不是首只票的详情页
     bat = render_batch([sig(code="sh600519"), sig(event_id=2, code="sh600000")], SECRET, CFG)
-    assert bat.click == f"https://{CFG.notify.public_host}/signals"
+    assert _path_of(bat.click) == f"https://{CFG.notify.public_host}/signals"
 
 
 def test_open_brief_total_counts_truncated_rows():

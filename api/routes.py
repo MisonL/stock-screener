@@ -89,9 +89,10 @@ def create_app(cfg, conn_factory, clock, dispatcher=None, mcp=None) -> FastAPI:
     app = FastAPI(title="stock-screener", lifespan=lifespan)
     # **访问口令**：`SS_WEB_PASS` 配了才生效；/healthz 与 /auth 免鉴权
     # （healthcheck 不带凭据；/auth 是登录入口本身）。
-    from api.auth import middleware as _auth_middleware
+    from api.auth import make_middleware as _make_auth
 
-    app.middleware("http")(_auth_middleware)
+    # 传 `conn_factory` 才能验签推送链接里的票据（免密进来）；不传则只认 Basic。
+    app.middleware("http")(_make_auth(conn_factory))
     # 工作日志路由（Task 13）：不挂的话 `GET /api/agent-log` 永不注册
     from api.agent_log import register as register_agent_log
     from chat.session import ChatSession

@@ -337,7 +337,8 @@ class Dispatcher:
         self._push_log(row={"code": None, "kind": kind, "level": level, "seq_id": seq_id,
                             "event_id": None, "signal_id": None, "segment": 1,
                             "trade_date": self.clock.today()},
-                       msg=render_alert(kind, text, self.cfg, level=level))
+                       msg=render_alert(kind, text, self.cfg, level=level,
+                                        secret=self.secret))
 
     def open_brief(self, rows: list[BriefRow], n: int, overflow=None, pool_date=None,
                    baseline_days=None, auction_detections=None) -> None:
@@ -362,7 +363,8 @@ class Dispatcher:
             "SELECT level, count(*) FROM signals WHERE trade_date=? GROUP BY level", (day,))}
         stats = CloseStats(pushed=pushed, suppressed=suppressed, signals_n=sum(by_kind.values()),
                            by_kind=by_kind, by_level=by_level, pool_sizes=self._pool_sizes())
-        msg = render_close_digest(stats, self.cfg, trade_date=day)
+        msg = render_close_digest(stats, self.cfg, trade_date=day,
+                                      secret=self.secret)
         self._push_log(row={"code": None, "kind": "close_digest", "level": "P2",
                             "seq_id": msg.seq_id, "event_id": None, "signal_id": None,
                             "segment": 1, "trade_date": day}, msg=msg)

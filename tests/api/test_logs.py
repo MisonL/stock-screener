@@ -51,3 +51,36 @@ def test_install_is_idempotent():
         assert after - before <= 1, f"install() 叠加了多个过滤器：{before} -> {after}"
     finally:
         logger.filters = [f for f in logger.filters if not isinstance(f, HealthzFilter)]
+
+
+def test_ticket_in_query_is_redacted():
+    """推送链接的免密票据不能落到日志里。
+
+    链接长这样：`/stock/sh600519?t=<签名>&exp=<到期>`。整条记进 `docker logs`
+    等于把免密凭据写进日志文件——能看日志的人就能登录。只保留路径就够排障了。
+    """
+    import logging
+
+    from api.logs import HealthzFilter
+
+    rec = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1, "%s - %s", None, None)
+    rec.args = ("1.2.3.4:5", "GET", "/stock/sh600519?t=abcdef&exp=1797174302", "HTTP/1.1", 302)
+    assert HealthzFilter().filter(rec) is True          # 保留这条日志
+    logged = str(rec.args[2])
+    assert "abcdef" not in logged, "票据明文进了日志"
+    assert "1797174302" not in logged, "到期时刻进了日志"
+    assert "/stock/sh600519" in logged, "路径被一起抹掉了，日志失去排障价值"
+
+
+def test_business_query_params_are_kept():
+    """业务参数（如 `tab=k`）必须留着，只打码凭据。"""
+    import logging
+
+    from api.logs import HealthzFilter
+
+    rec = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1, "%s", None, None)
+    rec.args = ("1.2.3.4:5", "GET", "/stock/sh600519?tab=k&t=secret123&exp=99", "HTTP/1.1", 200)
+    HealthzFilter().filter(rec)
+    logged = str(rec.args[2])
+    assert "tab=k" in logged
+    assert "secret123" not in logged

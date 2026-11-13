@@ -15,7 +15,9 @@ from typing import Literal
 
 from core.clock import SH
 
-Purpose = Literal["read", "confirm"]
+# `session` 是「网页访问票据」：推送里的链接带上它，点开即自动登录。
+# 与 read/confirm 用不同 purpose，三类票据互不通用（同一 id 也签不出同一张票）。
+Purpose = Literal["read", "confirm", "session"]
 _SECRET_BYTES = 32
 
 

@@ -484,7 +484,10 @@ def test_batch_click_points_to_signals(env):
     import json as _json
     sig = _ls(env.conn, env.ids["sh600519"])
     msg = render_batch([sig] * 3, b"x" * 32, CFG)
-    assert msg.click.endswith("/signals")
+    # 链接现在带免密票据（`?t=..&exp=..`），所以不能直接 endswith
+    from urllib.parse import urlsplit
+
+    assert urlsplit(msg.click).path == "/signals"
 
 
 def test_confirm_result_audit_rows_do_not_consume_daily_cap(env):

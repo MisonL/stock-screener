@@ -17,16 +17,44 @@ import logging
 QUIET_PATHS: frozenset[str] = frozenset({"/healthz"})
 
 
+#: 查询串里要打码的参数名。推送链接会带 `?t=<签名>&exp=<到期>`，
+#: 那把整个 URL 记进 `docker logs` 等于把**免密凭据**写进日志文件，
+#: 任何能看日志的人都能拿它登录。日志留痕只保留路径就够了。
+SECRET_QUERY_KEYS: frozenset[str] = frozenset({"t", "exp"})
+
+
+def _redact_query(raw: str) -> str:
+    """把敏感查询参数的值换成 `***`，其余原样保留。
+
+    不能用「整条丢掉」：`/stock/sh600519?tab=k` 这类业务参数对排障有用。
+    """
+    if "?" not in raw:
+        return raw
+    path, _, query = raw.partition("?")
+    if not query:
+        return path
+    kept = []
+    for pair in query.split("&"):
+        key, sep, _value = pair.partition("=")
+        kept.append(f"{key}{sep}***" if key in SECRET_QUERY_KEYS else pair)
+    return f"{path}?{'&'.join(kept)}"
+
+
 class HealthzFilter(logging.Filter):
-    """丢弃 `QUIET_PATHS` 的 access 记录。"""
+    """丢弃 `QUIET_PATHS` 的 access 记录，并给查询串里的凭据打码。"""
 
     def filter(self, record: logging.LogRecord) -> bool:
         args = record.args
         # 正常是 5 元组；形状不对时**保留**（宁可多打一行，也不要吞掉意外格式的日志）
         if isinstance(args, tuple) and len(args) >= 3:
-            path = str(args[2]).split("?")[0]
+            raw = str(args[2])
+            path = raw.split("?")[0]
             if path in QUIET_PATHS:
                 return False
+            if "?" in raw:
+                # 元组是不可变的，重建一份；只替换路径这一项
+                record.args = tuple(
+                    _redact_query(str(a)) if i == 2 else a for i, a in enumerate(args))
         return True
 
 

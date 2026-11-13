@@ -109,6 +109,12 @@ VM 侧要到第 6 节 `up` 之后再验：`$DC ps cloudflared` 显示 running，
 - `deploy/docker-compose.yml` 只把它挂给 **api** 服务（agent/jobs 不对外）
 - **`/healthz` 与 `/auth` 免鉴权**：healthcheck 不带凭据，挡了会被判 unhealthy 并无限重启
 - 未配 `SS_WEB_PASS` 时保持开放（本机开发 / 纯内网），不会把自己锁在门外
+- **推送链接免密**：通知里的每个链接都带签名票据 `?t=..&exp=..`，点开即进，
+  不再弹原生登录框；首次进入后拿 `HttpOnly` 会话 Cookie，之后刷新也不再问。
+  裸敲域名（无票据无 Cookie）仍然要口令。
+  票据有效期 30 天（`SS_SESSION_DAYS` 可改）。**要让所有在飞链接立刻失效**：
+  删掉 `sqlite3 data/market.db "DELETE FROM app_secret WHERE name='hmac_key'"` 再重启 api。
+  访问日志里的 `t`/`exp` 会自动打码成 `***`，不会把凭据写进 `docker logs`。
 - 口令比较用 `hmac.compare_digest`（常量时间），避免前缀时序泄露
 
 验证（三条都要对）：

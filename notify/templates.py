@@ -117,14 +117,42 @@ def _code_url(sig: SigRow) -> str:
     return sig.code or sig.code6
 
 
-def _link(cfg, path: str) -> str:
+# 会话票据有效期。30 天：手机点一次之后 Cookie 生效，不必反复登录；
+# 同时也不是永久——换密钥或过期都需要重新点一次通知。
+SESSION_LINK_DAYS = 30
+
+
+def _session_ticket(secret: bytes | None):
+    """造一张网页访问票据，返回 `(token, exp_ts)`；没有密钥时返回 `(None, 0)`。"""
+    if secret is None:
+        return None, 0
+    import time as _time
+
+    from notify.hmac_sign import sign
+
+    exp_ts = int(_time.time() + SESSION_LINK_DAYS * 24 * 3600)
+    return sign(secret, "session", 0, exp_ts), exp_ts
+
+
+def _link(cfg, path: str, secret: bytes | None = None) -> str:
+    """拼通知里的绝对 https 链接；给了 `secret` 就带上免密票据。
+
+    **票据放进 URL 是为了「从通知点开不用再输口令」**：手机浏览器不总记得
+    HTTP Basic 凭据，一次推送弹一次原生登录框。服务端验票后发 Cookie 并 302
+    把 `t`/`exp` 从地址栏抹掉，之后这个浏览器就不再问。
+    直接敲域名进来没有票据，仍然走 Basic——这是本设计要保留的边界。
+    """
     url = f"{_host(cfg)}{path}"
     assert url.startswith("https://"), f"通知里的链接必须是绝对 https 地址：{url}"
+    token, exp_ts = _session_ticket(secret)
+    if token:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}t={token}&exp={exp_ts}"
     return url
 
 
-def _base_click(cfg, code6: str) -> str:
-    return _link(cfg, f"/stock/{code6}")
+def _base_click(cfg, code6: str, secret: bytes | None = None) -> str:
+    return _link(cfg, f"/stock/{code6}", secret)
 
 
 def _limit_line(sig: SigRow) -> str | None:
@@ -167,7 +195,7 @@ def render_breakout(sig: SigRow, secret: bytes, cfg) -> Message:
     return Message(
         title=title, body="\n".join(lines), priority=5 if sig.level == "P0" else 3,
         tags=["rotating_light"] if sig.level == "P0" else ["chart_with_upwards_trend"],
-        click=_base_click(cfg, _code_url(sig)), actions=_actions(sig, secret, cfg),
+        click=_base_click(cfg, _code_url(sig), secret), actions=_actions(sig, secret, cfg),
         seq_id=_seq_id(sig),
     )
 
@@ -191,7 +219,7 @@ def render_breakdown(sig: SigRow, secret: bytes, cfg) -> Message:
     ]
     return Message(
         title=title, body="\n".join(lines), priority=5, tags=["warning"],
-        click=_base_click(cfg, _code_url(sig)), actions=_actions(sig, secret, cfg),
+        click=_base_click(cfg, _code_url(sig), secret), actions=_actions(sig, secret, cfg),
         seq_id=_seq_id(sig),
     )
 
@@ -212,7 +240,7 @@ def render_batch(items: list[SigRow], secret: bytes, cfg) -> Message:
     return Message(
         title=f"📋 {head}", body="\n".join(lines), priority=priority, tags=["memo"],
         # 合并条点进去看**列表**：单票页对「3 只同向」没有意义
-        click=_link(cfg, "/signals"), actions=_actions(first, secret, cfg), seq_id=seq_id,
+        click=_link(cfg, "/signals", secret), actions=_actions(first, secret, cfg), seq_id=seq_id,
     )
 
 
@@ -288,11 +316,12 @@ def render_open_brief(rows: list[BriefRow], n: int, secret: bytes, cfg, overflow
     trade_date = pool_date or 0
     return Message(
         title=f"📋 今日观察池 {total} 只", body="\n".join(lines), priority=4, tags=["memo"],
-        click=_link(cfg, "/pool"), seq_id=f"open-{trade_date}",
+        click=_link(cfg, "/pool", secret), seq_id=f"open-{trade_date}",
     )
 
 
-def render_close_digest(stats: CloseStats, cfg, trade_date: int = 0) -> Message:
+def render_close_digest(stats: CloseStats, cfg, trade_date: int = 0,
+                        secret: bytes | None = None) -> Message:
     body = [
         f"推送 {stats.pushed} 条 ｜ 压制 {stats.suppressed} 条 ｜ 信号 {stats.signals_n} 条",
         " · ".join(f"{k} {v}" for k, v in sorted(stats.by_kind.items())) or "无",
@@ -301,17 +330,18 @@ def render_close_digest(stats: CloseStats, cfg, trade_date: int = 0) -> Message:
     # **图标只留一处**：标题不写 emoji，交给 `tags` 渲染。
     # 两边都写时手机端显示两个图标（实机验证：两个夕阳）。
     return Message(title="收盘统计", body="\n".join(body), priority=3, tags=["city_sunset"],
-                   click=_link(cfg, "/"), seq_id=f"close-{trade_date}")
+                   click=_link(cfg, "/", secret), seq_id=f"close-{trade_date}")
 
 
 _ALERT_PRIORITY = {"P0": 5, "P1": 4, "P2": 3}
 
 
-def render_alert(kind: str, text: str, cfg, level: str = "P1") -> Message:
+def render_alert(kind: str, text: str, cfg, level: str = "P1",
+                 secret: bytes | None = None) -> Message:
     """系统告警（§7.2）：P0 → 5 urgent（watchdog 的 agent 停止必须响铃），P1 → 4，P2 → 3。"""
     # 同上：图标交给 `tags`，标题只放文字
     return Message(title=kind, body=text, priority=_ALERT_PRIORITY[level], tags=["bell"],
-                   click=_link(cfg, "/"))
+                   click=_link(cfg, "/", secret))
 
 
 def render_confirm_card(turn_id: int, action_desc: str, host: str, secret: bytes, cfg,
@@ -343,8 +373,8 @@ def _summary_line(sig: SigRow) -> str:
 def _actions(sig: SigRow, secret: bytes, cfg) -> list[NtfyAction]:
     token = sign(secret, "read", sig.id, day_end_ts(sig.event_trade_date))
     return [
-        NtfyAction("view", "看详情", _base_click(cfg, _code_url(sig))),
-        NtfyAction("view", "K 线", _link(cfg, f"/stock/{_code_url(sig)}?tab=k")),
+        NtfyAction("view", "看详情", _base_click(cfg, _code_url(sig), secret)),
+        NtfyAction("view", "K 线", _link(cfg, f"/stock/{_code_url(sig)}?tab=k", secret)),
         NtfyAction("http", "标记已读", _link(cfg, f"/api/hook/signals/{sig.id}/read?t={token}"),
                    method="POST"),
     ]

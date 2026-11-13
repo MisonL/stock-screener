@@ -5,8 +5,22 @@
 **完全裸奔**——外网任何人 `curl https://stock.<域名>/api/status` 就能读到
 服务状态、池子、信号，甚至调写接口。
 
-**为什么用 Basic 而不是自建登录页**：浏览器原生弹框即可，手机上输一次由系统
-记住，不用写前端代码，也不会因为刷新丢 session。
+**为什么用 Basic 而不是自建登录页**：浏览器原生弹框即可，不用写前端代码。
+
+**但手机浏览器不总记得 Basic 凭据**——从 ntfy 点开链接会一次次弹原生登录框。
+所以加了一层 **会话票据 + Cookie**：
+
+1. 推送里的每个链接都带 `?t=<签名>&exp=<到期>`，点开即自动登录（**不弹框**）；
+2. 浏览器随后拿到 `HttpOnly; Secure; SameSite=Lax` 的会话 Cookie，
+   之后刷新、换页面都不再问；
+3. 直接输入域名（没有票据、也没有 Cookie）仍然走 Basic——这正是要的：
+   **从通知点进来的免密，裸敲网址的照样要口令**；
+4. Basic 登录成功后也发同一个 Cookie，所以手动输过一次之后就不再弹了。
+
+票据是 `hmac_sha256(secret, "session:0:<exp>")`，密钥复用 `app_secret.hmac_key`。
+`purpose` 与 `read`/`confirm` 分开，三类票据互不通用。
+链接里带凭据的代价是它会出现在访问日志里——因此**过期时间有限、且只能读网页**；
+要立刻让所有在飞的链接失效，删掉 `app_secret.hmac_key` 那一行即可。
 
 **为什么口令放环境变量**：`config/` 是挂载进容器的、会进 Git；口令不该进版本库。
 不配 `SS_WEB_PASS` 时**保持开放**（本机开发、内网自用），避免把自己锁在门外。
@@ -23,6 +37,31 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 
 _log = logging.getLogger("api.auth")
+
+# ---- 会话票据（推送链接免密）--------------------------------------------
+# Cookie 名。`__Host-` 前缀要求 Secure + Path=/ + 无 Domain，浏览器会强制检查；
+# 这里不用它是因为自签/本地调试时没有 https 会让浏览器直接丢弃 Cookie。
+SESSION_COOKIE = "ss_session"
+# 有效期：票据与 Cookie 同一个到期时刻。短了手机上一天点几次就要重新登录，
+# 长了等于把口令写进 URL 长期有效。30 天是折中，可用环境变量改。
+SESSION_DAYS_ENV = "SS_SESSION_DAYS"
+DEFAULT_SESSION_DAYS = 30
+
+def _load_secret(conn_factory) -> bytes | None:
+    """取签名密钥。**不关连接**：工厂可能返回共享连接。
+
+    **故意不缓存**：`ensure_secret` 只是一次主键 SELECT（`app_secret` 几行），
+    而缓存会让「删掉 `app_secret.hmac_key` 让在飞票据立刻失效」变成一个
+    最长要等一分钟的操作——安全开关不该有延迟。缓存还曾让测试互相污染
+    （单跑通过、合跑失败），这种隐蔽性不值得那点查询开销换。
+    """
+    try:
+        from notify.hmac_sign import ensure_secret
+
+        return ensure_secret(conn_factory())
+    except Exception:                        # noqa: BLE001 —— 取不到就退化为仅 Basic
+        _log.warning("取不到签名密钥，退化为仅 Basic 鉴权", exc_info=True)
+        return None
 
 USER_ENV = "SS_WEB_USER"
 PASS_ENV = "SS_WEB_PASS"
@@ -61,6 +100,46 @@ def _credentials() -> tuple[str, str] | None:
     if not pw:
         return None
     return (os.environ.get(USER_ENV) or DEFAULT_USER).strip(), pw
+
+
+def _session_days() -> int:
+    raw = (os.environ.get(SESSION_DAYS_ENV) or "").strip()
+    try:
+        days = int(raw)
+    except ValueError:
+        return DEFAULT_SESSION_DAYS
+    return days if days > 0 else DEFAULT_SESSION_DAYS
+
+
+def issue_session(secret: bytes, exp_ts: int) -> str:
+    """签一张网页访问票据。`ref_id` 固定 0：本系统只有单一口令，没有多用户。"""
+    from notify.hmac_sign import sign
+
+    return sign(secret, "session", 0, exp_ts)
+
+
+def session_ok(secret: bytes, token: str, exp_ts: int, now: float) -> bool:
+    """票据有效且未过期。**过期判断在这里做**：`verify` 只看签名。"""
+    from notify.hmac_sign import verify
+
+    if not token or exp_ts <= 0 or now >= exp_ts:
+        return False
+    return verify(secret, "session", 0, exp_ts, token)
+
+
+def _cookie_value(request: Request) -> str:
+    return (request.cookies.get(SESSION_COOKIE) or "").strip()
+
+
+def _set_session_cookie(response, token: str, days: int):
+    """`HttpOnly` 防 XSS 读走；`Secure` 只在 https 下发送；`Lax` 兼顾跳转链接。"""
+    response.set_cookie(
+        SESSION_COOKIE, token,
+        max_age=days * 24 * 3600, httponly=True, secure=True, samesite="lax", path="/",
+    )
+    # 链接里带过凭据：别让 Referer 把它泄给站外
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    return response
 
 
 def _parse_basic(header: str | None) -> tuple[str, str] | None:
@@ -173,33 +252,100 @@ def _too_many(until: float) -> JSONResponse:
     )
 
 
-async def middleware(request: Request, call_next):
-    """口令校验。挂在整个 app 上，**逐请求读环境变量**（改了不用重启构造）。"""
-    path = request.url.path
-    if any(path == p or path.startswith(p + "/") for p in OPEN_PATHS):
-        return await call_next(request)
+def make_middleware(conn_factory=None):
+    """造一个挂了签名密钥来源的中间件。
 
-    creds = _credentials()
-    if creds is None:
-        return await call_next(request)
+    `conn_factory` 用来取 `app_secret.hmac_key`（票据验签）。测试可以不传，
+    此时**只认 Basic**——没有密钥就没法验票，退化成原来的行为最安全。
+    """
 
-    key = _client_key(request)
-    now = time.time()
-    until = _blocked_until(key, now)
-    if until > now:
-        return _too_many(until)
+    async def middleware(request: Request, call_next):
+        """口令校验。挂在整个 app 上，**逐请求读环境变量**（改了不用重启构造）。"""
+        path = request.url.path
+        if any(path == p or path.startswith(p + "/") for p in OPEN_PATHS):
+            return await call_next(request)
 
-    got = _parse_basic(request.headers.get("authorization"))
-    if got is None:
-        _note_failure(key, now)
-        return _challenge()
-    want_user, want_pw = creds
-    # **常量时间比较**：普通 == 会因为提前返回泄露前缀长度
-    ok_user = hmac.compare_digest(got[0].encode(), want_user.encode())
-    ok_pass = hmac.compare_digest(got[1].encode(), want_pw.encode())
-    if not (ok_user and ok_pass):
-        _log.warning("口令错误：user=%r path=%s", got[0][:40], path)
-        _note_failure(key, now)
-        return _challenge()
-    _note_success(key)
-    return await call_next(request)
+        creds = _credentials()
+        if creds is None:
+            return await call_next(request)
+
+        key = _client_key(request)
+        now = time.time()
+        until = _blocked_until(key, now)
+        if until > now:
+            return _too_many(until)
+
+        days = _session_days()
+        secret = _load_secret(conn_factory) if conn_factory is not None else None
+
+        # ① 已有会话 Cookie：最省事的一条路，手机刷新/换页都不会再弹框
+        if secret is not None:
+            token = _cookie_value(request)
+            exp_raw = request.cookies.get(SESSION_COOKIE + "_exp") or ""
+            try:
+                exp = int(exp_raw)
+            except ValueError:
+                exp = 0
+            if token and session_ok(secret, token, exp, now):
+                _note_success(key)
+                return await call_next(request)
+
+            # ② 推送链接里带的票据：验过就发 Cookie，然后把 URL 上的凭据抹掉
+            q_token = (request.query_params.get("t") or "").strip()
+            q_exp = (request.query_params.get("exp") or "").strip()
+            # **带了口令就先校验口令**：否则「有效票据 + 错误口令」会被票据直接放行，
+            # 错误口令既不失败也不计数——限流形同虚设。
+            if request.headers.get("authorization"):
+                bad = _parse_basic(request.headers.get("authorization"))
+                want_user, want_pw = creds
+                if bad is None or not (
+                        hmac.compare_digest(bad[0].encode(), want_user.encode())
+                        and hmac.compare_digest(bad[1].encode(), want_pw.encode())):
+                    _log.warning("口令错误（票据请求）：path=%s", path)
+                    _note_failure(key, now)
+                    return _challenge()
+            if q_token and q_exp.isdigit() and session_ok(secret, q_token, int(q_exp), now):
+                _note_success(key)
+                # 去掉 t/exp 后 302，避免票据留在地址栏、历史和 Referer 里
+                rest = [(k, v) for k, v in request.query_params.multi_items()
+                        if k not in ("t", "exp")]
+                qs = "&".join(f"{k}={v}" for k, v in rest)
+                target = path + (f"?{qs}" if qs else "")
+                from fastapi.responses import RedirectResponse
+
+                resp = RedirectResponse(target, status_code=302)
+                return _set_session_cookie(resp, q_token, days)
+
+        got = _parse_basic(request.headers.get("authorization"))
+        if got is None:
+            # **过期票据不该计入口令失败**：否则手机点几条旧通知就被锁 15 分钟，
+            # 而用户根本没输过口令。它也不是猜口令的尝试，不占用限流额度。
+            # 但**只要带了口令就照常计数**——否则「票据 + 错误口令」就能绕过限流。
+            if not request.query_params.get("t"):
+                _note_failure(key, now)
+            return _challenge()
+        want_user, want_pw = creds
+        # **常量时间比较**：普通 == 会因为提前返回泄露前缀长度
+        ok_user = hmac.compare_digest(got[0].encode(), want_user.encode())
+        ok_pass = hmac.compare_digest(got[1].encode(), want_pw.encode())
+        if not (ok_user and ok_pass):
+            _log.warning("口令错误：user=%r path=%s", got[0][:40], path)
+            _note_failure(key, now)
+            return _challenge()
+        _note_success(key)
+        response = await call_next(request)
+        # ③ Basic 成功后也发 Cookie：手动输过一次之后就不再弹原生框
+        if secret is not None:
+            exp_ts = int(now + days * 24 * 3600)
+            token = issue_session(secret, exp_ts)
+            _set_session_cookie(response, token, days)
+            response.set_cookie(SESSION_COOKIE + "_exp", str(exp_ts),
+                                max_age=days * 24 * 3600, httponly=True,
+                                secure=True, samesite="lax", path="/")
+        return response
+
+    return middleware
+
+
+# 兼容旧装配：没有 conn_factory 时只认 Basic（不会突然变宽松）
+middleware = make_middleware()

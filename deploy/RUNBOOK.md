@@ -112,7 +112,9 @@ VM 侧要到第 6 节 `up` 之后再验：`$DC ps cloudflared` 显示 running，
 - **推送链接免密**：通知里的每个链接都带签名票据 `?t=..&exp=..`，点开即进，
   不再弹原生登录框；首次进入后拿 `HttpOnly` 会话 Cookie，之后刷新也不再问。
   裸敲域名（无票据无 Cookie）仍然要口令。
-  票据有效期 30 天（`SS_SESSION_DAYS` 可改）。**要让所有在飞链接立刻失效**：
+  票据有效期 30 天（`SS_SESSION_DAYS` 可改，**同时作用于 Cookie 与推送链接**）。
+  **本地 http 调试时 Secure Cookie 不会持久化**：浏览器与 httpx 都不回传，
+  每次请求仍要 Basic。这是 `Secure` 属性的应有行为，别为了本地方便去掉它。**要让所有在飞链接立刻失效**：
   删掉 `sqlite3 data/market.db "DELETE FROM app_secret WHERE name='hmac_key'"` 再重启 api。
   访问日志里的 `t`/`exp` 会自动打码成 `***`，不会把凭据写进 `docker logs`。
 - 口令比较用 `hmac.compare_digest`（常量时间），避免前缀时序泄露

@@ -44,8 +44,7 @@ _log = logging.getLogger("api.auth")
 SESSION_COOKIE = "ss_session"
 # 有效期：票据与 Cookie 同一个到期时刻。短了手机上一天点几次就要重新登录，
 # 长了等于把口令写进 URL 长期有效。30 天是折中，可用环境变量改。
-SESSION_DAYS_ENV = "SS_SESSION_DAYS"
-DEFAULT_SESSION_DAYS = 30
+# 有效期常量在 `notify/hmac_sign.py`（api 与 notify 共用同一个来源）
 
 def _load_secret(conn_factory) -> bytes | None:
     """取签名密钥。**不关连接**：工厂可能返回共享连接。
@@ -70,6 +69,17 @@ DEFAULT_USER = "admin"
 # **只放行不通外网的端点**：docker healthcheck 不带凭据，挡了会被判 unhealthy
 # 并触发无限重启；`/auth` 本身是登录入口，挡了就没法登录。
 OPEN_PATHS = ("/healthz", "/auth")
+
+#: 自带签名保护的路径**前缀**：它们的鉴权由路由自己用 `verify()` 完成，
+#: 全局口令中间件必须放行，否则 ntfy 的按钮请求（不携带任何浏览器凭据）会被 401。
+#:
+#: **为什么必须在中间件放行**：ntfy 的「标记已读」「确认执行」是服务端直接 POST，
+#: 根本没有浏览器、没有 Cookie、也不会弹口令框。放行是安全的——两个路由都
+#: 强制 `verify(secret, purpose, id, exp, token)` + 过期判断，purpose 写进签名原文，
+#: read / confirm / session 三类票据互不通用。
+#:
+#: **新增 `/api/hook/` 下的路由时必须自己验签**，守卫测试会检查这一点。
+SELF_SIGNED_PREFIXES = ("/api/hook/",)
 
 # ---- 失败限流 -----------------------------------------------------------
 # 没有限流时，外网可以对 `/api/...` 无限次猜口令（实测连打 10 次全是 401、
@@ -103,12 +113,9 @@ def _credentials() -> tuple[str, str] | None:
 
 
 def _session_days() -> int:
-    raw = (os.environ.get(SESSION_DAYS_ENV) or "").strip()
-    try:
-        days = int(raw)
-    except ValueError:
-        return DEFAULT_SESSION_DAYS
-    return days if days > 0 else DEFAULT_SESSION_DAYS
+    from notify.hmac_sign import session_days
+
+    return session_days()
 
 
 def issue_session(secret: bytes, exp_ts: int) -> str:
@@ -116,6 +123,19 @@ def issue_session(secret: bytes, exp_ts: int) -> str:
     from notify.hmac_sign import sign
 
     return sign(secret, "session", 0, exp_ts)
+
+
+def session_signature_valid(secret: bytes, token: str, exp_ts: int) -> bool:
+    """**只看签名**，不管是否过期。
+
+    用来区分「合法签发但已过期」与「伪造/垃圾」：前者不该计入口令失败
+    （用户点了一条旧通知），后者应该计入（有人在试探）。
+    """
+    from notify.hmac_sign import verify
+
+    if not token or exp_ts <= 0:
+        return False
+    return verify(secret, "session", 0, exp_ts, token)
 
 
 def session_ok(secret: bytes, token: str, exp_ts: int, now: float) -> bool:
@@ -131,12 +151,23 @@ def _cookie_value(request: Request) -> str:
     return (request.cookies.get(SESSION_COOKIE) or "").strip()
 
 
-def _set_session_cookie(response, token: str, days: int):
-    """`HttpOnly` 防 XSS 读走；`Secure` 只在 https 下发送；`Lax` 兼顾跳转链接。"""
-    response.set_cookie(
-        SESSION_COOKIE, token,
-        max_age=days * 24 * 3600, httponly=True, secure=True, samesite="lax", path="/",
-    )
+def _set_session_cookie(response, token: str, exp_ts: int):
+    """写入 `ss_session` **与** `ss_session_exp` 两枚 Cookie。
+
+    **必须同时写**：Cookie 分支验签要用到期时刻，而这个时刻只存在于 URL 的
+    `exp` 参数里。上一版票据分支只写了 `ss_session`，于是 302 之后的下一次请求
+    找不到 `exp` → `session_ok` 判否 → 又落回 Basic 弹框，**免密链路完全没生效**。
+    测试当时只断言"302 + Set-Cookie 里有 ss_session"，所以全绿。
+
+    有效期取票据自己的 `exp`，不另算：两者不一致会让 Cookie 比票据活得久或短。
+    """
+    max_age = max(0, int(exp_ts - time.time()))
+    for name, value in ((SESSION_COOKIE, token),
+                        (SESSION_COOKIE + "_exp", str(exp_ts))):
+        response.set_cookie(
+            name, value,
+            max_age=max_age, httponly=True, secure=True, samesite="lax", path="/",
+        )
     # 链接里带过凭据：别让 Referer 把它泄给站外
     response.headers.setdefault("Referrer-Policy", "no-referrer")
     return response
@@ -264,6 +295,9 @@ def make_middleware(conn_factory=None):
         path = request.url.path
         if any(path == p or path.startswith(p + "/") for p in OPEN_PATHS):
             return await call_next(request)
+        # 自带 HMAC 验签的回调端点：ntfy 直接 POST，没有浏览器凭据
+        if any(path.startswith(prefix) for prefix in SELF_SIGNED_PREFIXES):
+            return await call_next(request)
 
         creds = _credentials()
         if creds is None:
@@ -314,14 +348,22 @@ def make_middleware(conn_factory=None):
                 from fastapi.responses import RedirectResponse
 
                 resp = RedirectResponse(target, status_code=302)
-                return _set_session_cookie(resp, q_token, days)
+                return _set_session_cookie(resp, q_token, int(q_exp))
 
         got = _parse_basic(request.headers.get("authorization"))
         if got is None:
-            # **过期票据不该计入口令失败**：否则手机点几条旧通知就被锁 15 分钟，
-            # 而用户根本没输过口令。它也不是猜口令的尝试，不占用限流额度。
-            # 但**只要带了口令就照常计数**——否则「票据 + 错误口令」就能绕过限流。
-            if not request.query_params.get("t"):
+            # **只有「合法签发但已过期」的票据才不计失败**：用户点了一条旧通知，
+            # 不该被锁 15 分钟。伪造/垃圾票据**照常计数**——上一版只看 `t` 是否
+            # 非空，于是加一个 `?t=garbage` 就能无限试探而不进限流表。
+            # 带 Authorization 的情况已在上面校验过并计数，走不到这里。
+            stale_but_real = False
+            if secret is not None:
+                t = (request.query_params.get("t") or "").strip()
+                e = (request.query_params.get("exp") or "").strip()
+                if t and e.isdigit():
+                    stale_but_real = (session_signature_valid(secret, t, int(e))
+                                      and int(e) <= now)
+            if not stale_but_real:
                 _note_failure(key, now)
             return _challenge()
         want_user, want_pw = creds
@@ -337,11 +379,7 @@ def make_middleware(conn_factory=None):
         # ③ Basic 成功后也发 Cookie：手动输过一次之后就不再弹原生框
         if secret is not None:
             exp_ts = int(now + days * 24 * 3600)
-            token = issue_session(secret, exp_ts)
-            _set_session_cookie(response, token, days)
-            response.set_cookie(SESSION_COOKIE + "_exp", str(exp_ts),
-                                max_age=days * 24 * 3600, httponly=True,
-                                secure=True, samesite="lax", path="/")
+            _set_session_cookie(response, issue_session(secret, exp_ts), exp_ts)
         return response
 
     return middleware

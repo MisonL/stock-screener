@@ -117,20 +117,20 @@ def _code_url(sig: SigRow) -> str:
     return sig.code or sig.code6
 
 
-# 会话票据有效期。30 天：手机点一次之后 Cookie 生效，不必反复登录；
-# 同时也不是永久——换密钥或过期都需要重新点一次通知。
-SESSION_LINK_DAYS = 30
-
-
 def _session_ticket(secret: bytes | None):
-    """造一张网页访问票据，返回 `(token, exp_ts)`；没有密钥时返回 `(None, 0)`。"""
+    """造一张网页访问票据，返回 `(token, exp_ts)`；没有密钥时返回 `(None, 0)`。
+
+    有效期取 `notify.hmac_sign.session_days()`——与 api 发 Cookie 用的是**同一个**
+    `SS_SESSION_DAYS`。上一版这里写死 30 天，改环境变量只影响 Cookie 不影响链接，
+    RUNBOOK 说的「可改」等于没生效。
+    """
     if secret is None:
         return None, 0
     import time as _time
 
-    from notify.hmac_sign import sign
+    from notify.hmac_sign import session_days, sign
 
-    exp_ts = int(_time.time() + SESSION_LINK_DAYS * 24 * 3600)
+    exp_ts = int(_time.time() + session_days() * 24 * 3600)
     return sign(secret, "session", 0, exp_ts), exp_ts
 
 

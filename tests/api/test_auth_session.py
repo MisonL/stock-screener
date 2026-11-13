@@ -16,6 +16,8 @@ import asyncio
 import base64
 import time
 
+import httpx
+
 import pytest
 
 from api import auth
@@ -143,3 +145,76 @@ def test_ticket_plus_wrong_password_still_counts(api, tmp_db, passwd, secret):
                     headers=_cred("u", f"bad{i}")).status_code in (401, 302)
     blocked = _get(api, headers=_cred("u", "p"))
     assert blocked.status_code == 429, "带票据的错误口令没有计入限流"
+
+
+def _browser_flow(api, path: str):
+    """**同一个 client** 连发两次，**中间不重定向**，手动跟随 `Location`。
+
+    浏览器收到 302 会自己带上刚拿到的 Cookie。测试里必须模拟这一点——
+    直接让 httpx 自动跟随会把 Set-Cookie 丢掉（`ASGITransport` 加默认
+    client 时 cookie jar 行为不一致），于是"免密没生效"这种真缺陷会被
+    "浏览器会处理"的假设掩盖掉。
+
+    `base_url` 必须是 https：Cookie 带 `Secure`，http 下 httpx 不会回传。
+    """
+    async def run():
+        # 用 `https://` 的 client：Cookie 带 `Secure`，http 下 httpx 不会回传，
+        # 测试就会得到"免密没生效"的假失败（或反过来掩盖真问题）。
+        client = api()
+        client.base_url = httpx.URL("https://test")
+        async with client:
+            first = await client.get(path)
+            if first.headers.get("location"):
+                second = await client.get(first.headers["location"])
+            else:
+                second = first
+            return first, second
+
+    return asyncio.run(run())
+
+
+def test_ticket_login_then_next_request_succeeds(api, tmp_db, passwd, secret):
+    """**端到端**：点链接 → 302 → 跟着跳转的那次请求必须 200。
+
+    上一版就在这里断了：票据分支只写 `ss_session`，而 Cookie 校验还要
+    `ss_session_exp`；跳转后的请求找不到到期时刻 → 又弹 Basic。
+    """
+    token, exp = _ticket(secret)
+    first, second = _browser_flow(api, f"/api/status?t={token}&exp={exp}")
+    assert first.status_code == 302
+    assert second.status_code == 200, (
+        f"跟随 302 之后仍然要口令（{second.status_code}）：免密链路没生效")
+
+
+def test_ticket_sets_both_cookies(api, tmp_db, passwd, secret):
+    """两枚 Cookie 必须一起写，且有效期为**票据自己的** exp。"""
+    token, exp = _ticket(secret)
+    r = _get(api, f"/api/status?t={token}&exp={exp}")
+    cookies = r.headers.get_list("set-cookie")
+    joined = "; ".join(cookies)
+    assert auth.SESSION_COOKIE in joined
+    assert auth.SESSION_COOKIE + "_exp" in joined, "没有写 ss_session_exp，下次请求会弹框"
+    for c in cookies:
+        assert "HttpOnly" in c, f"Cookie 少了 HttpOnly：{c}"
+        assert "Secure" in c, f"Cookie 少了 Secure：{c}"
+        assert "SameSite=lax" in c.replace("samesite=lax", "SameSite=lax")
+
+
+def test_hook_buttons_work_without_browser_credentials(api, tmp_db, passwd):
+    """ntfy 的「标记已读」「确认执行」不带浏览器凭据，必须能过中间件。
+
+    这两个按钮是 ntfy **服务端直接 POST**，没有浏览器、没有 Cookie、也不会
+    弹口令框。全局中间件按 Basic 拦它 → 401，路由自己的 HMAC 根本没机会跑，
+    于是"标记已读"从来没能生效（生产库证据：94 条信号 `read_at` 全为空）。
+    放行是安全的：两个路由都强制 `verify()` + 过期判断。
+    """
+    for path in ("/api/hook/signals/1/read", "/api/hook/agent/1/confirm"):
+        r = _get(api, path)
+        assert r.status_code != 401, (
+            f"{path} 被中间件拦成 401，ntfy 按钮永远点不动")
+
+
+def test_hook_prefix_is_not_a_general_bypass(api, tmp_db, passwd):
+    """放行 `/api/hook/` 不能顺带放行别的路径。"""
+    assert _get(api, "/api/status").status_code == 401
+    assert _get(api, "/api/hookx/status").status_code == 401

@@ -18,6 +18,12 @@ from core.clock import SH
 # `session` 是「网页访问票据」：推送里的链接带上它，点开即自动登录。
 # 与 read/confirm 用不同 purpose，三类票据互不通用（同一 id 也签不出同一张票）。
 Purpose = Literal["read", "confirm", "session"]
+
+#: 网页访问票据（推送链接免密）的有效期。
+#: **唯一来源**：`api/auth.py` 发 Cookie 与 `notify/templates.py` 拼链接都用它，
+#: 两处各写一个常量时，改环境变量只影响其中一处——RUNBOOK 承诺的「可改」就是假的。
+SESSION_DAYS_ENV = "SS_SESSION_DAYS"
+DEFAULT_SESSION_DAYS = 30
 _SECRET_BYTES = 32
 
 
@@ -55,6 +61,16 @@ def verify(secret: bytes, purpose: Purpose, ref_id: int, exp_ts: int, token: str
     if not token:
         return False
     return hmac.compare_digest(sign(secret, purpose, ref_id, exp_ts), str(token))
+
+
+def session_days() -> int:
+    """票据有效天数。非法值退回默认，不让一个手误把有效期变成 0 天。"""
+    raw = (os.environ.get(SESSION_DAYS_ENV) or "").strip()
+    try:
+        days = int(raw)
+    except ValueError:
+        return DEFAULT_SESSION_DAYS
+    return days if days > 0 else DEFAULT_SESSION_DAYS
 
 
 def day_end_ts(trade_date: int) -> int:

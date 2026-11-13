@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+from urllib.parse import unquote
 
 #: 要静音的探活路径（精确匹配整条路径，不做前缀匹配——`/healthz2` 之类仍要留痕）
 QUIET_PATHS: frozenset[str] = frozenset({"/healthz"})
@@ -27,6 +28,11 @@ def _redact_query(raw: str) -> str:
     """把敏感查询参数的值换成 `***`，其余原样保留。
 
     不能用「整条丢掉」：`/stock/sh600519?tab=k` 这类业务参数对排障有用。
+
+    **键要先做百分号解码再比对**：`?%74=xxx` 会被 Starlette 解成 `t=xxx`
+    并成功验签（票据照样生效），而日志里还是 `%74`——按原文比对就不会打码，
+    等于把一张有效票据原样写进日志。这正是「鉴权解析」与「日志解析」
+    用两套规则时的经典漏法。
     """
     if "?" not in raw:
         return raw
@@ -36,7 +42,11 @@ def _redact_query(raw: str) -> str:
     kept = []
     for pair in query.split("&"):
         key, sep, _value = pair.partition("=")
-        kept.append(f"{key}{sep}***" if key in SECRET_QUERY_KEYS else pair)
+        name = unquote(key)
+        if name in SECRET_QUERY_KEYS:
+            kept.append(f"{key}{sep}***" if sep else f"{key}***")
+        else:
+            kept.append(pair)
     return f"{path}?{'&'.join(kept)}"
 
 

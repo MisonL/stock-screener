@@ -183,9 +183,19 @@ def new_changelog_text(text: str, new: str, today: str) -> str:
 
 # ---- git ----------------------------------------------------------------
 
+#: 发版提交的固定身份。**必须在这里钉死**：`release.py` 用的是当前 shell 的
+#: git 配置，开发者本机通常配的是真名 + 真邮箱，于每跑一次发版就往历史里多写
+#: 一个真实邮箱——推到公开仓库后永久可见、可被搜索引擎关联到本人。
+#: 这不是假设：本仓库 12 个提交里有 5 个是作者的真实邮箱，全部来自这个脚本。
+RELEASE_IDENTITY = ("stock-screener", "noreply@example.com")
+
+
 def _git(*args: str, capture: bool = False) -> str:
+    # `-c` 放在子命令**之前**，优先级高于仓库与全局配置
     env_prefix = ["env", "-u", "GIT_CONFIG_COUNT", "-u", "GIT_CONFIG_VALUE_0",
-                  "-u", "GIT_CONFIG_VALUE_1", "git"]
+                  "-u", "GIT_CONFIG_VALUE_1", "git",
+                  "-c", f"user.name={RELEASE_IDENTITY[0]}",
+                  "-c", f"user.email={RELEASE_IDENTITY[1]}"]
     try:
         out = subprocess.run(env_prefix + list(args), cwd=ROOT, check=True,
                              capture_output=capture, text=True)
@@ -197,7 +207,9 @@ def _git(*args: str, capture: bool = False) -> str:
 
 def tag_exists(tag: str) -> bool:
     env_prefix = ["env", "-u", "GIT_CONFIG_COUNT", "-u", "GIT_CONFIG_VALUE_0",
-                  "-u", "GIT_CONFIG_VALUE_1", "git"]
+                  "-u", "GIT_CONFIG_VALUE_1", "git",
+                  "-c", f"user.name={RELEASE_IDENTITY[0]}",
+                  "-c", f"user.email={RELEASE_IDENTITY[1]}"]
     r = subprocess.run(env_prefix + ["rev-parse", "-q", "--verify", f"refs/tags/{tag}"],
                        cwd=ROOT, capture_output=True, text=True)
     return r.returncode == 0

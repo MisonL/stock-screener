@@ -263,7 +263,7 @@ def render_open_brief(rows: list[BriefRow], n: int, secret: bytes, cfg, overflow
 
     # ---- 先把**尾部固定行**拼出来，量出它们占多少字节 ----
     # 顺序不能反：预算只扣 Top N 的话，尾部（竞价行 + 「另有」「完整」）会追加在
-    # 预算之外。实测 Top 100 + 长名字 + 10 条长原因竞价异常 = 4150 字节，照样被
+    # 预算之外。Top N 拉满 + 长股票名 + 多条长原因竞价异常时照样超限，被
     # ntfy 400 拒收（open_brief 无重试，当天整条丢失）。
     tail: list[str] = []
     if pool_date is not None:
@@ -275,7 +275,7 @@ def render_open_brief(rows: list[BriefRow], n: int, secret: bytes, cfg, overflow
         tail.append(f"竞价基线 {baseline_days}/{base_total} 日"
                     + ("（未满，量能异常暂不判）" if baseline_days < base_total else ""))
     # **竞价异常必须截断**：448 条全塞进正文会让消息超 ntfy 上限被 400 拒收
-    # （实测 2026-11-11：468 行 / 11134 字节，开盘简报整条丢失且无重试）。
+    # （曾出现过整条开盘简报因超限被拒收且没有重试）。
     # 行情明细本来就该看网页，推送只留头部若干条。
     auction_shown = auction_detections or []
     auction_total = len(auction_shown)

@@ -532,7 +532,7 @@ def test_drill_off_still_publishes(env, monkeypatch):
 def test_batch_dedupes_same_stock(env):
     """同一批里同一只票只留一行——重复信号不该让「11 只同向异动」其实只有 4 只。
 
-    实测 2026-11-11 10:36：`batch-804` 里 300052 出现 9 次，正文写「11 只同向异动」，
+    曾经`batch-804` 里 300052 出现 9 次，正文写「11 只同向异动」，
     用户看到的是同一只票刷屏。
     """
     from notify.dispatcher import load_sig as _ls
@@ -550,7 +550,7 @@ def test_batch_dedupes_same_stock(env):
 def test_seq_id_uses_event_date_not_pool_date(env):
     """`seq_id` 里的日期必须是**事件当天**，不是池子日期（T−1）。
 
-    实测 2026-11-11：当天所有信号都写成 `sig-300002-20261110-breakout-1`，
+    曾经当天所有信号都写成 `sig-300002-20261110-breakout-1`，
     `sig.trade_date` 取的是 `pool.trade_date`（昨天），而事件其实是今天发生的。
     后果：事后按 seq_id 对账会把今天的信号记到昨天；池子若某天没重建，
     连续两天会生成**同一个 seq_id**，ntfy 会把第二天的消息当成第一天的更新。
@@ -596,7 +596,7 @@ def test_pool_alerts_is_pushed(env):
     「告警未推送」，`pool_low` / `pool_overflow` 从来没到过手机。
     `getattr` 兜底让出池本身不失败，缺陷因此一直静默。
 
-    实机证据：2026-11-13 15:13:56 `cn_star` 池子只有 14 只（阈值 30）触发 `pool_low`，
+    实机证据：某天 `cn_star` 池子只有十几只（低于阈值 30），触发 `pool_low`，
     日志 `WARNING after_close: dispatcher 没有 pool_alerts，告警未推送: ['pool_low']`。
     """
     from core.strategy.pool import PoolReport

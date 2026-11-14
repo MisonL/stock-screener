@@ -1,6 +1,12 @@
 #!/usr/bin/env node
 // 腾讯自选股 westock-mcp 的无浏览器授权：微信扫码 → 三件套 cookie → consent → token
 //
+// ⚠️ 使用边界（请先读这段）
+//   本脚本把「用你自己的微信扫一次码」这个人工步骤自动化到命令行，登录态**只代表
+//   你本人的账号**。请勿用于批量注册、多账号轮换、账号池或对外提供数据服务。
+//   腾讯侧的服务条款你需要在用之前自行确认；本项目不对此作任何担保，也不提供账号。
+//   仓库的 LICENSE 只覆盖本仓库代码，不覆盖任何第三方服务。
+//
 // 设计前提：全部在 VM 上用纯 HTTP 完成，不需要浏览器、不需要 Mac。
 // 唯一的真人动作是「用微信扫一下二维码」，二维码由本脚本生成并打印保存路径。
 //
@@ -43,9 +49,11 @@ const WX_QRCONNECT = 'https://open.weixin.qq.com/connect/qrconnect';
 const WX_QRCODE = 'https://open.weixin.qq.com/connect/qrcode';
 const WX_LONGPOLL = 'https://long.open.weixin.qq.com/connect/l/qrconnect';
 
-// 统一使用小米 12 Pro 的手机 UA：与用户真机一致，避免被腾讯当成「脚本客户端」。
-// 实测（2026-10-30）该 UA 下 qrconnect / qrcode / 长轮询 / 三件套跳转全部正常。
-const UA = 'Mozilla/5.0 (Linux; Android 13; 2201122C) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36';
+// 用一个通用的 Android Chrome 手机 UA。腾讯的登录流程对手机 UA 更宽松，
+// 桌面 UA 容易走到另一套风控路径；具体机型无所谓，只要是主流手机 UA 即可。
+// 需要时设环境变量 WB_UA 覆盖成你自己设备的 UA。
+const UA = process.env.WB_UA
+  || 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36';
 
 // ---------- 参数 ----------
 const argv = process.argv.slice(2);

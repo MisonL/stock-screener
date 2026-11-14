@@ -39,11 +39,18 @@ mkdir -p ntfy/cache ntfy/auth data/logs cf
 
 ```bash
 mkdir -p ~/.config/stock-screener/state
-touch ~/.config/stock-screener/{llm,notify}.env \
-      ~/.config/stock-screener/state/westock.env
+touch ~/.config/stock-screener/{llm,notify,web}.env \
+      ~/.config/stock-screener/state/westock.env \
+      ~/.config/stock-screener/wb_client.json \
+      ~/.config/stock-screener/wb_session.json
 chmod 600 ~/.config/stock-screener/*.env \
+          ~/.config/stock-screener/*.json \
           ~/.config/stock-screener/state/*.env
 ```
+
+**`wb_client.json` / `wb_session.json` 必须存在**：compose 单文件 bind mount
+在这两个路径上，文件不存在时 docker 会在**宿主机**建一个同名空目录顶替，
+容器内读它直接 `EISDIR`。这个目录通常归 root，补建前要先 `sudo rm -rf`。
 
 **`westock.env` 必须放在 `state/` 子目录**：compose 只把 `state/` 挂到容器内
 `/state`，而 `jobs/main.py` 从 `/state/westock.env` 读取。放在
@@ -274,7 +281,9 @@ NTFY_URL=https://ntfy.<域名> NTFY_TOKEN=$NTFY_TOKEN TOPIC=<topic> ./scripts/ac
 > 同时跑会把预算翻倍、触发上游风控，403 后反而更慢。
 
 ```bash
-export UID GID   # 或把实测 uid 写进 .env：compose 读不到 UID/GID 会静默回落 1000
+# **不要 `export UID GID`**：bash 里 UID 是只读变量，`export UID` 直接报
+# `UID: readonly variable`。它们本来就已在环境里，compose 能读到；
+# 要显式传就在命令行给：`make backfill UID=$(id -u) GID=$(id -g)`
 cd ~/stock-screener
 
 # 1) 停 jobs（不只是停调度——快照三循环也在 jobs 里）
@@ -430,15 +439,17 @@ curl -s https://stock.example.com/healthz          # version 应变成新版本
 
 ```bash
 git tag --list --sort=-v:refname          # 先看有哪些真实落点（别凭记忆写版本号）
-git checkout <上一个 tag>                  # 例如 v0.1.0 —— 但**必须先确认它存在**
+git checkout <上一个 tag>                  # 用上面列出来的真实 tag，别凭记忆写版本号
 docker compose -f deploy/docker-compose.yml --project-directory . build api
 docker compose -f deploy/docker-compose.yml --project-directory . up -d --force-recreate api jobs agent
 curl -s https://stock.example.com/healthz  # version 应变成回滚到的版本
 git checkout main
 ```
 
-`v0.1.0` 已追溯补打在 `de56875`（2026-11-10 最后一个提交）上，
-作为影子期前基线的回滚落点。事故中先 `git tag --list` 确认落点存在再动手。
+**回滚落点 = `git tag --list` 里最早的那个 `v0.2.x`**。本仓库是公开版重建过的
+历史，`v0.1.0` / `de56875` 等影子期之前的对象**不在其中**（见 CHANGELOG 的
+`[0.1.0]` 小节说明）。事故中先 `git tag --list --sort=-v:refname` 看真实落点，
+再动手。
 
 **三个坑**（都踩过）：
 

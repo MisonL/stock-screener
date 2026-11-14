@@ -302,7 +302,7 @@ class Dispatcher:
         `jobs/after_close.py::_dispatch` 一直是 `getattr(dispatcher, "pool_alerts", None)`
         调这个方法——而本类**从来没有它**，于是每次出池都只记一条
         `WARNING ... 告警未推送`，池子告警一次都没到过手机。`getattr` 的兜底让出池
-        本身不失败，缺陷因此静默了很久（2026-11-13 15:13 `cn_star` 只有 14 只触发
+        本身不失败，缺陷因此静默了很久（当时 `cn_star` 只有十几只触发
         `pool_low` 才暴露）。
 
         `pool_low` 是 P1：池子过小意味着当天几乎没有符合形态的票，这不是故障，

@@ -33,6 +33,41 @@
 
 ## [Unreleased]
 
+### 修复
+
+- **发版脚本会把作者真实邮箱写进历史**：`release.py` 的 `_git()` 用当前 shell 的
+  git 配置，开发者本机配的是真名 + 真邮箱，于是每跑一次发版就往历史里多写一个
+  真实邮箱——推到公开仓库后永久可见。现在显式 `-c user.name/user.email` 钉死。
+  （连带修了假 git 测试桩：它假设子命令在 `$1`，加上 `-c` 之后全部失灵。）
+- **`wb_client.json` / `wb_session.json` 没写进文档**：compose 单文件挂载这两个
+  路径，宿主机文件不存在时 docker 会建一个同名**空目录**顶替，容器里读写它
+  直接 `EISDIR`。这个坑只在别人机器上出现（作者本机文件早就有）。现在 README/
+  RUNBOOK 的 `touch` 列表补上，并在启动时检查"是目录"并报 ERROR。
+- **`docs/strategy.md` 说「其余因子三市一致」是错的**：B6/B9/min_amount_20d 在
+  `config/strategy.yaml` 里都按市场分档。补齐表并改成"以 yaml 为准"。
+  同时补上 C2 的分时段阈值（09:45–10:00 用 2.5，之后 1.5）。
+- **RUNBOOK 的 `export UID GID` 在 bash 下必炸**（`readonly variable`），而 README
+  专门写过这个坑。改成注释说明。
+- **RUNBOOK 的回滚落点指向不存在的 `v0.1.0` / `de56875`**：公开仓库的历史是重建
+  过的，这两个对象不在其中。改成"以 `git tag --list` 里最早的 `v0.2.x` 为准"。
+- **`api/main.py` 4 个死 import**（`SourceRegistry`/`SinaSource`/`TencentSource`/
+  `Http`/`RateLimiter`）与 `docs/architecture.md` 的「api 不碰上游」自相矛盾；
+  `import os` 还排在用它的函数之后。一并整理到顶部 import 区。
+- **前端工具链有 high/critical 漏洞**：vite 5.4.11 / esbuild 0.21.5 / vitest 2.1.8
+  （含 esbuild dev server 任意读、vitest RCE 类公告）。升到 vite 8 / vitest 5 /
+  plugin-react 6 / jsdom 31，`npm audit` 归零，45 个前端测试 + 构建 + tsc 全通过。
+
+### 文档
+
+- README 顶部加「部署前必读」：不设口令时所有接口不鉴权、而默认部署是公网可达的；
+  数据源非官方；westock 脚本需用本人账号。
+- README 补「其他已知限制」：交易日历内置到 2027、上游接口无版本协商、单实例设计。
+- `docs/architecture.md` 末尾加**历史编号对照表**：代码注释里的 `D18`/`Task 6`/
+  `§7.2.6` 来自未公开的私有设计文档，这张表把高频编号一次解释掉。
+- 清理代码与注释里的本机痕迹：`/tmp/screener_*` 路径、真机型号 UA、
+  个股观测记录、带具体时间戳的运行故障描述，统一改成通用表述。
+- `scripts/wb_auth_headless.mjs` 文件头补明确的使用边界（仅本人账号、不得多账号）。
+
 ## [0.2.30] - 2026-11-14
 
 ### 修复
@@ -605,8 +640,12 @@
 
 ## [0.1.0] - 2026-11-10
 
-影子期之前的基线版本。tag `v0.1.0` 事后补打在 `de56875`
-（2026-11-10 最后一个提交）上，作为可用的回滚落点。
+影子期之前的基线版本。
+
+> **公开仓库里没有 `v0.1.0` 这个 tag，也没有 `de56875` 这个提交。**
+> 公开版的历史是重建过的（见文件末尾 `public-since` 说明），本节及更早的
+> 小节属于私有期沿革，只作背景记录。**可用的回滚落点 = `git tag --list`
+> 里最早的那个 `v0.2.x`**，RUNBOOK 的回滚章节按这个口径写。
 
 ### 新增
 

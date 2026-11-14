@@ -4,6 +4,17 @@
 
 不是荐股软件，不是自动交易。它做的是**把符合特定形态的票筛出来并告诉你为什么**，决策仍然是你自己的。
 
+> ### ⚠️ 部署前必读
+>
+> 1. **必须设网页口令**：不设 `SS_WEB_PASS` 时**所有接口都不鉴权**。本项目的默认
+>    部署方式（Cloudflare Tunnel + 域名）是**公网可达**的——不设口令等于把状态、
+>    观察池、聊天接口全部对外开放，而 `/api/chat` 每调一次都会**花你自己的 LLM 预算**。
+>    详见「快速开始」里的 `web.env`。
+> 2. **数据源是非官方接口**：A 股行情接口没有官方授权，随时可能变更或封禁，
+>    使用前请自行判断合规性。见文末「免责」。
+> 3. **westock 相关脚本需要你自己的账号**：扫码登录态只代表你本人，请勿用于
+>    批量/多账号抓取，本项目不提供账号池。
+
 ---
 
 ## 它做什么
@@ -45,13 +56,24 @@ git clone <仓库地址> && cd stock-screener
 # 数据、缓存、隧道配置目录（compose 的 bind mount 目标）
 mkdir -p data/logs ntfy/cache ntfy/auth cf
 
-# 环境变量文件：内容可以先留空，但**文件必须存在**
+# 环境变量文件与 westock 登录态：内容可以先留空，但**文件必须存在**
+# （这两个 .json 会被 westock 扫码脚本填入登录态；空文件即可启动，
+#   只是 westock 续期会要求重新扫码）
 mkdir -p ~/.config/stock-screener/state
 touch ~/.config/stock-screener/llm.env \
       ~/.config/stock-screener/notify.env \
-      ~/.config/stock-screener/web.env
-chmod 600 ~/.config/stock-screener/*.env
+      ~/.config/stock-screener/web.env \
+      ~/.config/stock-screener/state/westock.env \
+      ~/.config/stock-screener/wb_client.json \
+      ~/.config/stock-screener/wb_session.json
+chmod 600 ~/.config/stock-screener/*.env \
+          ~/.config/stock-screener/*.json \
+          ~/.config/stock-screener/state/*.env
 ```
+
+**这几个文件少建任何一个，docker 都会在宿主机上建一个同名空目录顶替**
+（单文件 bind mount 的行为），之后容器里读写它直接 `EISDIR`；而且那个目录
+通常归 root，想补建得先 `sudo rm -rf`。报错只出现在容器日志里，不好定位。
 
 `UID`/`GID` 在 bash 里是**只读变量**，不能 `export UID=$(id -u)`（会报
 `UID: readonly variable`）。它们本来就已存在，直接传给 make 即可：
@@ -133,6 +155,13 @@ docker compose -f deploy/docker-compose.yml --project-directory . up -d api jobs
 > `snapshot_implied` 行，`suspension_calendar` 保持空表。补齐真实取数前，
 > 请不要依赖这两张表做判断。
 
+### 其他已知限制
+
+- **交易日历内置到 2027 年**：`core/clock.py` 的 `builtin_holidays` 覆盖 2026/2027。
+  超出范围后会退化成「工作日即交易日」，元旦/春节会被当成交易日。跨年前要补表。
+- **上游接口随时可能变**：解析逻辑没有版本协商，对方改字段就会直接失败（会发 P0）。
+- **单实例设计**：共享同一个 SQLite 与同一份上游限速预算，不支持多副本部署。
+
 ---
 
 ## 部署
@@ -196,3 +225,7 @@ make check-version   # 版本号与 tag/CHANGELOG 一致性
 ## 免责
 
 本项目仅供个人学习与技术研究。A 股数据接口无官方授权，使用者需自行判断合规性。任何基于本项目产生的投资决策与后果由使用者自负。
+
+**关于 westock / 腾讯自选股**：相关脚本（`scripts/wb_*.mjs`）依赖**你本人**的微信
+扫码登录态，仅用于自动化你自己的账号。请勿用于批量注册、多账号轮换、账号池或
+对外提供数据服务。本仓库的 MIT 许可只覆盖仓库内代码，不覆盖任何第三方服务。

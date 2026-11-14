@@ -75,7 +75,8 @@ intraday:
     limit_gap: 0.003
   # 价格类信号（breakout/breakdown/near_breakout/stall）的**重新武装冷却期**（分钟）。
   # 条件消失一个 tick 就重置的话，价格在上沿附近抖动会让同一只票几秒一报：
-  # 实测 300052 在 8 分钟出 19 条，还挤进同一批推送重复 8 次。
+  # 不做冷却的话，价格在上沿附近抖动时同一只票会几秒一报，还会挤进同一批推送
+  # 重复出现多次（实测过：一只票 8 分钟十几条）。
   price_rearm_min: 30
   index_move:
     window_s: 300

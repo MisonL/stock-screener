@@ -306,7 +306,7 @@ def fetch_sector_members(sina) -> list[tuple[str, str, list[str]]]:
 
     单独拆出来是为了让调用方能「先抓完、再加锁写」——原来 `refresh_sector_members`
     把请求和写库交替做在同一把锁里，抓完几十个板块要好几分钟，把每秒的 tick 和
-    30 秒的心跳全堵在锁上（实测 2026-11-13 08:50 心跳因等锁超过 30 秒被跳过）。
+    30 秒的心跳全堵在锁上（曾经有一次心跳因等锁超过 30 秒被直接跳过）。
     """
     out: list[tuple[str, str, list[str]]] = []
     for sector, name in sina.fetch_sector_list():

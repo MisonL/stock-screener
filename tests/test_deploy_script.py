@@ -1,6 +1,6 @@
 """`scripts/deploy.py` 的守卫：部署只能发**已提交**的内容。
 
-2026-11-13 11:31 的事故：我新建了 `api/logs.py` 却没提交，改了 `api/main.py` 加
+曾经的事故：新加了 `api/logs.py` 却**没有提交**，而 `api/main.py` 已经 import 它，
 `from api import logs`，然后用 `git ls-files | rsync` 部署——`ls-files` 只筛选
 **文件名**、发的是**工作区内容**，于是 main.py 带着对新模块的引用上去了，
 而新模块没上去。三个容器启动即 `ImportError`，站点 502 约 9 分钟。

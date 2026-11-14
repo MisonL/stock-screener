@@ -44,13 +44,36 @@ def _run(*args: str, cwd: Path | None = None,
                           cwd=base, capture_output=True, text=True, env=env)
 
 
+#: 假 git 桩共用的头部：跳过 `-c k=v` 等全局选项，让 `$1` 真的是子命令。
+#: release.py 为发版提交钉死身份（`git -c user.name=.. -c user.email=.. commit`），
+#: 不看这一步的桩会把 `-c` 当子命令，"查 tag" 就永远返回"标签存在"。
+SKIP_GLOBAL_OPTS =     'while [ $# -gt 0 ]; do\n' \
+    '  case "$1" in\n' \
+    '    -c|--git-dir|--work-tree|-C) shift 2 ;;\n' \
+    '    -*) shift ;;\n' \
+    '    *) break ;;\n' \
+    '  esac\n' \
+    'done\n'
+
+
 def _apply_release_ok(tmp: Path):
     """在临时副本里备好 fake git 与有条目的 Unreleased，返回 (fakebin, gitlog)。"""
     fake = tmp / "fakebin"
     fake.mkdir()
-    # 最小 git：记录调用并返回成功
+    # 最小 git：记录调用并返回成功。
+    # **必须跳过全局 `-c key=value` 选项**再找子命令：release.py 会为发版提交
+    # 钉死身份（`git -c user.name=.. -c user.email=.. commit ...`），
+    # 只看 `$1` 的桩会把 `-c` 当成子命令，"查 tag" 就永远返回"标签存在"。
     (fake / "git").write_text(
         '#!/bin/sh\n'
+        '# 跳过全局选项：-c k=v / --git-dir=X 之类\n'
+        'while [ $# -gt 0 ]; do\n'
+        '  case "$1" in\n'
+        '    -c|--git-dir|--work-tree|-C) shift 2 ;;\n'
+        '    -*) shift ;;\n'
+        '    *) break ;;\n'
+        '  esac\n'
+        'done\n'
         '# rev-parse 是"查 tag 是否存在"，没有 tag 时 git 以 1 退出\n'
         'if [ "$1" = "rev-parse" ]; then exit 1; fi\n'
         'echo "git $@" >> "$FAKE_GIT_LOG"; exit 0\n', encoding="utf-8")
@@ -183,8 +206,7 @@ def test_existing_tag_blocks_before_any_write(release_sandbox):
     sandbox, fake, log = release_sandbox
     # fake git：只有 rev-parse（查 tag）返回"已存在"，其余成功
     (fake / "git").write_text(
-        '#!/bin/sh\n'
-        'if [ "$1" = "rev-parse" ]; then echo "abc123"; exit 0; fi\n'
+        '#!/bin/sh\n' + SKIP_GLOBAL_OPTS +        'if [ "$1" = "rev-parse" ]; then echo "abc123"; exit 0; fi\n'
         'echo "git $@" >> "$FAKE_GIT_LOG"; exit 0\n', encoding="utf-8")
     (fake / "git").chmod(0o755)
     before = {p: (sandbox / p).read_text(encoding="utf-8") for p in FILES_TO_GUARD}
@@ -207,8 +229,7 @@ def test_commit_succeeded_but_tag_failed_leaves_consistent_state(release_sandbox
     """
     sandbox, fake, log = release_sandbox
     (fake / "git").write_text(
-        '#!/bin/sh\n'
-        'if [ "$1" = "rev-parse" ]; then exit 1; fi\n'
+        '#!/bin/sh\n' + SKIP_GLOBAL_OPTS +        'if [ "$1" = "rev-parse" ]; then exit 1; fi\n'
         'if [ "$1" = "tag" ]; then echo "fatal: hook 拒绝" >&2; exit 1; fi\n'
         'echo "git $@" >> "$FAKE_GIT_LOG"; exit 0\n', encoding="utf-8")
     (fake / "git").chmod(0o755)
@@ -260,8 +281,7 @@ def test_commit_failure_leaves_no_staged_residue(release_sandbox):
     sandbox, fake, log = release_sandbox
     original_version = (sandbox / "core" / "version.py").read_text(encoding="utf-8")
     (fake / "git").write_text(
-        '#!/bin/sh\n'
-        'if [ "$1" = "rev-parse" ]; then exit 1; fi\n'
+        '#!/bin/sh\n' + SKIP_GLOBAL_OPTS +        'if [ "$1" = "rev-parse" ]; then exit 1; fi\n'
         'if [ "$1" = "add" ]; then echo "git $@" >> "$FAKE_GIT_LOG"; exit 0; fi\n'
         'if [ "$1" = "commit" ]; then echo "fatal: synthetic commit failure" >&2; exit 1; fi\n'
         'if [ "$1" = "reset" ]; then echo "git $@" >> "$FAKE_GIT_LOG"; exit 0; fi\n'

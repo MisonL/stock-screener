@@ -3,6 +3,7 @@
 模块级 `app` 必须显式装配（`create_app(...)`），否则 uvicorn 直接 `AttributeError`。
 连接不在 import 期建：`make_conn_factory()` 每次按需建连接并迁移（Task 2 的约定）。
 """
+import os
 from pathlib import Path
 
 from api import logs as _api_logs
@@ -10,6 +11,8 @@ from api.routes import create_app
 from core.clock import SystemClock
 from core.config import load_config
 from core.db import make_conn_factory
+from notify.dispatcher import Dispatcher
+from notify.ntfy import NtfyClient
 
 # 模块级安装：uvicorn 的 access logger 在进程启动时就存在，这里是最早的挂载点。
 # 把 `/healthz` 的探活记录过滤掉——实测它占了 api 日志的 99.6%，会把有用信息淹掉。
@@ -37,15 +40,6 @@ def _warn_if_placeholder_config(cfg) -> None:   # pragma: no cover - 进程入�
         logging.getLogger("api").warning(
             "SS_WEB_PASS 未配置：网页不鉴权。公网部署务必在 "
             "~/.config/stock-screener/web.env 里设置")
-
-import os
-
-from core.datasource.registry import SourceRegistry
-from core.datasource.sina import SinaSource
-from core.datasource.tencent import TencentSource
-from core.http import Http, RateLimiter
-from notify.dispatcher import Dispatcher
-from notify.ntfy import NtfyClient
 
 _cfg = load_config(Path("config"))
 _warn_if_placeholder_config(_cfg)

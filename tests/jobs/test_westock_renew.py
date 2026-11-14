@@ -280,7 +280,7 @@ def test_no_env_vars_leaves_script_defaults(monkeypatch, tmp_path, clock, conn):
 def test_renew_runs_every_day_not_just_weekdays(conn, CFG, tmp_path):
     """续期必须**每天**跑，不能只挂 mon-fri。
 
-    token 的有效期是腾讯给的，不认我们的交易日历。实测 2026-11-15（周日）13:49
+    token 的有效期是腾讯给的，不认我们的交易日历。曾经（周日）13:49
     到期，而续期任务只挂 mon-fri：周六、周日的 08:40 都不跑，
     直到周一 08:40 才动——那时 token 已经过期 18.8 小时。
     周末虽然不交易，但「过期期间任何一次调用都失败」是不可接受的，

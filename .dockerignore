@@ -2,7 +2,6 @@
 # 目录一律根锚定（前导 /），避免将来 web/src/data 之类同名子目录被误排除。
 .git
 .superpowers
-/tmp_smoke
 /.tmp_smoke
 /.firecrawl
 /data

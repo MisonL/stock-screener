@@ -8,7 +8,7 @@
 # **日志轮转必须写在仓库里**：VM 的 /etc/docker/daemon.json 也配了同一组值，
 # 但那是机器状态、不进版本控制——换机器/重装 Docker 就丢，届时 json-file 默认
 # **无上限**，日志会一直涨到写满磁盘（而且不会报错）。放这里跟着仓库走。
-# 实测用量约 500KB/天（jobs 783B、api 78KB 且 99.6% 是 /healthz、ntfy 407KB），
+# 稳定运行后三者的日增都在百 KB 级（api 几乎全是 /healthz 探活），
 x-logging: &default-logging
   driver: json-file
   options:
@@ -192,7 +192,7 @@ services:
   cloudflared:
     logging: *default-logging
     # 锁定具体版本，不用 latest：latest 会在某次 up 时静默升级并改掉 --config 行为。
-    # 2026.10.3 是 spec §7.0 记录的全链路实测版本。
+    # 具体版本号按你的上游兼容性自行调整。
     image: cloudflare/cloudflared:2026.10.3
     user: "${UID:-1000}:${GID:-1000}"
     command: tunnel --no-autoupdate --config /etc/cloudflared/config.yml run

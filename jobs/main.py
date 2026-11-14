@@ -117,7 +117,7 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
                     )
             except sqlite3.OperationalError as exc:
                 # **锁冲突时安静跳过**：EOD 的事务会持锁数分钟，而 busy_timeout 只有 5 秒。
-                # 抛给 apscheduler 等于每分钟刷一条 ERROR（实测 2026-11-12 15:08:32 就是）。
+                # 抛给 apscheduler 等于每分钟刷一条 ERROR（曾经就是这样，日志被刷爆）。
                 # 跳过是安全的：30 秒后还有下一次，判活阈值是 120 秒。
                 if not _is_locked(exc):
                     raise
@@ -138,7 +138,7 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
         from jobs.eod import run_eod
 
         # **整条写路径都必须在同一把写锁里**：`after_close` 也写 `pool` 表。
-        # 它原先跑在锁外（只锁了 run_eod），实测 2026-11-12 15:08:32 心跳写库撞上它、
+        # 它原先跑在锁外（只锁了 run_eod），结果心跳写库撞上它、
         # busy_timeout（5 秒）耗尽后抛 `database is locked`。EOD 事务本身持锁约 3 分钟、
         # after_close 选三个市场约 46 秒，而判活阈值只有 STALE_S=120 秒——
         # 连续几个心跳周期失败就会让 watchdog 误判 jobs 已死（P0 误报）。
@@ -181,7 +181,7 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
         try:
             # **先抓完、再加锁写**：抓几十个板块要好几分钟，若连网络请求一起放在
             # `loops.lock` 里，每秒的 tick 和 30 秒的心跳会全程堵着——
-            # 实测 2026-11-13 08:50 心跳因等锁超过 30 秒，被 APScheduler 跳过。
+            # 曾经因为等锁超过 30 秒，心跳被 APScheduler 直接跳过。
             sectors = fetch_sector_members(reg.sina)
             with _write_lock(loops):
                 write_sector_members(conn, sectors)
@@ -323,7 +323,7 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
     # 09:00 自选股导入（09:15 开盘前完成，不占用盘中资源）
     #
     # **续期必须每天跑，不能只挂 mon-fri**：token 到期时刻由腾讯决定，不认交易日历。
-    # 实测 2026-11-15（周日）13:49 到期，只挂工作日的话周六周日都不跑，
+    # 续期到期日可能正好落在周末：只挂工作日 cron 的话周六周日都不跑，
     # 直到周一 08:40 才动——那时已过期 18.8 小时，期间任何 westock 调用都失败
     # （除权事件、停牌日历）。续期本身很便宜（剩 ≥24h 直接 skip），
     # 多跑周末两天没有成本。
@@ -505,7 +505,7 @@ def startup_recovery(cfg, conn, clock, *, reg, tick=None, dispatcher=None, loops
             if getattr(report, "skipped", False):
                 # **跳过就停**：`skipped` 的成因是「快照日期不是该日」（节假日/上游还停在
                 # 上个交易日），后续日期必然同样跳过。继续 `continue` 会把 5 天各跑一遍，
-                # 每次重启白发 50 个快照请求（实测部署后 `job_state` 为空时就是这样）。
+                # 每次重启都会白发一批重复的快照请求（`job_state` 为空时必然如此）。
                 # 不写 marker 是对的（那天确实没跑成），但没必要把后面几天也试一遍。
                 out["eod_skipped"].append(day)
                 break
@@ -556,6 +556,18 @@ def _warn_if_placeholder_config(cfg) -> None:  # pragma: no cover - 进程入口
                     host)
     # **口令只在 api 侧检查**：`web.env` 按 compose 只挂给 api（agent/jobs 不对外），
     # jobs 里永远读不到 SS_WEB_PASS，在这里查只会产生一条恒真的误报告警。
+
+    # westock 登录态是**单文件 bind mount**：宿主机上文件不存在时 docker 会建一个
+    # 同名**目录**顶替，之后脚本写它直接 EISDIR。这个坑只在别人机器上出现
+    # （作者本机文件早就有），所以必须在启动时明确说出来，而不是让人去翻容器日志。
+    for path in ("/host-config/wb_client.json", "/host-config/wb_session.json"):
+        p = Path(path)
+        if p.exists() and p.is_dir():
+            log.error("%s 是**目录**而不是文件：单文件 bind mount 在宿主机对应路径"
+                      "不存在时会建空目录顶替。处理：在宿主机删掉该目录后 "
+                      "`touch` 同名文件（见 README 快速开始第 1 步）", path)
+        elif not p.exists():
+            log.warning("%s 不存在：westock 续期会要求重新扫码（扫码需要人工）", path)
 
 
 def _setup_logging() -> None:

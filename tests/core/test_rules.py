@@ -204,7 +204,7 @@ def test_pool_detection_watch_false():
 def test_no_halt_judged_before_continuous_trading():
     """**开盘集合竞价期间不能判停牌**：那时上游时间戳本来就静止。
 
-    实测 2026-11-11：09:16–09:26 产生 116 条 `reason=halt`，涉及 116 只票、
+    曾经09:16–09:26 产生 116 条 `reason=halt`，涉及 116 只票、
     每票只 1 条，而且这些票当天都有大量 breakout/stall（确在正常交易）。
     原因是判据「快照 ts 连续 60 秒不变」在集合竞价（09:15–09:25）成立——
     上游此刻不逐笔推送，时间戳自然不动。规格说的是「**盘中**停牌」，

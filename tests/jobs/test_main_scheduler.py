@@ -13,6 +13,7 @@ from core.db import connect, migrate
 from core.intraday.detector import EventDetector
 from jobs.eod import EodReport
 from jobs.intraday import IntradayTick
+from jobs import main as jobs_main
 from jobs.main import make_scheduler, maintenance_on, self_check, startup_recovery
 from tests.helpers import SH, _trading_days_rev
 
@@ -606,7 +607,7 @@ def test_eod_job_holds_write_lock_across_after_close():
     """EOD 的**整条写路径**（含 `after_close`）都必须在写锁内。
 
     注释写着「写库必须串行」，但 `after_close` 实际跑在 `with _write_lock(...)` **之外**——
-    它同样写 `pool` 表。实测后果：2026-11-12 15:08:32 心跳写库撞上它，
+    它同样写 `pool` 表。后果：心跳写库会撞上它，
     `busy_timeout`（5 秒）耗尽后抛 `database is locked`，apscheduler 记 ERROR。
 
     判活阈值 `STALE_S=120`，EOD 事务持锁约 3 分钟——连续多个心跳周期失败会让
@@ -667,7 +668,7 @@ def test_heartbeat_survives_database_locked(env):
     """心跳撞上真实锁冲突时**安静跳过**，不把异常抛给 apscheduler。
 
     EOD 的事务会持锁数分钟，心跳的 `busy_timeout` 只有 5 秒。抛异常等于每分钟
-    刷一条 ERROR（实测 2026-11-12 15:08:32 正是如此），还让真正的异常被淹没。
+    刷一条 ERROR（曾经 正是如此），还让真正的异常被淹没。
     跳过是安全的：30 秒后还有下一次，判活阈值是 120 秒。
 
     用**另一条真实连接 `BEGIN IMMEDIATE`** 造成锁冲突（而不是 mock execute——
@@ -1076,7 +1077,7 @@ def test_members_job_does_not_fetch_inside_the_lock(env):
     """`members_job` 的网络请求必须在写锁**外**。
 
     抓几十个板块要好几分钟；把请求放进 `loops.lock` 里，每秒的 tick 与 30 秒的
-    心跳会全程堵着。实测 2026-11-13 08:50:44：
+    心跳会全程堵着。曾经
     `heartbeat_job ... skipped: maximum number of running instances reached (1)`
     ——心跳等锁超过 30 秒，下一轮触发时上一轮还没结束。
 
@@ -1157,3 +1158,23 @@ def test_architecture_doc_schedule_matches_code():
     assert not bogus, (
         f"docs/architecture.md 写了 {sorted(bogus)}，但代码里没有对应的 CronTrigger"
         f"（实际：{sorted(triggers)}）")
+
+
+def test_bind_mounted_session_file_being_a_directory_is_reported(tmp_path, caplog, monkeypatch):
+    """单文件 bind mount 被 docker 建成目录时必须 ERROR，不能悄悄 EISDIR。
+
+    宿主机上 `~/.config/stock-screener/wb_client.json` 不存在时，docker 会建一个
+    同名**空目录**顶替；容器里读写它直接 EISDIR，报错出现在容器日志深处。
+    这个坑只在别人机器上出现（作者本机文件早就在），所以启动时必须喊出来。
+    """
+    import logging
+
+    d = tmp_path / "wb_client.json"
+    d.mkdir()                                    # 模拟 docker 建出来的目录
+    monkeypatch.setattr("jobs.main.Path",
+                        lambda p: d if p.endswith("wb_client.json") else tmp_path / "missing.json")
+    with caplog.at_level(logging.ERROR):
+        jobs_main._warn_if_placeholder_config(SimpleNamespace(
+            notify=SimpleNamespace(public_host="stock.example.com")))
+    assert any("是**目录**而不是文件" in r.message for r in caplog.records), \
+        f"没有报出目录陷阱：{[r.message for r in caplog.records]}"

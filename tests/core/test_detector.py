@@ -201,7 +201,7 @@ def test_salience_breadth_from_config():
 def test_price_kind_has_cooldown_not_just_rearm(det):
     """价格类信号要**冷却期**，不能「消失一个 tick 就重新触发」。
 
-    实测 2026-11-11：300052 一直停在上沿之上，量能条件偶尔不满足 → `present`
+    真实形态：一只票一直停在上沿之上，量能条件偶尔不满足 → `present`
     缺它一个 tick → `_armed` 重置 → 下次满足又发。8 分钟产生 19 条 breakout，
     还挤进同一批推送（`batch-804` 里同一只重复 8 次，用户看到「11 只同向异动」
     其实只有 4 只）。

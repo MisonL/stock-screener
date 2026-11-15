@@ -211,7 +211,7 @@ class WestockMcp:
                              {"codes": ",".join(part), "years": int(years)})
             if not resp.get("ok"):
                 return {}                    # 一次失败就整体放弃，避免半天数据进库
-            data = resp.get("data")
+            data = _unwrap(resp.get("data"))
             # **两种返回结构都出现过**（实测）：
             #   单只票 → `{code, end, plans:[…]}`
             #   多只票 → `{sh600036: {code, end, plans:[…]}, sz002415: {…}}`
@@ -249,7 +249,7 @@ class WestockMcp:
         resp = self._rpc(MCP_TOOLS["suspension"], {"market": market})
         if not resp.get("ok"):
             return []
-        data = resp.get("data")
+        data = _unwrap(resp.get("data"))
         rows = data.get("stocks") if isinstance(data, dict) else None
         out = []
         for row in rows or []:
@@ -409,6 +409,20 @@ def _content_data(result: dict):
     if "structuredContent" in result:
         return result["structuredContent"]
     return result
+
+
+def _unwrap(data):
+    """剥掉工具返回的 `{"ok": …, "data": …}` 外壳，给出真正的业务数据。
+
+    **这是实测出来的形状**：`data_dividend` / `data_suspension` 的 `content[].text`
+    是 `{"ok":true,"data":{…}}`，而 `_content_data()` 只是把 text 解析成 JSON，
+    所以 `_rpc()["data"]` 里还是带 `ok`/`data` 的一层壳。不剥就会把 `True` 和
+    字典当成两个"股票块"去遍历，结果一条都取不到——而且不报错。
+    只剥一层，且仅当它确实有 `data` 键、没有业务字段时。
+    """
+    if isinstance(data, dict) and "data" in data and "ok" in data:
+        return data["data"]
+    return data
 
 
 def _rows(data) -> list[dict]:

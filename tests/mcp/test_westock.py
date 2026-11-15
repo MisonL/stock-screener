@@ -506,6 +506,15 @@ def _mcp_with(env_file, rows):
         datetime(2026, 11, 15, 10, 0)))
 
 
+def _wrapped(payload):
+    """按**真实接口**的形状包一层：`content[].text` 是 `{"ok":true,"data":…}`。
+
+    这一点最初就是因为 fixture 用了平铺数据而漏掉的：假数据平铺、真数据双层，
+    于是单测全绿、线上一条都取不到。fixture 必须照真实形状写。
+    """
+    return {"ok": True, "data": payload}
+
+
 def test_batch_dividend_maps_real_payload(env_file):
     """字段映射与**单位**必须对：接口是「每 10 股」，落了库要换成每股。
 
@@ -513,7 +522,7 @@ def test_batch_dividend_maps_real_payload(env_file):
     `tranAddShareRatio='4.00'` 对应「转 4.000 股」。不除 10 会让现金虚高 10 倍，
     复权因子整个算错——这类错误在图上不会报错，只会让价格看起来不对。
     """
-    mcp = _mcp_with(env_file, {"data_dividend": _DIV_SINGLE})
+    mcp = _mcp_with(env_file, {"data_dividend": _wrapped(_DIV_SINGLE)})
     got = mcp.batch_dividend(["sh603259"], years=10)
 
     assert list(got) == ["sh603259"]
@@ -534,7 +543,7 @@ def test_batch_dividend_reads_dict_shaped_multi_code_reply(env_file):
     只按列表处理会让多只票**一条都取不到**，而 silently 返回空 dict 看起来像
     "这段时间没有分红"，最难发现。
     """
-    mcp = _mcp_with(env_file, {"data_dividend": _DIV_MULTI})
+    mcp = _mcp_with(env_file, {"data_dividend": _wrapped(_DIV_MULTI)})
     got = mcp.batch_dividend(["sh600036", "sz300059"], years=10)
 
     assert set(got) == {"sh600036", "sz300059"}
@@ -545,7 +554,7 @@ def test_batch_dividend_reads_dict_shaped_multi_code_reply(env_file):
 
 def test_batch_dividend_sends_comma_joined_codes(env_file):
     """入参契约：`codes` 是**逗号分隔的字符串**，不是数组。"""
-    mcp = _mcp_with(env_file, {"data_dividend": _DIV_SINGLE})
+    mcp = _mcp_with(env_file, {"data_dividend": _wrapped(_DIV_SINGLE)})
     mcp.batch_dividend(["sh603259", "sz300059"], years=8)
 
     assert mcp.http.calls, "没有发请求"
@@ -568,7 +577,7 @@ def test_suspension_parses_real_payload_and_handles_undecided_resumption(env_fil
     `end_date == 上一交易日` 找复牌股）永远命中不了，但这条记录也永远清不掉。
     这里换成查询区间的右端（今天），语义是"仍在停牌"。
     """
-    mcp = _mcp_with(env_file, {"data_suspension": _SUSPENSION})
+    mcp = _mcp_with(env_file, {"data_suspension": _wrapped(_SUSPENSION)})
     rows = mcp.suspension("2026-11-01", "2026-11-15")
 
     assert (("sz000831", 20261102, 20261116) in rows), rows
@@ -579,7 +588,7 @@ def test_suspension_parses_real_payload_and_handles_undecided_resumption(env_fil
 
 def test_suspension_uses_hs_market_argument(env_file):
     """`data_suspension` 的 market 只认 hs/hk/us，与 `MARKETS`（A/HK/US）不是一套。"""
-    mcp = _mcp_with(env_file, {"data_suspension": _SUSPENSION})
+    mcp = _mcp_with(env_file, {"data_suspension": _wrapped(_SUSPENSION)})
     mcp.suspension("2026-11-01", "2026-11-15")
     assert mcp.http.last_args()["market"] == "hs"
 
@@ -593,8 +602,8 @@ def test_refresh_hooks_are_wired_when_client_supports_it(env_file):
     """
     from jobs.main import make_refresh_hooks
 
-    mcp = _mcp_with(env_file, {"data_dividend": _DIV_SINGLE,
-                              "data_suspension": _SUSPENSION})
+    mcp = _mcp_with(env_file, {"data_dividend": _wrapped(_DIV_SINGLE),
+                              "data_suspension": _wrapped(_SUSPENSION)})
     assert hasattr(mcp, "batch_dividend") and hasattr(mcp, "suspension")
     actions, suspensions = make_refresh_hooks(mcp, cfg=None, conn=_Conn([]))
     assert actions is not None, "有 batch_dividend 却仍返回 None：回调没接线"

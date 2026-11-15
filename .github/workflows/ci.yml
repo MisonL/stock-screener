@@ -103,4 +103,7 @@ jobs:
 
       - name: 扫描全部历史
         run: |
-          git log --all -p | python3 scripts/scan_secrets.py
+          # 同样排除那两个文件（历史里的 diff 也含样本行）
+          git log --all -p -- . \
+            ':!scripts/scan_secrets.py' ':!tests/test_scan_secrets.py' \
+            | python3 scripts/scan_secrets.py

@@ -631,3 +631,40 @@ class _Rows:
 
     def __iter__(self):
         return iter(self._rows)
+
+
+def test_batch_dividend_keeps_partial_results_when_one_chunk_fails(env_file):
+    """某个批次失败（多为上游「服务限频」）时**不能整体放弃**。
+
+    5000 多只票要发 100 多个请求，中间撞到限频很正常。全丢的后果很具体：
+    整个周刷新白跑，而且因为失败不盖时间戳，下次启动会从头再撞一遍。
+    """
+    class FlakyHttp(FakeHttp):
+        def post(self, url, json=None, headers=None, timeout=None, **kw):
+            body = json or {}
+            args = (body.get("params") or {}).get("arguments") or {}
+            first = (args.get("codes") or "").split(",")[0]
+            if first == "sz000002":                 # 第二批必然失败
+                self.calls.append({"url": url, "json": body, "headers": dict(headers or {})})
+                return Resp(200, {"jsonrpc": "2.0", "id": 1, "result": {
+                    "content": [{"type": "text", "text": "高级选股异常：msg=服务限频"}],
+                    "isError": True}})
+            return super().post(url, json=json, headers=headers, timeout=timeout, **kw)
+
+    block = {"cashDiviRMB": "5.00", "dividendPlan": "10派5.000元",
+             "exDiviDate": "20260710", "procedure": "方案实施",
+             "bonusShareRatio": "", "tranAddShareRatio": ""}
+    mcp = WestockMcp(env_path=env_file, http=FlakyHttp({"data_dividend": _wrapped(
+        {"sh600036": {"code": "sh600036", "plans": [block]}})}), clock=FixedClock(
+        datetime(2026, 11, 15, 10, 0)))
+
+    got = mcp.batch_dividend(["sh600036", "sz000002"], years=10, chunk=1)
+    assert got is not None, "只有一个批次失败却返回 None：整个刷新会白跑"
+    assert "sh600036" in got, "成功的批次被丢掉了"
+
+
+def test_batch_dividend_returns_none_only_when_every_chunk_failed(env_file):
+    """全部批次都失败才算失败——这时才不该盖「已完成」时间戳。"""
+    mcp = WestockMcp(env_path=env_file, http=FakeHttp({}, status=401),
+                     clock=FixedClock(datetime(2026, 11, 15, 10, 0)))
+    assert mcp.batch_dividend(["sh600036", "sz000002"], chunk=1) is None

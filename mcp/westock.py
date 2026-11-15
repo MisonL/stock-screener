@@ -20,6 +20,8 @@ reason: "mcp_unavailable"`，**绝不抛异常**，主链路（选股、推送�
 """
 from __future__ import annotations
 
+import logging
+
 import json
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +30,8 @@ from core.clock import SH
 from core.http import RateLimiter
 from core.market import classify_market
 from llm.schemas import MCP_TOOL_SCHEMAS, envelope
+
+log = logging.getLogger("mcp.westock")
 
 MIN_INTERVAL_S = 0.3                     # D18：只打 westock，≥300ms；与 jobs 的行情限速器独立
 TIMEOUT_S = 15
@@ -209,12 +213,18 @@ class WestockMcp:
 
         out: dict[str, list] = {}
         codes = list(codes)
+        failed_chunks = 0
         for i in range(0, len(codes), chunk):
             part = codes[i:i + chunk]
             resp = self._rpc(MCP_TOOLS["dividend"],
                              {"codes": ",".join(part), "years": int(years)})
             if not resp.get("ok"):
-                return None                  # 一次失败就整体放弃，且明确告诉调用方"失败"
+                # **单个 chunk 失败不再整体放弃**：上游有「服务限频」，5000 多只票
+                # 要发 112 个请求，中间撞到限频很正常。全丢会让整个周刷新白跑，
+                # 而且因为不盖时间戳会每次启动都重来一遍、继续撞限频。
+                # 记一笔继续下一个 chunk，最后按"有没有拿到东西"返回。
+                failed_chunks += 1
+                continue
             data = _unwrap(resp.get("data"))
             # **两种返回结构都出现过**（实测）：
             #   单只票 → `{code, end, plans:[…]}`
@@ -238,6 +248,12 @@ class WestockMcp:
                     action = _action_of(code, plan)
                     if action is not None:
                         out.setdefault(code, []).append(action)
+        total_chunks = (len(codes) + chunk - 1) // chunk
+        if failed_chunks and failed_chunks == total_chunks:
+            return None                      # 全失败：真的没取到数据，别盖"已完成"
+        if failed_chunks:
+            log.warning("分红取数 %d/%d 个批次失败（多为上游限频），已写入其余批次",
+                        failed_chunks, total_chunks)
         return out
 
     def suspension(self, start: str, end: str, market: str = SUSPENSION_MARKET):

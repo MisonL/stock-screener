@@ -169,14 +169,14 @@ def test_startup_in_session_starts_loops(env):
 def test_startup_refresh_actions_catchup(env):
     calls = []
     out = startup_recovery(env.cfg, env.conn, env.clock, reg=None,
-                           refresh_actions=lambda: calls.append("actions"),
-                           refresh_suspensions=lambda: calls.append("susp"))
+                           refresh_actions=lambda: calls.append("actions") or 1,
+                           refresh_suspensions=lambda: calls.append("susp") or 1)
     assert out["refresh_actions"] and calls == ["actions", "susp"]
     assert env.conn.execute(
         "SELECT value FROM job_state WHERE name='refresh_actions.last'").fetchone()[0] == "20261030"
 
     out2 = startup_recovery(env.cfg, env.conn, env.clock, reg=None,
-                            refresh_actions=lambda: calls.append("again"))
+                            refresh_actions=lambda: calls.append("again") or 1)
     assert out2["refresh_actions"] is False and calls == ["actions", "susp"]      # 7 天内不重复
 
 
@@ -185,7 +185,7 @@ def test_startup_after_seven_days_refreshes_again(env):
     env.conn.commit()
     calls = []
     out = startup_recovery(env.cfg, env.conn, env.clock, reg=None,
-                           refresh_actions=lambda: calls.append("actions"))
+                           refresh_actions=lambda: calls.append("actions") or 1)
     assert out["refresh_actions"] and calls == ["actions"]
 
 
@@ -228,7 +228,7 @@ def test_refresh_actions_adjacent_day_across_month_boundary_does_not_rerun(env):
     env.clock._now = datetime(2026, 11, 1, 10, 0, tzinfo=SH)
     calls = []
     out = startup_recovery(env.cfg, env.conn, env.clock, reg=None,
-                           refresh_actions=lambda: calls.append("actions"))
+                           refresh_actions=lambda: calls.append("actions") or 1)
     assert out["refresh_actions"] is False and calls == []
 
 
@@ -238,7 +238,7 @@ def test_refresh_actions_exactly_seven_days_triggers(env):
     env.clock._now = datetime(2026, 11, 1, 10, 0, tzinfo=SH)
     calls = []
     out = startup_recovery(env.cfg, env.conn, env.clock, reg=None,
-                           refresh_actions=lambda: calls.append("actions"))
+                           refresh_actions=lambda: calls.append("actions") or 1)
     assert out["refresh_actions"] and calls == ["actions"]
 
 
@@ -410,7 +410,7 @@ def test_startup_recovery_skips_when_no_eod_marker_and_calendar_huge(env):
 
     out = jobs_main.startup_recovery(
         env.cfg, env.conn, env.clock, reg=None, run_eod=_fake_eod,
-        refresh_actions=lambda: None, refresh_suspensions=lambda: None)
+        refresh_actions=lambda: 1, refresh_suspensions=lambda: 1)
     # 只有一次「试跑」，跑完就按 skipped 停下，不继续把 5 天全试一遍
     assert len(calls) == 1, f"skipped 之后还在补跑：{calls}"
     assert out.get("eod_skipped")
@@ -1180,12 +1180,15 @@ def test_bind_mounted_session_file_being_a_directory_is_reported(tmp_path, caplo
         f"没有报出目录陷阱：{[r.message for r in caplog.records]}"
 
 
-def test_refresh_does_not_stamp_when_it_wrote_nothing(tmp_path):
-    """取到 0 条时**不许盖 `refresh_actions.last`**。
+def test_refresh_does_not_stamp_when_the_fetch_failed(tmp_path):
+    """取数**失败**（回调返回 `None`）时不许盖 `refresh_actions.last`。
 
     盖了会按「距上次 ≥7 天」把重试推到下周，而这类失败通常不抛异常：
-    0.2.33 上线时正是如此——写入 0 行、时间戳照样落下，`corporate_actions`
-    的官方行一直是 0，而整条链路不报错。不盖的话每次启动都会重试。
+    0.2.33 上线时正是如此——时间戳落下、`corporate_actions` 的官方行一直是 0，
+    而整条链路不报错。不盖的话每次启动都会重试。
+
+    **注意 `0` 和 `None` 是两回事**：停牌返回 0 行是正常结果（今天没人停牌），
+    不能因为 0 就永远不盖戳、每次启动都全量重拉。
     """
     from core.db import connect, migrate
 
@@ -1196,11 +1199,11 @@ def test_refresh_does_not_stamp_when_it_wrote_nothing(tmp_path):
 
     def actions():
         called["actions"] += 1
-        return 0
+        return None
 
     def susp():
         called["susp"] += 1
-        return 0
+        return None
 
     out = jobs_main.startup_recovery(
         cfg=SimpleNamespace(), conn=conn, clock=FixedClock(datetime(2026, 11, 15, 20, 0)),
@@ -1208,9 +1211,9 @@ def test_refresh_does_not_stamp_when_it_wrote_nothing(tmp_path):
         refresh_actions=actions, refresh_suspensions=susp)
 
     assert called["actions"] == 1, "没有调用刷新"
-    assert out["refresh_actions"] is False, "0 条却把 refresh_actions 标成已完成"
+    assert out["refresh_actions"] is False, "取数失败却把 refresh_actions 标成已完成"
     row = conn.execute("SELECT value FROM job_state WHERE name='refresh_actions.last'").fetchone()
-    assert row is None, f"0 条却盖了时间戳：{row}"
+    assert row is None, f"取数失败却盖了时间戳：{row}"
 
 
 def test_refresh_stamps_after_writing_rows(tmp_path):
@@ -1226,5 +1229,26 @@ def test_refresh_stamps_after_writing_rows(tmp_path):
         refresh_actions=lambda: 5, refresh_suspensions=lambda: 2)
 
     assert out["refresh_actions"] is True
+    row = conn.execute("SELECT value FROM job_state WHERE name='refresh_actions.last'").fetchone()
+    assert row and row[0] == "20261115"
+
+
+def test_refresh_stamps_when_it_wrote_zero_rows_but_succeeded(tmp_path):
+    """查到了但确实是 0 行（例如今天没有票停牌）**必须盖戳**。
+
+    否则每次启动都会全量重拉一遍——对停牌这种"经常是 0 条"的数据，
+    不盖戳等于把「7 天一次」变成「每次启动一次」。
+    """
+    from core.db import connect, migrate
+
+    conn = connect(tmp_path / "t.db")
+    migrate(conn)
+
+    out = jobs_main.startup_recovery(
+        cfg=SimpleNamespace(), conn=conn, clock=FixedClock(datetime(2026, 11, 15, 20, 0)),
+        reg=None, tick=None, dispatcher=None, loops=None,
+        refresh_actions=lambda: 0, refresh_suspensions=lambda: 0)
+
+    assert out["refresh_actions"] is True, "0 行但没失败，应当算完成"
     row = conn.execute("SELECT value FROM job_state WHERE name='refresh_actions.last'").fetchone()
     assert row and row[0] == "20261115"

@@ -198,8 +198,12 @@ class WestockMcp:
         口径，不用再除 10。`exDiviDate` 是 `YYYYMMDD` 字符串。
 
         只保留 `procedure='方案实施'` 且 `exDiviDate` 合法的行：未实施的预案没有
-        除权日，拿来算复权会把因子算错。整个调用失败时返回空 dict（不抛），
-        让 `refresh_actions` 拿到"没有数据"而不是崩掉——周刷新失败不该影响主链路。
+        除权日，拿来算复权会把因子算错。
+
+        **取数失败返回 `None`，不是 `{}`**：调用方要能区分「查到了，这些票确实
+        没分红」和「压根没查到」。混为一谈会让"失败"被记成"已完成"，然后按
+        ≥7 天的规则推到下周才重试（0.2.33 就栽在这上面）。不抛异常——周刷新失败
+        不该把 jobs 主链路带崩。
         """
         from core.datasource.westock import CorpAction
 
@@ -210,7 +214,7 @@ class WestockMcp:
             resp = self._rpc(MCP_TOOLS["dividend"],
                              {"codes": ",".join(part), "years": int(years)})
             if not resp.get("ok"):
-                return {}                    # 一次失败就整体放弃，避免半天数据进库
+                return None                  # 一次失败就整体放弃，且明确告诉调用方"失败"
             data = _unwrap(resp.get("data"))
             # **两种返回结构都出现过**（实测）：
             #   单只票 → `{code, end, plans:[…]}`
@@ -245,10 +249,13 @@ class WestockMcp:
         交易日` 找复牌股，1900 年的记录永远不会误命中，但也永远清不掉。
         接口只按当前快照给"正在停牌"的票，没有区间查询参数，`start`/`end` 仅用于
         把哨兵值夹到今天。
+
+        **取数失败返回 `None`**（理由同 `batch_dividend`）：空列表是正常结果
+        （今天没有票停牌），不能拿来当失败信号。
         """
         resp = self._rpc(MCP_TOOLS["suspension"], {"market": market})
         if not resp.get("ok"):
-            return []
+            return None
         data = _unwrap(resp.get("data"))
         rows = data.get("stocks") if isinstance(data, dict) else None
         out = []

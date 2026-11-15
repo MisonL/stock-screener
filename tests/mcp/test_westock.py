@@ -563,11 +563,16 @@ def test_batch_dividend_sends_comma_joined_codes(env_file):
     assert sent["years"] == 8
 
 
-def test_batch_dividend_returns_empty_on_failure_instead_of_crashing(env_file):
-    """取数失败返回空 dict：周刷新不该把 jobs 主链路带崩。"""
+def test_batch_dividend_returns_none_on_failure_instead_of_crashing(env_file):
+    """取数失败返回 **None**（不是 `{}`）：调用方要能区分"失败"和"查到了没数据"。
+
+    混为一谈的后果很具体：0.2.33 上线时把失败记成"已完成"，于是按「距上次
+    ≥7 天」把重试推到下周，`corporate_actions` 官方行一直是 0 而链路不报错。
+    同时不抛异常——周刷新失败不该把 jobs 主链路带崩。
+    """
     mcp = WestockMcp(env_path=env_file, http=FakeHttp({}, status=401),
                      clock=FixedClock(datetime(2026, 11, 15, 10, 0)))
-    assert mcp.batch_dividend(["sh600519"]) == {}
+    assert mcp.batch_dividend(["sh600519"]) is None
 
 
 def test_suspension_parses_real_payload_and_handles_undecided_resumption(env_file):

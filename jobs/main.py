@@ -523,28 +523,25 @@ def startup_recovery(cfg, conn, clock, *, reg, tick=None, dispatcher=None, loops
     if due and refresh_actions is not None:
         # 同 EOD 补跑：`loops.start()` 之后快照线程已在写共享连接，这里也必须持锁
         with write_lock:
-            # **回调返回 None 表示"没报错、也没给数字"，不能当成 0**：
-            # 老的回调/测试桩不返回值，把 None 当 0 会让它们全部变成"没写入"。
-            # 只有明确返回 0 才算"这次一条都没取到"。
+            # **`None` = 取数失败，`0` = 查到了但确实没有**。
+            # 两者必须分开：停牌返回 0 行是正常的（今天没人停牌），
+            # 而"取数失败"如果被当成成功，就会按「距上次 ≥7 天」把重试推到下周
+            # ——0.2.33 上线时正是这样，`corporate_actions` 官方行一直是 0。
             wrote = refresh_actions()
             susp = refresh_suspensions() if refresh_suspensions is not None else None
-            wrote_count = wrote if isinstance(wrote, int) else None
-            susp_count = susp if isinstance(susp, int) else None
+            failed = (wrote is None) or (refresh_suspensions is not None and susp is None)
             # **一条都没写就不要盖时间戳**：盖了会按「距上次 ≥7 天」把重试推到下周，
             # 而失败（取数空、账号没配、上游改结构）通常不会抛异常——0.2.33 上线时
             # 就是这样：写入 0 行、时间戳照样落下，之后一周都不会再试一次。
             # 不盖的话每次启动都会重试，日志里也看得出来。
-            empty = ((wrote_count == 0) if wrote_count is not None else False) and \
-                    ((susp_count == 0) if susp_count is not None else True) and \
-                    (wrote_count is not None or susp_count is not None)
-            if not empty:
+            if not failed:
                 with conn:
                     conn.execute(
                         "INSERT OR REPLACE INTO job_state(name, value)"
                         " VALUES ('refresh_actions.last', ?)", (str(_ymd(today)),))
                 out["refresh_actions"] = True
             else:
-                log.warning("除权/停牌刷新取到 0 条，不盖时间戳（下次启动重试）")
+                log.warning("除权/停牌刷新取数失败（返回 None），不盖时间戳（下次启动重试）")
     return out
 
 

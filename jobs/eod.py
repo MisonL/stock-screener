@@ -250,6 +250,8 @@ def refresh_actions(cfg, westock, conn, codes) -> int:
     **没有周期触发器**：只由 `startup_recovery` 在「距上次 ≥7 天」时补跑。
     """
     actions = westock.batch_dividend(list(codes), years=10)
+    if actions is None:
+        return None                     # 取数失败：让调用方不要盖"已完成"时间戳
     written = 0
     with conn:
         for code, items in actions.items():
@@ -278,6 +280,8 @@ def refresh_suspensions(cfg, westock, conn, codes=None) -> int:
     end = datetime.now(SH).date()
     start = end - timedelta(days=SUSPENSION_DAYS)
     rows = westock.suspension(start.isoformat(), end.isoformat())
+    if rows is None:
+        return None                     # 取数失败（`[]` 才是"今天没人停牌"）
     wanted = None if codes is None else set(codes)
     written = 0
     with conn:

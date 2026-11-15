@@ -1,4 +1,4 @@
-"""batch2 Task 5：出处标记抽取与服务端回核。"""
+"""出处标记抽取与服务端回核。"""
 import inspect
 
 import pytest

@@ -1,4 +1,4 @@
-"""Task 4：交易时段、交易日历与时钟。"""
+"""交易时段、交易日历与时钟。"""
 from datetime import date, datetime, time
 
 import pytest

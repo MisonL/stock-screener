@@ -1,4 +1,4 @@
-"""Task 13：`GET /api/agent-log` 与 agent_turn 归档。"""
+"""`GET /api/agent-log` 与 agent_turn 归档。"""
 from __future__ import annotations
 
 import json

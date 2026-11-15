@@ -1,4 +1,4 @@
-"""Task 6：串行限速 HTTP 客户端。"""
+"""串行限速 HTTP 客户端。"""
 import time
 
 import httpx

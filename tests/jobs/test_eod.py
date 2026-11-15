@@ -1,4 +1,4 @@
-"""Task 12：每日增量（15:05 快照 append）、除权检测、ST 区间与停牌日历。"""
+"""每日增量（15:05 快照 append）、除权检测、ST 区间与停牌日历。"""
 from datetime import datetime as dt
 
 import pytest

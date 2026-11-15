@@ -1,4 +1,4 @@
-"""Task 9：多源降级链与健康探测。"""
+"""多源降级链与健康探测。"""
 import pytest
 
 from core.datasource.registry import HealthTracker, SourceRegistry

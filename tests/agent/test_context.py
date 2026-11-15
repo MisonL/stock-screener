@@ -1,4 +1,4 @@
-"""Task 8：预渲染上下文的裁剪顺序与 6000 字符预算。"""
+"""预渲染上下文的裁剪顺序与 6000 字符预算。"""
 import json
 from datetime import datetime, timedelta
 

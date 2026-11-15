@@ -1,4 +1,4 @@
-"""Task 11：自适应心跳与自排闹钟。"""
+"""自适应心跳与自排闹钟。"""
 from datetime import datetime, timedelta
 
 import pytest

@@ -1,4 +1,4 @@
-"""Task 7：注意力层（当日过滤 / 合并 / 去重 / 通道 B 疲劳阈值 / escalated 写入）。"""
+"""注意力层（当日过滤 / 合并 / 去重 / 通道 B 疲劳阈值 / escalated 写入）。"""
 from datetime import datetime, timedelta
 
 import pytest

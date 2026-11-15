@@ -1,4 +1,4 @@
-"""Task 22：调度器装配（B3 每秒 tick、D9 心跳、D26 自检）与启动恢复（D10）。"""
+"""调度器装配（B3 每秒 tick、D9 心跳、D26 自检）与启动恢复（D10）。"""
 import json
 from datetime import datetime, timedelta
 from pathlib import Path

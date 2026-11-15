@@ -1,4 +1,4 @@
-"""Task 23：模板渲染、HMAC 票据与 ntfy 客户端。"""
+"""模板渲染、HMAC 票据与 ntfy 客户端。"""
 import copy
 import re
 from datetime import datetime

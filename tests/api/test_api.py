@@ -1,4 +1,4 @@
-"""Task 24：只读接口、签名回调与状态（§7.5、D19/D20/D23/D25）。"""
+"""只读接口、签名回调与状态（§7.5、D19/D20/D23/D25）。"""
 import json
 from datetime import datetime
 from pathlib import Path

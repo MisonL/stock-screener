@@ -1,4 +1,4 @@
-"""batch2 Task 4：compare_pattern（z-score + 皮尔逊 + 后 20 日事实）。
+"""compare_pattern（z-score + 皮尔逊 + 后 20 日事实）。
 
 用直接造库的方式喂序列：这里测的是算法与窗口口径，不是选股链路。
 """
@@ -198,7 +198,7 @@ def test_ref_start_before_list_date(conn):
 
 
 def test_ref_end_none_length_equals_current_n(conn):
-    """Task 4 点名的口径：ref_end=None 时参考窗口长度 == 当前 N*。"""
+    """点名的口径：ref_end=None 时参考窗口长度 == 当前 N*。"""
     dates = seed(conn, wave(60), box_days=20)
     data, reason = compare_pattern(conn, CLOCK, "sh600519", str(dates[0]), cfg=CFG)
     assert reason is None and data["n"] == 20

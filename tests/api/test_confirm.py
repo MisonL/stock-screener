@@ -1,4 +1,4 @@
-"""Task 6：确认卡回调（`POST /api/hook/agent/{turn_id}/confirm`）。
+"""确认卡回调（`POST /api/hook/agent/{turn_id}/confirm`）。
 
 Step 1 清单里属于本文件的条目：
 ① 验签失败 / 过期 → 403 **且不改库、不执行写**；

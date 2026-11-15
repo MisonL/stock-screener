@@ -1,4 +1,4 @@
-"""Task 25 的进程级契约：agent 主循环必然 import llm / openai（批2 Task 11 起）。
+"""watchdog 的进程级契约：agent 主循环必然 import llm / openai（批2 Task 11 起）。
 
 批1 曾断言 `agent.main` **不** import llm——批2 换成真实主循环后这条断言必须改写：
 真实主循环要调 `LlmClient`，不 import 才是有问题的。现在钉的是**进程能被正常 import**

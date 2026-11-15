@@ -1,4 +1,4 @@
-"""Task 14：bar 标注与共用下跌期窗口（spec §4.6.6 末尾红框与 §4.6.5）。
+"""bar 标注与共用下跌期窗口（spec §4.6.6 末尾红框与 §4.6.5）。
 
 `rows_double_top / rows_high_in_box / rows_long_decline` 是三个只造形状的 `list[DayRow]`
 常量（价格取整、四价相同），下面 5 个用例直接吃它们。

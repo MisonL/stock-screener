@@ -1,4 +1,4 @@
-"""Task 14：AI 对话（假 LLM 回放）。"""
+"""AI 对话（假 LLM 回放）。"""
 from __future__ import annotations
 
 import asyncio

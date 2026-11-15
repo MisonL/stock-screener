@@ -1,4 +1,4 @@
-"""Task 2：LLM 客户端（重试分类 / thinking 注入 / 抖动）。"""
+"""LLM 客户端（重试分类 / thinking 注入 / 抖动）。"""
 import json
 from pathlib import Path
 

@@ -1,4 +1,4 @@
-"""Task 23：派发层规则（去重 / 熔断 / 上溢 / 合并）与落库契约。"""
+"""派发层规则（去重 / 熔断 / 上溢 / 合并）与落库契约。"""
 from datetime import datetime, timedelta
 from pathlib import Path
 

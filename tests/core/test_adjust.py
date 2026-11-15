@@ -1,4 +1,4 @@
-"""Task 10：自算乘法复权因子与 adj 表重建。"""
+"""自算乘法复权因子与 adj 表重建。"""
 import pytest
 
 from core.adjust import cum_factors, day_factor, ex_ref, factors_at, rebuild_adj

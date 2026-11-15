@@ -1,4 +1,4 @@
-"""Task 7：`channel_b_today` 的计数口径（B9/D8）。"""
+"""`channel_b_today` 的计数口径（B9/D8）。"""
 from datetime import datetime, timedelta
 
 import pytest

@@ -1,4 +1,4 @@
-"""Task 20：池内票的盘中规则（C1/C2/C3/C′、封板、停牌、除权跳过）。"""
+"""池内票的盘中规则（C1/C2/C3/C′、封板、停牌、除权跳过）。"""
 import json
 from datetime import datetime, timedelta
 from pathlib import Path

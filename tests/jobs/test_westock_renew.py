@@ -1,4 +1,4 @@
-"""Task 6：westock token 按需续期（先红后绿）。
+"""westock token 按需续期（先红后绿）。
 
 Step 1 清单里属于本文件的条目：
 ① `renew_if_needed` 同一天第二次调用返回 `skip`、子进程只起了一次，

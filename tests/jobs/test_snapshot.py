@@ -1,4 +1,4 @@
-"""Task 22 第一步：快照三循环、上游请求记账与退避。"""
+"""第一步：快照三循环、上游请求记账与退避。"""
 import json
 import threading
 from datetime import datetime, timedelta

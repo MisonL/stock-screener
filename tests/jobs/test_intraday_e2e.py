@@ -1,4 +1,4 @@
-"""Task 22：盘中 tick 端到端（快照 → 规则 → 检测器 → 派发 → 库）。"""
+"""盘中 tick 端到端（快照 → 规则 → 检测器 → 派发 → 库）。"""
 from datetime import datetime
 
 import pytest

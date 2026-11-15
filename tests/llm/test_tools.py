@@ -1,4 +1,4 @@
-"""Task 3：只读工具集（23 工具 / 3 套 schema / 统一信封 / TTL 缓存 / needs_confirm）。
+"""只读工具集（23 工具 / 3 套 schema / 统一信封 / TTL 缓存 / needs_confirm）。
 
 全部用假 mcp、假 westock CLI、真 SQLite（conftest 的 conn），不碰网络。
 """

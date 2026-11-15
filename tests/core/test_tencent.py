@@ -1,4 +1,4 @@
-"""Task 7：腾讯数据源（快照 / 日线）与 Bar 的占位判据。"""
+"""腾讯数据源（快照 / 日线）与 Bar 的占位判据。"""
 from datetime import datetime
 
 import pytest

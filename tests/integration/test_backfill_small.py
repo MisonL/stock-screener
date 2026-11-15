@@ -1,4 +1,4 @@
-"""Task 11：首次全量回填（假上游，不碰网）。"""
+"""首次全量回填（假上游，不碰网）。"""
 from jobs.backfill import backfill
 from tests.helpers import seed_fetch_log
 

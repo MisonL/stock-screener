@@ -1,4 +1,4 @@
-"""Task 10：回合循环（整回合硬截止）与工作日志。用回放脚本的假客户端。"""
+"""回合循环（整回合硬截止）与工作日志。用回放脚本的假客户端。"""
 from __future__ import annotations
 
 import asyncio

@@ -1,4 +1,4 @@
-"""Task 8：记忆检索与写入（`agent_memory`）。"""
+"""记忆检索与写入（`agent_memory`）。"""
 from datetime import datetime, timedelta
 
 import pytest

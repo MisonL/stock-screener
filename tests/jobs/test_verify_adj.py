@@ -1,4 +1,4 @@
-"""Task 11 的复权对拍脚本（只校验，不参与生产路径）。"""
+"""复权对拍脚本（只校验，不参与生产路径）。"""
 import pytest
 
 from core.adjust import verify_adj

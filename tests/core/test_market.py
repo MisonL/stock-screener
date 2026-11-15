@@ -1,4 +1,4 @@
-"""Task 5：市场判别、涨跌停价与一字板判定。"""
+"""市场判别、涨跌停价与一字板判定。"""
 import pytest
 
 from core.market import classify_market, limit_hit, limit_prices, oneword

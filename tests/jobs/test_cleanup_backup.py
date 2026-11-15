@@ -1,4 +1,4 @@
-"""Task 22：清理任务（D19）、数据库备份与调度器装配。"""
+"""清理任务（D19）、数据库备份与调度器装配。"""
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path

@@ -1,4 +1,4 @@
-"""Task 13：指标原语（口径照 spec §4.6.1.1）。"""
+"""指标原语（口径照 spec §4.6.1.1）。"""
 import numpy as np
 import pytest
 

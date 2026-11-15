@@ -1,4 +1,4 @@
-"""batch2 Task 1：第二批 schema（agent 工作日志、记忆、闹钟、对话、日预算）。"""
+"""第二批 schema（agent 工作日志、记忆、闹钟、对话、日预算）。"""
 import pytest
 
 from core.db import migrate

@@ -1,4 +1,4 @@
-"""Task 10：westock CLI 包装（除权事件主源）。"""
+"""westock CLI 包装（除权事件主源）。"""
 import json
 import subprocess
 

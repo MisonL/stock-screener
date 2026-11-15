@@ -1,4 +1,4 @@
-"""Task 13：watchdog 规则 3（回合停滞）与决定 B3（LLM 连续不可用）。"""
+"""watchdog 规则 3（回合停滞）与决定 B3（LLM 连续不可用）。"""
 from __future__ import annotations
 
 import json

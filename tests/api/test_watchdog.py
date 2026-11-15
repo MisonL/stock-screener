@@ -1,4 +1,4 @@
-"""Task 25：watchdog 与 agent 空壳。"""
+"""watchdog 与 agent 空壳。"""
 import json
 import subprocess
 import sys

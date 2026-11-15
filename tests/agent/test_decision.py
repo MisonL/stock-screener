@@ -1,4 +1,4 @@
-"""Task 9：emit_decision 解析与「方向不可说反」。"""
+"""emit_decision 解析与「方向不可说反」。"""
 import json
 
 import pytest

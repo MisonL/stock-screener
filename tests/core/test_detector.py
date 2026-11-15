@@ -1,4 +1,4 @@
-"""Task 21 第二部分：salience 与沿触发事件检测器（`detector.py`）。"""
+"""第二部分：salience 与沿触发事件检测器（`detector.py`）。"""
 import json
 from datetime import datetime
 

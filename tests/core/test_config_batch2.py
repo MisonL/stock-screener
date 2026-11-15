@@ -1,4 +1,4 @@
-"""batch2 Task 1：agent.yaml / llm.yaml 的加载与必检。"""
+"""agent.yaml / llm.yaml 的加载与必检。"""
 from pathlib import Path
 
 import pytest

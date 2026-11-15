@@ -1,4 +1,4 @@
-"""Task 12：两段式第二段（同 sequence_id）、通道 B 与共用去重。"""
+"""两段式第二段（同 sequence_id）、通道 B 与共用去重。"""
 from __future__ import annotations
 
 import json

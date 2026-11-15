@@ -1,4 +1,4 @@
-"""Task 2：双池日预算。"""
+"""双池日预算。"""
 from datetime import datetime
 from types import SimpleNamespace
 

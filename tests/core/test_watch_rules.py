@@ -1,4 +1,4 @@
-"""Task 21 第一部分：自选股 / 指数 / 板块 / 竞价规则（`core/intraday/watch_rules.py`）。"""
+"""第一部分：自选股 / 指数 / 板块 / 竞价规则（`core/intraday/watch_rules.py`）。"""
 from datetime import datetime, time, timedelta
 from pathlib import Path
 

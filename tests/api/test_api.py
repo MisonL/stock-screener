@@ -1,6 +1,7 @@
 """Task 24：只读接口、签名回调与状态（§7.5、D19/D20/D23/D25）。"""
 import json
 from datetime import datetime
+from pathlib import Path
 
 import httpx
 import pytest
@@ -541,15 +542,23 @@ def test_spa_fallback_excludes_server_routes(api):
 
 
 def test_spa_prefixes_do_not_shadow_frontend_routes(api):
-    """/authors/1、/auth-log、/healthzzz 是前端自己的路由，回落 index.html 而不是 404 JSON。"""
+    """/authors/1、/auth-log、/healthzzz 是前端自己的路由，回落 index.html 而不是 404 JSON。
+
+    **`web/dist` 是构建产物、不入库**（见 .gitignore）。没构建过时 `api/routes.py`
+    的 SPA 回落按设计返回 404「前端产物不存在」——那是正确行为，不是要靠这条测试
+    抓的缺陷。所以这里显式跳过，而不是断言 200：否则测试会依赖「本地碰巧构建过」，
+    CI 上必红（第一次跑 CI 就是这么红的）。
+    """
     import asyncio
+
+    if not (Path("web/dist/index.html")).exists():
+        pytest.skip("web/dist 未构建（make test-web 或镜像构建后才有）")
 
     async def run():
         async with api() as client:
             return {p: await client.get(p) for p in ("/authors/1", "/auth-log", "/healthzzz")}
 
     for path, resp in asyncio.run(run()).items():
-        # 正常回落 = index.html（web/dist 已构建时 200 HTML）；被误当成服务端路径才是 404 JSON
         assert resp.status_code == 200 and "text/html" in resp.headers["content-type"], path
         assert "选股盯盘" in resp.text, path
 

@@ -22,6 +22,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # test_version.py 会校验「当前版本必须有对应 tag」，浅克隆拿不到 tag 就必红
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: 构建 dev 镜像
         run: docker build --target dev -t ss-dev -f deploy/Dockerfile .
@@ -43,11 +47,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
 
-      - run: pip install pytest pyyaml
+      # **不能只装 pytest**：`tests/conftest.py` 会 import httpx 等运行时依赖，
+      # 少一个就 `ModuleNotFoundError`（第一次跑 CI 就栽在这）。装 dev 全闭包。
+      - run: pip install -r requirements-dev.txt
 
-      # 纯文本检查，不必先构建镜像（见 Makefile 里 check-version 的注释）：
-      # 它要在「改完版本、跑全量测试之前」尽快给出反馈，所以只跑这一个文件。
+      # 纯文本检查，不构建镜像。它要在「改完版本、跑全量测试之前」尽快反馈，
+      # 所以只跑这一个文件——但依赖必须齐。
       - run: python -m pytest -q tests/test_version.py
 
   frontend:
@@ -84,9 +92,14 @@ jobs:
       # **不要在 YAML 里写一条大正则**：版本号和私网地址在文本上长得一样，
       # 误报会把这条门禁变成噪音，最后没人看。脚本用 ipaddress 模块解析，
       # 天生不会把版本号当 IP。
+      # 扫描器自身和它的测试里含有「应该被抓到」的样本行（规则文本、示例 IP），
+      # 扫自己必然误报。排除这两个文件；它们的行为由 tests/test_scan_secrets.py 保证。
       - name: 扫描工作区
         run: |
-          git ls-files -z | xargs -0 cat 2>/dev/null | python3 scripts/scan_secrets.py
+          set -euo pipefail
+          git ls-files \
+            | grep -v -E '^(scripts/scan_secrets\.py|tests/test_scan_secrets\.py)$' \
+            | xargs cat | python3 scripts/scan_secrets.py
 
       - name: 扫描全部历史
         run: |

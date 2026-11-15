@@ -197,7 +197,7 @@ class WestockMcp:
     # ---- 除权 / 停牌（jobs 的周刷新用，不进 agent 工具集） -----------------
 
     def batch_dividend(self, codes, years: int = 10, chunk: int = 50,
-                       backoff_s: float = 2.0):
+                       backoff_s: float = 5.0, retries: int = 3):
         """多只票的分红送转，返回 `{code: [CorpAction, ...]}`。
 
         **字段名是实测出来的**（`data_dividend` 的返回，见 `_action_of`）：
@@ -220,20 +220,13 @@ class WestockMcp:
         failed_chunks = 0
         for i in range(0, len(codes), chunk):
             part = codes[i:i + chunk]
-            resp = self._rpc(MCP_TOOLS["dividend"],
-                             {"codes": ",".join(part), "years": int(years)})
-            if not resp.get("ok"):
-                # **单个 chunk 失败不再整体放弃**：上游有「服务限频」，5000 多只票
-                # 要发 112 个请求，中间撞到限频很正常。全丢会让整个周刷新白跑，
-                # 而且因为不盖时间戳会每次启动都重来一遍、继续撞限频。
+            data = self._fetch_chunk(part, years, backoff_s=backoff_s, retries=retries)
+            if data is None:
+                # **单个 chunk 失败不再整体放弃**：5000 多只票要发 100 多个请求，
+                # 全丢会让整个周刷新白跑，而且因为不盖时间戳会每次启动都重来一遍。
                 # 记一笔继续下一个 chunk，最后按"有没有拿到东西"返回。
                 failed_chunks += 1
-                if self.sleep and failed_chunks <= 3:
-                    # 撞到限频就退避一下再继续：连续 100 多个请求本来就贴着上游
-                    # 的限频线，硬顶着发只会一直撞。
-                    self.sleep(backoff_s * failed_chunks)
                 continue
-            data = _unwrap(resp.get("data"))
             # **两种返回结构都出现过**（实测）：
             #   单只票 → `{code, end, plans:[…]}`
             #   多只票 → `{sh600036: {code, end, plans:[…]}, sz002415: {…}}`
@@ -256,13 +249,46 @@ class WestockMcp:
                     action = _action_of(code, plan)
                     if action is not None:
                         out.setdefault(code, []).append(action)
-        total_chunks = (len(codes) + chunk - 1) // chunk
+        total_chunks = max(1, (len(codes) + chunk - 1) // chunk)
         if failed_chunks and failed_chunks == total_chunks:
             return None                      # 全失败：真的没取到数据，别盖"已完成"
         if failed_chunks:
             log.warning("分红取数 %d/%d 个批次失败（多为上游限频），已写入其余批次",
                         failed_chunks, total_chunks)
         return out
+
+    def _fetch_chunk(self, part, years, backoff_s: float, retries: int):
+        """取一个批次，撞上限频就退避重试；拿到数据返回按 code 分组的块。
+
+        **限频的伪装必须看穿**：上游被限流时不会报错，而是返回
+        `ok=True` + **空/残缺数据**（实测：连续调用时返回键数 50 → 17 → 0 → 1 → 0…，
+        冷却一两分钟才恢复）。若不校验条数，这些"空返回"会被当成
+        「这些票十年内都没分红」——数据静默缺失，比报错难发现得多。
+
+        所以判据是**返回的票数明显少于请求数**（少于一半）就当限频，退避重试；
+        重试仍不足才接受现有结果（B 股、新股本来就可能没有分红记录）。
+        """
+        want = len(part)
+        best: dict | None = None
+        for attempt in range(retries + 1):
+            resp = self._rpc(MCP_TOOLS["dividend"],
+                             {"codes": ",".join(part), "years": int(years)})
+            if not resp.get("ok"):
+                reason = resp.get("reason") or ""
+                if "mcp_unavailable" in reason:
+                    return None                  # token 没了，重试也没用
+                data = None
+            else:
+                data = _unwrap(resp.get("data"))
+            got = len(data) if isinstance(data, dict) else 0
+            if got * 2 >= want:
+                return data                      # 够数，直接用
+            # 不足一半：优先保留拿到最多的那次（残缺也比没有强）
+            if best is None or got > len(best):
+                best = data if isinstance(data, dict) else best
+            if attempt < retries and self.sleep:
+                self.sleep(backoff_s * (attempt + 1))
+        return best
 
     def suspension(self, start: str, end: str, market: str = SUSPENSION_MARKET):
         """停牌列表，返回 `[(code, start_date, end_date), ...]`。

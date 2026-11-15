@@ -690,4 +690,41 @@ def test_batch_dividend_backs_off_after_a_rate_limit(env_file):
 
     assert delays, "撞到限频却完全没有退避"
     assert delays[0] >= 2.0, f"退避太短：{delays[0]}"
-    assert len(delays) <= 3, f"退避次数应封顶（实际 {len(delays)} 次）"
+    # 3 个 chunk × 3 次重试：每个 chunk 内部重试、不无限循环
+    assert len(delays) <= 3 * 3, f"退避次数应封顶（实际 {len(delays)} 次）"
+
+
+def test_batch_dividend_retries_when_response_is_suspiciously_short(env_file):
+    """**限频的伪装是 `ok=True` + 空数据**，必须靠"条数明显偏少"识破。
+
+    实测：连续调用 `data_dividend` 时返回键数 50 → 17 → 0 → 1 → 0…，
+    冷却一两分钟才恢复，全程 `ok=True`、不报错。不校验条数的话，
+    这些空返回会被当成「这些票十年内没分红」——数据静默缺失，
+    比报错难发现得多。
+    """
+    calls = {"n": 0}
+
+    class ShrinkingHttp(FakeHttp):
+        def post(self, url, json=None, headers=None, timeout=None, **kw):
+            calls["n"] += 1
+            body = json or {}
+            args = (body.get("params") or {}).get("arguments") or {}
+            want = (args.get("codes") or "").split(",")
+            # 前两次只回 1 只（模拟限频），第三次回全部
+            keep = want[:1] if calls["n"] < 3 else want
+            payload = {c: {"code": c, "plans": [{
+                "cashDiviRMB": "5.00", "dividendPlan": "10派5.000元",
+                "exDiviDate": "20260710", "procedure": "方案实施",
+                "bonusShareRatio": "", "tranAddShareRatio": ""}]} for c in keep}
+            self.calls.append({"url": url, "json": body, "headers": dict(headers or {})})
+            return Resp(200, {"jsonrpc": "2.0", "id": 1, "result": {
+                "content": [{"type": "text", "text": _json.dumps(
+                    {"ok": True, "data": payload}, ensure_ascii=False)}],
+                "isError": False}})
+
+    mcp = WestockMcp(env_path=env_file, http=ShrinkingHttp({}), sleep=lambda s: None,
+                     clock=FixedClock(datetime(2026, 11, 15, 10, 0)))
+    got = mcp.batch_dividend(["sh600036", "sz000002", "sh600000"], years=10, chunk=3)
+
+    assert calls["n"] >= 3, "条数明显偏少却没重试：残缺数据会被当成真实结果"
+    assert got is not None and len(got) == 3, f"重试后仍不完整：{got}"

@@ -33,6 +33,8 @@
 
 ## [Unreleased]
 
+## [0.2.32] - 2026-11-15
+
 ### 新增
 
 - **GitHub Actions CI**（`.github/workflows/ci.yml`），四个 job：

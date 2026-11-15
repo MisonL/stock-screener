@@ -445,3 +445,175 @@ def test_wb_auth_headless_exits_1_on_failure(tmp_path):
         proc, out = _run_script(tmp_path, stub)
     assert proc.returncode == 1
     assert not out.exists()                            # 失败不留半成品凭据
+
+
+# ---------------------------------------------------------------- 除权 / 停牌取数
+#
+# 下面的 fixture 数据是**从真实接口抓回来的原文**（2026-11-15），不是编的。
+# 字段名、单位、"多只票返回以 code 为键的字典"这些坑，全是实测撞出来的。
+
+
+#: `data_dividend` 单只票的真实返回（sh603259，含转增）
+_DIV_SINGLE = {
+    "code": "sh603259",
+    "end": "2026-11-15",
+    "plans": [
+        {"bonusShareRatio": "", "cashDiviRMB": "5.80", "dividendFlag": "是",
+         "dividendPlan": "10派5.800元转4.000股", "dividendType": "有分红",
+         "exDiviDate": "20260710", "procedure": "方案实施", "proposalSn": 1,
+         "reportEndDate": "20251231", "rightRegDate": "20260709",
+         "totalCashDiviComRMB": "1.0", "tranAddShareRatio": "4.00"},
+        # 未实施的预案且**没有**除权日
+        {"bonusShareRatio": "", "cashDiviRMB": "1.00", "dividendFlag": "否",
+         "dividendPlan": "10派1.000元", "dividendType": "有分红",
+         "exDiviDate": "", "procedure": "董事会预案", "proposalSn": 1,
+         "reportEndDate": "20260930", "rightRegDate": "",
+         "totalCashDiviComRMB": "0", "tranAddShareRatio": ""},
+        # 未实施的预案但**填了**除权日（预案里排的日期）。只靠"有没有除权日"
+        # 过滤是漏不掉的——必须按 `procedure` 判。不判就会把还没实施的方案
+        # 当成已除权，复权因子提前偏移。
+        {"bonusShareRatio": "", "cashDiviRMB": "2.00", "dividendFlag": "否",
+         "dividendPlan": "10派2.000元", "dividendType": "有分红",
+         "exDiviDate": "20270415", "procedure": "股东大会决议", "proposalSn": 1,
+         "reportEndDate": "20260331", "rightRegDate": "",
+         "totalCashDiviComRMB": "0", "tranAddShareRatio": ""},
+    ],
+}
+
+#: `data_dividend` 多只票的真实返回：**以 code 为键的字典**，顶层没有 plans
+_DIV_MULTI = {
+    "sh600036": {"code": "sh600036", "end": "2026-11-15", "plans": [
+        {"cashDiviRMB": "10.03", "dividendPlan": "10派10.030元",
+         "exDiviDate": "20260710", "procedure": "方案实施",
+         "bonusShareRatio": "", "tranAddShareRatio": ""}]},
+    "sz300059": {"code": "sz300059", "end": "2026-11-15", "plans": [
+        {"cashDiviRMB": "0.70", "dividendPlan": "10派0.700元转2.000股",
+         "exDiviDate": "20260520", "procedure": "方案实施",
+         "bonusShareRatio": "", "tranAddShareRatio": "2.00"}]},
+}
+
+#: `data_suspension` 的真实返回：`resumptionDate=19000101` 表示"还没定复牌日"
+_SUSPENSION = {"market": "hs", "stocks": [
+    {"code": "sz000635", "name": "英 力 特", "resumptionDate": "19000101",
+     "status": "", "statusDesc": "重大事项", "suspendDate": "20261113"},
+    {"code": "sz000831", "name": "中国稀土", "resumptionDate": "20261116",
+     "status": "", "statusDesc": "重大事项", "suspendDate": "20261102"},
+]}
+
+
+def _mcp_with(env_file, rows):
+    return WestockMcp(env_path=env_file, http=FakeHttp(rows), clock=FixedClock(
+        datetime(2026, 11, 15, 10, 0)))
+
+
+def test_batch_dividend_maps_real_payload(env_file):
+    """字段映射与**单位**必须对：接口是「每 10 股」，落了库要换成每股。
+
+    实测对照：`cashDiviRMB='5.80'` 对应 `dividendPlan='10派5.800元转4.000股'`，
+    `tranAddShareRatio='4.00'` 对应「转 4.000 股」。不除 10 会让现金虚高 10 倍，
+    复权因子整个算错——这类错误在图上不会报错，只会让价格看起来不对。
+    """
+    mcp = _mcp_with(env_file, {"data_dividend": _DIV_SINGLE})
+    got = mcp.batch_dividend(["sh603259"], years=10)
+
+    assert list(got) == ["sh603259"]
+    actions = got["sh603259"]
+    assert len(actions) == 1, "未实施的预案（无除权日）必须被丢掉"
+    a = actions[0]
+    assert a.code == "sh603259" and a.ex_date == 20260710
+    assert a.cash_per_share == pytest.approx(0.58)        # 5.80 / 10
+    assert a.tran_ratio == pytest.approx(0.40)            # 4.00 / 10
+    assert a.bonus_ratio == 0.0
+    assert a.source == "westock_dividend"
+
+
+def test_batch_dividend_reads_dict_shaped_multi_code_reply(env_file):
+    """多只票的返回是**以 code 为键的字典**，顶层没有 `plans`。
+
+    单只票是 `{code, plans}`、多只票是 `{sh600036: {...}, ...}`——两种都出现过。
+    只按列表处理会让多只票**一条都取不到**，而 silently 返回空 dict 看起来像
+    "这段时间没有分红"，最难发现。
+    """
+    mcp = _mcp_with(env_file, {"data_dividend": _DIV_MULTI})
+    got = mcp.batch_dividend(["sh600036", "sz300059"], years=10)
+
+    assert set(got) == {"sh600036", "sz300059"}
+    assert got["sh600036"][0].cash_per_share == pytest.approx(1.003)
+    assert got["sz300059"][0].cash_per_share == pytest.approx(0.07)
+    assert got["sz300059"][0].tran_ratio == pytest.approx(0.2)
+
+
+def test_batch_dividend_sends_comma_joined_codes(env_file):
+    """入参契约：`codes` 是**逗号分隔的字符串**，不是数组。"""
+    mcp = _mcp_with(env_file, {"data_dividend": _DIV_SINGLE})
+    mcp.batch_dividend(["sh603259", "sz300059"], years=8)
+
+    assert mcp.http.calls, "没有发请求"
+    sent = mcp.http.last_args()
+    assert sent["codes"] == "sh603259,sz300059"
+    assert sent["years"] == 8
+
+
+def test_batch_dividend_returns_empty_on_failure_instead_of_crashing(env_file):
+    """取数失败返回空 dict：周刷新不该把 jobs 主链路带崩。"""
+    mcp = WestockMcp(env_path=env_file, http=FakeHttp({}, status=401),
+                     clock=FixedClock(datetime(2026, 11, 15, 10, 0)))
+    assert mcp.batch_dividend(["sh600519"]) == {}
+
+
+def test_suspension_parses_real_payload_and_handles_undecided_resumption(env_file):
+    """`resumptionDate=19000101` 是"还没定"的哨兵值，不能原样落成 1900 年。
+
+    接口用它表示"至今未复牌"。原样落库的话 `resume_dates()`（按
+    `end_date == 上一交易日` 找复牌股）永远命中不了，但这条记录也永远清不掉。
+    这里换成查询区间的右端（今天），语义是"仍在停牌"。
+    """
+    mcp = _mcp_with(env_file, {"data_suspension": _SUSPENSION})
+    rows = mcp.suspension("2026-11-01", "2026-11-15")
+
+    assert (("sz000831", 20261102, 20261116) in rows), rows
+    stuck = [r for r in rows if r[0] == "sz000635"][0]
+    assert stuck[1] == 20261113
+    assert stuck[2] == 20261115, f"19000101 应换成区间右端，实际 {stuck[2]}"
+
+
+def test_suspension_uses_hs_market_argument(env_file):
+    """`data_suspension` 的 market 只认 hs/hk/us，与 `MARKETS`（A/HK/US）不是一套。"""
+    mcp = _mcp_with(env_file, {"data_suspension": _SUSPENSION})
+    mcp.suspension("2026-11-01", "2026-11-15")
+    assert mcp.http.last_args()["market"] == "hs"
+
+
+def test_refresh_hooks_are_wired_when_client_supports_it(env_file):
+    """客户端具备两个方法时，`make_refresh_hooks` 必须返回真的回调而不是 (None, None)。
+
+    这是这一整块的关键：原先 `WestockMcp` 没有这两个方法，回调恒为 None，
+    `corporate_actions` 只有快照反推、`suspension_calendar` 永远是空表，
+    而启动日志只会打一条 warning。
+    """
+    from jobs.main import make_refresh_hooks
+
+    mcp = _mcp_with(env_file, {"data_dividend": _DIV_SINGLE,
+                              "data_suspension": _SUSPENSION})
+    assert hasattr(mcp, "batch_dividend") and hasattr(mcp, "suspension")
+    actions, suspensions = make_refresh_hooks(mcp, cfg=None, conn=_Conn([]))
+    assert actions is not None, "有 batch_dividend 却仍返回 None：回调没接线"
+    assert suspensions is not None, "有 suspension 却仍返回 None：回调没接线"
+
+
+class _Conn:
+    """`make_refresh_hooks` 只用到 `conn.execute(...)` 取 code 列表。"""
+
+    def __init__(self, codes):
+        self._codes = codes
+
+    def execute(self, sql, params=()):
+        return _Rows(self._codes)
+
+
+class _Rows:
+    def __init__(self, rows):
+        self._rows = [(c,) for c in rows]
+
+    def __iter__(self):
+        return iter(self._rows)

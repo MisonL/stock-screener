@@ -44,7 +44,13 @@ MCP_TOOLS = {
     "remove_watch": "portfolio_watchlist_remove",
     "set_alert": "portfolio_tips_set",     # 全量覆盖语义，必须 read → merge → set
     "cancel_alert": "portfolio_tips_set",
+    # 除权/停牌：**不是 agent 工具，是 jobs 的周刷新数据源**
+    "dividend": "data_dividend",
+    "suspension": "data_suspension",
 }
+
+#: 停牌接口的 market 参数与 `MARKETS` 不是一回事：`data_suspension` 只认 hs/hk/us
+SUSPENSION_MARKET = "hs"
 
 
 class WestockMcp:
@@ -181,6 +187,84 @@ class WestockMcp:
                 if not (_is_sys(row) and _alert_code(row) == code and _alert_kind(row) == kind)]
         return self._rpc(MCP_TOOLS["cancel_alert"], {"tips": kept})
 
+    # ---- 除权 / 停牌（jobs 的周刷新用，不进 agent 工具集） -----------------
+
+    def batch_dividend(self, codes, years: int = 10, chunk: int = 50):
+        """多只票的分红送转，返回 `{code: [CorpAction, ...]}`。
+
+        **字段名是实测出来的**（`data_dividend` 的返回，见 `_action_of`）：
+        `cashDiviRMB` 是「每 10 股派息（元）」，不是每股；`bonusShareRatio` 是
+        每股送股比例、`tranAddShareRatio` 是每股转增比例——这两个已经是"每股"
+        口径，不用再除 10。`exDiviDate` 是 `YYYYMMDD` 字符串。
+
+        只保留 `procedure='方案实施'` 且 `exDiviDate` 合法的行：未实施的预案没有
+        除权日，拿来算复权会把因子算错。整个调用失败时返回空 dict（不抛），
+        让 `refresh_actions` 拿到"没有数据"而不是崩掉——周刷新失败不该影响主链路。
+        """
+        from core.datasource.westock import CorpAction
+
+        out: dict[str, list] = {}
+        codes = list(codes)
+        for i in range(0, len(codes), chunk):
+            part = codes[i:i + chunk]
+            resp = self._rpc(MCP_TOOLS["dividend"],
+                             {"codes": ",".join(part), "years": int(years)})
+            if not resp.get("ok"):
+                return {}                    # 一次失败就整体放弃，避免半天数据进库
+            data = resp.get("data")
+            # **两种返回结构都出现过**（实测）：
+            #   单只票 → `{code, end, plans:[…]}`
+            #   多只票 → `{sh600036: {code, end, plans:[…]}, sz002415: {…}}`
+            # 判据是"顶层有没有 plans"：有就是单只，没有就按 code 键遍历。
+            if isinstance(data, dict) and "plans" in data:
+                blocks = [data]
+            elif isinstance(data, dict):
+                blocks = list(data.values())
+            elif isinstance(data, list):
+                blocks = data
+            else:
+                blocks = []
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                code = _normalize_code(block.get("code"))
+                if not code:
+                    continue
+                for plan in block.get("plans") or []:
+                    action = _action_of(code, plan)
+                    if action is not None:
+                        out.setdefault(code, []).append(action)
+        return out
+
+    def suspension(self, start: str, end: str, market: str = SUSPENSION_MARKET):
+        """停牌列表，返回 `[(code, start_date, end_date), ...]`。
+
+        `end_date` 用接口给的 `resumptionDate`（复牌日）；**未定复牌日的返回
+        `19000101` 这个哨兵值**，这里换成 `end`（今天）——把它当"还在停牌"，
+        比记成一个 1900 年的日期安全得多：`resume_dates()` 按 `end_date == 上一
+        交易日` 找复牌股，1900 年的记录永远不会误命中，但也永远清不掉。
+        接口只按当前快照给"正在停牌"的票，没有区间查询参数，`start`/`end` 仅用于
+        把哨兵值夹到今天。
+        """
+        resp = self._rpc(MCP_TOOLS["suspension"], {"market": market})
+        if not resp.get("ok"):
+            return []
+        data = resp.get("data")
+        rows = data.get("stocks") if isinstance(data, dict) else None
+        out = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            code = _normalize_code(row.get("code"))
+            begin = _ymd(row.get("suspendDate"))
+            if not code or begin is None:
+                continue
+            finish = _ymd(row.get("resumptionDate"))
+            if finish is None or finish <= begin:
+                finish = _ymd(end) or begin      # 19000101 / 未定 → 当作"仍在停牌"
+            out.append((code, begin, finish))
+        return out
+
 
 # ---------------------------------------------------------------- 单向导入
 
@@ -216,6 +300,71 @@ def import_watchlist(conn, mcp) -> int:
 
 
 # ---------------------------------------------------------------- 小工具
+
+
+def _normalize_code(raw) -> str | None:
+    """把 `sh600519` / `600519.SH` 统一成 `sh600519`；认不出就返回 None。"""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    text = raw.strip().lower()
+    if len(text) >= 8 and text[6] == ".":
+        num, suffix = text[:6], text[7:9]
+        if suffix in ("sh", "sz", "bj"):
+            return f"{suffix}{num}"
+    if len(text) == 8 and text[:2] in ("sh", "sz", "bj"):
+        return text
+    return None
+
+
+def _ymd(raw) -> int | None:
+    """`"20260626"` / `20260626` / 带横线的日期 → `20260626`；非法返回 None。"""
+    if raw is None:
+        return None
+    text = str(raw).strip().replace("-", "")
+    if len(text) != 8 or not text.isdigit():
+        return None
+    if text.startswith("1900"):             # 接口用 19000101 表示"未定/无"
+        return None
+    return int(text)
+
+
+def _num(raw) -> float:
+    """空串 / None / 非数字一律 0.0——接口用空串表示"本次没有这一项"。"""
+    try:
+        return float(str(raw).strip() or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _action_of(code: str, plan) -> "object | None":
+    """一条 `plans[]` → `CorpAction`；未实施或无除权日返回 None。
+
+    单位口径（**实测确认，别照直觉改**）：三个字段都是「每 **10 股**」的刻度，
+    所以要除以 10 才得到每股口径。证据是同一行的 `dividendPlan` 文本：
+
+        cashDiviRMB='10.03'   dividendPlan='10派10.030元'
+        tranAddShareRatio='4.00'  dividendPlan='10派5.800元转4.000股'
+
+    即 `cashDiviRMB` 就是「10 派 X 元」里的 X，`tranAddShareRatio` 就是
+    「转 N 股」里的 N。不除 10 会让每股现金虚高 10 倍、复权因子整个算错。
+    """
+    from core.datasource.westock import CorpAction
+
+    if not isinstance(plan, dict):
+        return None
+    if str(plan.get("procedure") or "").strip() != "方案实施":
+        return None
+    ex = _ymd(plan.get("exDiviDate"))
+    if ex is None:
+        return None
+    return CorpAction(
+        code=code,
+        ex_date=ex,
+        cash_per_share=_num(plan.get("cashDiviRMB")) / 10.0,
+        bonus_ratio=_num(plan.get("bonusShareRatio")) / 10.0,
+        tran_ratio=_num(plan.get("tranAddShareRatio")) / 10.0,
+        source="westock_dividend",
+    )
 
 
 def _payload(resp) -> dict | None:

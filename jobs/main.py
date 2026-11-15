@@ -4,8 +4,9 @@
 换成 `BackgroundScheduler` 后主线程一 `return` 进程就退出，16:00 清理、15:05 eod、
 23:30 备份全都永远跑不到，而容器看起来是「正常运行」。
 
-**除权刷新目前只有启动补跑、没有周期任务**（见 `make_refresh_hooks`）：能力缺失时
-回调为 `None`，`startup_recovery` 的「距上次 ≥7 天就补跑」分支会直接跳过。
+**除权/停牌刷新只有启动补跑、没有周期任务**（见 `make_refresh_hooks`）：客户端
+具备取数能力时，`startup_recovery` 按「距上次 ≥7 天就补跑」触发。
+能力缺失（如 CLI 客户端没有这两个方法）时回调为 `None`，该分支直接跳过并打 warning。
 
 **PID 1 必须自己装 SIGTERM**：容器里 `python -m jobs.main` 是 1 号进程，没装 handler
 时 SIGTERM 不执行默认终止，`docker stop` 会等满 10 秒再 SIGKILL，正在写的事务被硬杀。
@@ -682,8 +683,9 @@ def make_refresh_hooks(mcp, cfg, conn):
     `westock.suspension()` 在 `mcp/westock.py::WestockMcp` 上**并不存在**
     （测试用的是 `FakeWestockCli`，那个 CLI 客户端没实现）。
 
-    所以这里**不假装接上了**：能力缺失时返回 `(None, None)` 并打一条 warning，
-    让缺口每次启动都可见；补齐真实取数（CLI 或 MCP 工具）是后续任务。
+    现在 `WestockMcp` 已实现 `batch_dividend()` / `suspension()`（真实数据源是
+    MCP 的 `data_dividend` / `data_suspension`），所以正常路径会返回真回调。
+    能力缺失时仍然返回 `(None, None)` 并打 warning——**不假装接上了**。
     """
     missing = [m for m in ("batch_dividend", "suspension") if not hasattr(mcp, m)]
     if missing:

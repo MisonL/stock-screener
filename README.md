@@ -149,11 +149,11 @@ docker compose -f deploy/docker-compose.yml --project-directory . up -d api jobs
 凭据放在 `~/.config/stock-screener/state/westock.env`（见 RUNBOOK §1）。没有账号时
 自选股为空，其余功能不受影响。
 
-> **除权除息与停牌日历当前不可用**（不只是"没配账号"）：`WestockMcp` 客户端
-> 尚未实现 `batch_dividend()` / `suspension()` 两个方法，因此启动时对应的刷新回调
-> 为 `None` 并会打印一条 WARNING。结果是 `corporate_actions` 只会有快照反推的
-> `snapshot_implied` 行，`suspension_calendar` 保持空表。补齐真实取数前，
-> 请不要依赖这两张表做判断。
+> **除权除息与停牌日历需要 westock 账号**：两者来自 MCP 的 `data_dividend` /
+> `data_suspension`，没有账号时对应刷新回调为 `None`，启动时会打印一条 WARNING，
+> 此时 `corporate_actions` 只会有快照反推的 `snapshot_implied` 行、
+> `suspension_calendar` 保持空表——**这两张表此时不要用来做判断**。
+> 有账号时刷新在启动补跑（距上次 ≥7 天触发），不是周期任务。
 
 ### 其他已知限制
 

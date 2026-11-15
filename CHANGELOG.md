@@ -33,6 +33,26 @@
 
 ## [Unreleased]
 
+### 新增
+
+- **除权除息与停牌取数真正可用**：`WestockMcp` 补上 `batch_dividend()` /
+  `suspension()`，数据来自 MCP 的 `data_dividend` / `data_suspension`。
+  至此启动日志里最后一条 WARNING（「除权/停牌周刷新未接线」）消失，
+  `corporate_actions` 不再只有快照反推的 `snapshot_implied` 行。
+
+  实现细节全部来自**实测抓包**，不是照文档猜的：
+  - `cashDiviRMB` / `bonusShareRatio` / `tranAddShareRatio` 是「每 **10 股**」刻度，
+    落库要除以 10。证据是同一行的 `dividendPlan` 文本：`cashDiviRMB='5.80'`
+    对应 `10派5.800元转4.000股`、`tranAddShareRatio='4.00'` 对应「转 4.000 股」。
+    不除 10 会让每股现金虚高十倍、复权因子整个算错。
+  - 多只票的返回是**以 code 为键的字典**，单只票是 `{code, plans}`——
+    两种结构都出现过，只按一种解析会让多只票一条都取不到（而且看起来像
+    "这段时间没有分红"，最难发现）。
+  - 只保留 `procedure='方案实施'` 的行：预案里也会填除权日，只按"有没有除权日"
+    过滤漏得掉，会让还没实施的方案提前影响复权因子。
+  - 停牌接口用 `resumptionDate=19000101` 表示"还没定复牌日"，落库换成查询区间
+    右端；原样存 1900 年的话记录永远清不掉、也永远命中不了复牌判定。
+
 ### 文档
 
 - **清掉 docstring 首行的 `Task N：` 出处前缀**（53 个文件）。这些编号指向未随仓库

@@ -33,6 +33,8 @@
 
 ## [Unreleased]
 
+## [0.2.33] - 2026-11-15
+
 ### 新增
 
 - **除权除息与停牌取数真正可用**：`WestockMcp` 补上 `batch_dividend()` /

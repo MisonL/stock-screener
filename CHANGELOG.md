@@ -33,6 +33,19 @@
 
 ## [Unreleased]
 
+### 新增
+
+- **GitHub Actions CI**（`.github/workflows/ci.yml`），四个 job：
+  - `backend`：用 `deploy/Dockerfile` 的 dev 阶段构建后跑全量 pytest——
+    与本地 `make test`、与生产镜像是**同一份定义**，不会出现「CI 绿、线上红」。
+  - `version`：`tests/test_version.py`，纯文本检查不依赖镜像。
+  - `frontend`：`npm ci` + `tsc --noEmit` + `vitest` + `build`。
+  - `secrets`：扫工作区与**全部历史**，规则在 `scripts/scan_secrets.py`。
+- `scripts/scan_secrets.py`：按类型判定的敏感信息扫描器（私网地址用 `ipaddress`
+  解析、令牌按各家前缀精确匹配）。**没有写成一条大正则**——版本号 `10.4.3`
+  和私网地址在文本上长得一样，靠正则加边界既会误报也会漏报；误报几次之后
+  这条门禁就没人看了。配套 `tests/test_scan_secrets.py` 正反两面都钉住。
+
 ## [0.2.31] - 2026-11-14
 
 ### 修复

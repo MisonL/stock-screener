@@ -1,0 +1,93 @@
+name: CI
+
+# 公开仓库的常规门禁：改完代码推上来，这里跑一遍和后端 `make test` 等价的检查。
+#
+# **构建走 deploy/Dockerfile 的 dev 阶段**，不在 runner 上装 Python 依赖：
+# 生产镜像与 dev 镜像是同一套 3.12 + TA-Lib + Node，CI 用同一份定义才不会出现
+# 「CI 绿、线上红」。TA-Lib 在 manylinux 有预编译 wheel，Docker 构建不需要编译 C 库。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # 同一分支的新推送取消上一次，省 runner 时间
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: 后端测试
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 构建 dev 镜像
+        run: docker build --target dev -t ss-dev -f deploy/Dockerfile .
+
+      - name: pytest
+        # 挂载方式与 Makefile 的 `make test` 一致；runner 上 $PWD 就是仓库根
+        run: docker run --rm -v "$PWD":/app -w /app ss-dev pytest -q
+
+  version:
+    name: 版本门禁
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 版本门禁要读 tag，浅克隆拿不到
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install pytest pyyaml
+
+      # 纯文本检查，不必先构建镜像（见 Makefile 里 check-version 的注释）：
+      # 它要在「改完版本、跑全量测试之前」尽快给出反馈，所以只跑这一个文件。
+      - run: python -m pytest -q tests/test_version.py
+
+  frontend:
+    name: 前端测试
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # 注意：**不要设 NODE_ENV=production**，那样 npm 会跳过 devDependencies，
+      # vitest 根本装不上（本地踩过这个坑）。
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npx vitest run --reporter=dot
+      - run: npm run build
+
+  secrets:
+    name: 敏感信息扫描
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 规则在 scripts/scan_secrets.py 里，有对应单测（tests/test_scan_secrets.py）。
+      # **不要在 YAML 里写一条大正则**：版本号和私网地址在文本上长得一样，
+      # 误报会把这条门禁变成噪音，最后没人看。脚本用 ipaddress 模块解析，
+      # 天生不会把版本号当 IP。
+      - name: 扫描工作区
+        run: |
+          git ls-files -z | xargs -0 cat 2>/dev/null | python3 scripts/scan_secrets.py
+
+      - name: 扫描全部历史
+        run: |
+          git log --all -p | python3 scripts/scan_secrets.py

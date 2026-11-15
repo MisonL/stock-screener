@@ -668,3 +668,26 @@ def test_batch_dividend_returns_none_only_when_every_chunk_failed(env_file):
     mcp = WestockMcp(env_path=env_file, http=FakeHttp({}, status=401),
                      clock=FixedClock(datetime(2026, 11, 15, 10, 0)))
     assert mcp.batch_dividend(["sh600036", "sz000002"], chunk=1) is None
+
+
+def test_batch_dividend_backs_off_after_a_rate_limit(env_file):
+    """撞到限频后要退避，不能紧接着把剩下的批次全硬发出去。
+
+    连续 100 多个请求本来就贴着上游限频线。实测不序退避时，第 112 个批次后的
+    停牌请求直接返回 `isError: 高级选股异常 msg=服务限频`。
+    """
+    delays: list[float] = []
+
+    class AlwaysFail(FakeHttp):
+        def post(self, url, json=None, headers=None, timeout=None, **kw):
+            self.calls.append({"url": url, "json": json or {}, "headers": dict(headers or {})})
+            return Resp(200, {"jsonrpc": "2.0", "id": 1, "result": {
+                "content": [{"type": "text", "text": "msg=服务限频"}], "isError": True}})
+
+    mcp = WestockMcp(env_path=env_file, http=AlwaysFail({}), sleep=delays.append,
+                     clock=FixedClock(datetime(2026, 11, 15, 10, 0)))
+    mcp.batch_dividend(["sh600036", "sz000002", "sh600000"], chunk=1, backoff_s=2.0)
+
+    assert delays, "撞到限频却完全没有退避"
+    assert delays[0] >= 2.0, f"退避太短：{delays[0]}"
+    assert len(delays) <= 3, f"退避次数应封顶（实际 {len(delays)} 次）"

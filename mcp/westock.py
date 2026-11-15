@@ -60,8 +60,11 @@ SUSPENSION_MARKET = "hs"
 class WestockMcp:
     """6 个工具的封装；`http` 只要有 `.post(url, json=…, headers=…, timeout=…)` 即可。"""
 
-    def __init__(self, env_path=ENV_PATH, http=None, clock=None, limiter=None):
+    def __init__(self, env_path=ENV_PATH, http=None, clock=None, limiter=None,
+                 sleep=None):
         self.env_path = Path(env_path)
+        #: 退避用的 sleep，测试注入成空函数即可不真的等
+        self.sleep = sleep
         self._http = http
         self.clock = clock
         self.limiter = limiter or RateLimiter(MIN_INTERVAL_S)
@@ -193,7 +196,8 @@ class WestockMcp:
 
     # ---- 除权 / 停牌（jobs 的周刷新用，不进 agent 工具集） -----------------
 
-    def batch_dividend(self, codes, years: int = 10, chunk: int = 50):
+    def batch_dividend(self, codes, years: int = 10, chunk: int = 50,
+                       backoff_s: float = 2.0):
         """多只票的分红送转，返回 `{code: [CorpAction, ...]}`。
 
         **字段名是实测出来的**（`data_dividend` 的返回，见 `_action_of`）：
@@ -224,6 +228,10 @@ class WestockMcp:
                 # 而且因为不盖时间戳会每次启动都重来一遍、继续撞限频。
                 # 记一笔继续下一个 chunk，最后按"有没有拿到东西"返回。
                 failed_chunks += 1
+                if self.sleep and failed_chunks <= 3:
+                    # 撞到限频就退避一下再继续：连续 100 多个请求本来就贴着上游
+                    # 的限频线，硬顶着发只会一直撞。
+                    self.sleep(backoff_s * failed_chunks)
                 continue
             data = _unwrap(resp.get("data"))
             # **两种返回结构都出现过**（实测）：

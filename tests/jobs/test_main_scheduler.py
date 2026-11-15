@@ -171,13 +171,15 @@ def test_startup_refresh_actions_catchup(env):
     out = startup_recovery(env.cfg, env.conn, env.clock, reg=None,
                            refresh_actions=lambda: calls.append("actions") or 1,
                            refresh_suspensions=lambda: calls.append("susp") or 1)
-    assert out["refresh_actions"] and calls == ["actions", "susp"]
+    # **顺序是 susp 在前**：停牌 1 个请求、分红 100 多个，先做停牌才不会
+    # 等分红打完再撞上游限频（见 jobs/main.py 里的注释）
+    assert out["refresh_actions"] and calls == ["susp", "actions"]
     assert env.conn.execute(
         "SELECT value FROM job_state WHERE name='refresh_actions.last'").fetchone()[0] == "20261030"
 
     out2 = startup_recovery(env.cfg, env.conn, env.clock, reg=None,
                             refresh_actions=lambda: calls.append("again") or 1)
-    assert out2["refresh_actions"] is False and calls == ["actions", "susp"]      # 7 天内不重复
+    assert out2["refresh_actions"] is False and calls == ["susp", "actions"]      # 7 天内不重复
 
 
 def test_startup_after_seven_days_refreshes_again(env):

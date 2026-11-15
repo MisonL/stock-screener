@@ -527,8 +527,12 @@ def startup_recovery(cfg, conn, clock, *, reg, tick=None, dispatcher=None, loops
             # 两者必须分开：停牌返回 0 行是正常的（今天没人停牌），
             # 而"取数失败"如果被当成成功，就会按「距上次 ≥7 天」把重试推到下周
             # ——0.2.33 上线时正是这样，`corporate_actions` 官方行一直是 0。
-            wrote = refresh_actions()
+            # **先停牌后分红**：停牌只要 1 个请求，分红要 100 多个。
+            # 反过来的话，等分红那一百多个请求打完，停牌请求正好撞上上游
+            # 「服务限频」返回 isError，于是整次刷新被判失败、时间戳不盖、
+            # 下次启动从头再来一遍——实测就是这么卡住的。
             susp = refresh_suspensions() if refresh_suspensions is not None else None
+            wrote = refresh_actions()
             failed = (wrote is None) or (refresh_suspensions is not None and susp is None)
             # **一条都没写就不要盖时间戳**：盖了会按「距上次 ≥7 天」把重试推到下周，
             # 而失败（取数空、账号没配、上游改结构）通常不会抛异常——0.2.33 上线时

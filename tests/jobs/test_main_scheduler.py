@@ -1178,3 +1178,53 @@ def test_bind_mounted_session_file_being_a_directory_is_reported(tmp_path, caplo
             notify=SimpleNamespace(public_host="stock.example.com")))
     assert any("是**目录**而不是文件" in r.message for r in caplog.records), \
         f"没有报出目录陷阱：{[r.message for r in caplog.records]}"
+
+
+def test_refresh_does_not_stamp_when_it_wrote_nothing(tmp_path):
+    """取到 0 条时**不许盖 `refresh_actions.last`**。
+
+    盖了会按「距上次 ≥7 天」把重试推到下周，而这类失败通常不抛异常：
+    0.2.33 上线时正是如此——写入 0 行、时间戳照样落下，`corporate_actions`
+    的官方行一直是 0，而整条链路不报错。不盖的话每次启动都会重试。
+    """
+    from core.db import connect, migrate
+
+    conn = connect(tmp_path / "t.db")
+    migrate(conn)
+
+    called = {"actions": 0, "susp": 0}
+
+    def actions():
+        called["actions"] += 1
+        return 0
+
+    def susp():
+        called["susp"] += 1
+        return 0
+
+    out = jobs_main.startup_recovery(
+        cfg=SimpleNamespace(), conn=conn, clock=FixedClock(datetime(2026, 11, 15, 20, 0)),
+        reg=None, tick=None, dispatcher=None, loops=None,
+        refresh_actions=actions, refresh_suspensions=susp)
+
+    assert called["actions"] == 1, "没有调用刷新"
+    assert out["refresh_actions"] is False, "0 条却把 refresh_actions 标成已完成"
+    row = conn.execute("SELECT value FROM job_state WHERE name='refresh_actions.last'").fetchone()
+    assert row is None, f"0 条却盖了时间戳：{row}"
+
+
+def test_refresh_stamps_after_writing_rows(tmp_path):
+    """写进去一行就必须盖时间戳，否则每次启动都全量重拉。"""
+    from core.db import connect, migrate
+
+    conn = connect(tmp_path / "t.db")
+    migrate(conn)
+
+    out = jobs_main.startup_recovery(
+        cfg=SimpleNamespace(), conn=conn, clock=FixedClock(datetime(2026, 11, 15, 20, 0)),
+        reg=None, tick=None, dispatcher=None, loops=None,
+        refresh_actions=lambda: 5, refresh_suspensions=lambda: 2)
+
+    assert out["refresh_actions"] is True
+    row = conn.execute("SELECT value FROM job_state WHERE name='refresh_actions.last'").fetchone()
+    assert row and row[0] == "20261115"

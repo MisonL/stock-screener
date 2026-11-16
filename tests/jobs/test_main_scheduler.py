@@ -1347,3 +1347,42 @@ def test_actions_refresh_avoids_market_hours(env):
                 f"{job_id} 在盘中触发：{local}"
             prev = nxt + timedelta(seconds=1)
         assert len(seen) >= 30, f"{job_id} 只取到 {len(seen)} 个触发时刻，覆盖不足"
+
+
+def test_suspension_failure_does_not_block_stamping(tmp_path):
+    """**停牌失败不该连坐除权**。
+
+    停牌只有 1 个请求，撞上限频的概率不低；若因此判定整次失败、不盖时间戳，
+    分红已经写进库的数据每次启动都要重拉一遍，反而持续烧配额、持续撞限频。
+    所以只按除权是否失败决定盖不盖戳，停牌单独记 WARNING。
+    """
+    from core.db import connect, migrate
+
+    conn = connect(tmp_path / "t.db")
+    migrate(conn)
+
+    out = jobs_main.startup_recovery(
+        cfg=SimpleNamespace(), conn=conn, clock=FixedClock(datetime(2026, 11, 15, 20, 0)),
+        reg=None, tick=None, dispatcher=None, loops=None,
+        refresh_actions=lambda: 25, refresh_suspensions=lambda: None)
+
+    assert out["refresh_actions"] is True, "除权成功却被停牌失败拖着不盖戳"
+    row = conn.execute("SELECT value FROM job_state WHERE name='refresh_actions.last'").fetchone()
+    assert row and row[0] == "20261115"
+
+
+def test_actions_failure_still_blocks_stamping(tmp_path):
+    """除权失败（返回 None）仍然不盖戳——这条不能因为上面的改动被放松。"""
+    from core.db import connect, migrate
+
+    conn = connect(tmp_path / "t.db")
+    migrate(conn)
+
+    out = jobs_main.startup_recovery(
+        cfg=SimpleNamespace(), conn=conn, clock=FixedClock(datetime(2026, 11, 15, 20, 0)),
+        reg=None, tick=None, dispatcher=None, loops=None,
+        refresh_actions=lambda: None, refresh_suspensions=lambda: 3)
+
+    assert out["refresh_actions"] is False
+    assert conn.execute(
+        "SELECT value FROM job_state WHERE name='refresh_actions.last'").fetchone() is None

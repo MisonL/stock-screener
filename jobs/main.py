@@ -595,13 +595,16 @@ def startup_recovery(cfg, conn, clock, *, reg, tick=None, dispatcher=None, loops
             # 反过来的话，等分红那一百多个请求打完，停牌请求正好撞上上游
             # 「服务限频」返回 isError，于是整次刷新被判失败、时间戳不盖、
             # 下次启动从头再来一遍——实测就是这么卡住的。
-            # 两个回调**能接锁就传锁**：`make_refresh_hooks` 的回调签名是
-            # `f(lock=None)`，传进去才会在写库那一步持锁（取数仍在锁外）。
-            # 零参回调（老测试桩）按原样调用，不做兼容包装。
+            # **停牌失败不连坐除权**：停牌只有 1 个请求，撞上个限频很容易；
+            # 若因此判定整次刷新失败、不盖时间戳，分红那边已经写进去的数据
+            # 每次启动都要重拉一遍，反而持续消耗配额、持续撞限频。
+            # 所以：除权失败才不盖戳；停牌单独记失败，下次启动再试。
             susp = (_call_with_lock(refresh_suspensions, write_lock)
                     if refresh_suspensions is not None else None)
             wrote = _call_with_lock(refresh_actions, write_lock)
-            failed = (wrote is None) or (refresh_suspensions is not None and susp is None)
+            failed = wrote is None
+            if refresh_suspensions is not None and susp is None:
+                log.warning("停牌刷新取数失败（不连坐除权；除权本次写入 %s 行）", wrote)
             # **一条都没写就不要盖时间戳**：盖了会按「距上次 ≥7 天」把重试推到下周，
             # 而失败（取数空、账号没配、上游改结构）通常不会抛异常——0.2.33 上线时
             # 就是这样：写入 0 行、时间戳照样落下，之后一周都不会再试一次。

@@ -299,8 +299,10 @@ def refresh_actions(cfg, westock, conn, codes, max_requests: int | None = None) 
     return store_actions(conn, actions)
 
 
-#: 每轮最多发几个请求。上游实测连发 8–10 个就限频，取 6 留余量。
-ACTIONS_MAX_REQUESTS = 6
+#: 每轮最多发几个请求。上游实测连发 8–10 个就限频；停牌那 1 个请求也要占额度，
+#: 所以分红只发 4 个（4 + 1 = 5，留足余量）。原来取 6，启动时有 1/6 概率把停牌
+#: 挤成限频失败，而一次失败要等下周才重试。
+ACTIONS_MAX_REQUESTS = 4
 
 
 def actions_cursor(conn, codes) -> list:

@@ -288,7 +288,7 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
         # **每轮留一行文件痕迹**：容器 stdout 在部分宿主机上不落 docker logs
         # （实测连 `logger.info` 都进不去），只靠日志排障会瞎。
         # 文件小、每轮一行、自动截断，排查"这次到底跑没跑"时直接 cat。
-        _trace("actions_refresh 开始")
+        _trace(f"actions_refresh 开始 (mcp={type(mcp).__name__ if mcp is not None else 'None'})")
         refine_actions, refine_susp = make_refresh_hooks(mcp, cfg, conn)
         if refine_actions is None:
             _trace("actions_refresh 跳过：westock 客户端不具备取数能力")

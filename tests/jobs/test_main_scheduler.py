@@ -1386,3 +1386,21 @@ def test_actions_failure_still_blocks_stamping(tmp_path):
     assert out["refresh_actions"] is False
     assert conn.execute(
         "SELECT value FROM job_state WHERE name='refresh_actions.last'").fetchone() is None
+
+
+def test_heartbeat_thread_starts_before_startup_recovery():
+    """心跳线程必须在 `startup_recovery` **之前**起。
+
+    容器 healthcheck 判的是「`/tmp/jobs_healthy` 2 分钟内被 touch 过」，而
+    `start_period` 只有 300 秒。启动恢复要拉几分钟除权数据，若心跳在它之后才起，
+    容器会在恢复期间被判 unhealthy——线上实测 `Up 13 minutes (unhealthy)`、
+    `FailingStreak=9`。
+    """
+    import inspect
+
+    from jobs import main as jobs_main
+
+    src = inspect.getsource(jobs_main.main)
+    touch_at = src.index("_touch_loop")
+    recovery_at = src.index("startup_recovery(")
+    assert touch_at < recovery_at, "心跳线程被放在启动恢复之后：恢复期间容器会判 unhealthy"

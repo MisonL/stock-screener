@@ -722,6 +722,12 @@ def main() -> int:                                  # pragma: no cover - 进程�
     # 快照线程随即开始写共享连接，所以补跑 EOD / 写 marker 都在 `loops.lock` 内）。
     # 早先这里写过「调度器没起来就没有并发写者」，那是错的——漏了 `loops.start()`
     # 拉起的快照线程（Codex 用 LockSpy 观测到 lock_enters=0 且线程已启动）。
+    # **心跳线程必须在启动恢复之前起**：`startup_recovery` 可能要拉几分钟的
+    # 除权数据（滚动刷新），而容器 healthcheck 判的是「/tmp/jobs_healthy 2 分钟内
+    # 被 touch 过」、`start_period` 只有 300 秒。放在恢复之后会导致容器在恢复
+    # 期间被判 unhealthy（实测 Up 13 分钟 unhealthy，FailingStreak=9）。
+    threading.Thread(target=_touch_loop, args=(state,), daemon=True).start()
+
     refine_actions, refine_susp = make_refresh_hooks(_westock, cfg, conn)
     startup_recovery(cfg, conn, clock, reg=reg, tick=tick, dispatcher=dispatcher, loops=loops,
                      refresh_actions=refine_actions, refresh_suspensions=refine_susp)
@@ -736,7 +742,6 @@ def main() -> int:                                  # pragma: no cover - 进程�
     signal.signal(signal.SIGTERM, _graceful)
     signal.signal(signal.SIGINT, _graceful)
 
-    threading.Thread(target=_touch_loop, args=(state,), daemon=True).start()
     sched.start()                                   # 阻塞主线程直到进程被杀
     return 0
 

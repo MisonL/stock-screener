@@ -33,6 +33,15 @@
 
 ## [Unreleased]
 
+### 修复
+
+- **启动恢复期间容器被判 unhealthy**。心跳线程（`_touch_loop`）原来在
+  `sched.start()` 之后才起，而 `startup_recovery` 就在它前面——滚动刷新要拉
+  几分钟除权数据，`/tmp/jobs_healthy` 一直不刷新，而 compose 的
+  `start_period` 只有 300 秒、healthcheck 判的是「2 分钟内 touch 过」。
+  线上实测 `Up 13 minutes (unhealthy)`、`FailingStreak=9`。
+  现在心跳线程在启动恢复**之前**起，并加测试钉住这个顺序。
+
 ## [0.2.45] - 2026-11-16
 
 ### 修复

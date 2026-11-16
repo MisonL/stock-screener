@@ -616,7 +616,11 @@ def startup_recovery(cfg, conn, clock, *, reg, tick=None, dispatcher=None, loops
         from jobs.eod import run_eod as _run_eod
 
         runner = _run_eod
-    with write_lock:
+    # **EOD 补跑必须锁外执行**：`run_eod` 内部会取全市场快照、还可能回填缺口，
+    # 一个交易日就要十几秒到几十秒；放进写锁里会把这些时间里的 tick 全堵死。
+    # 连接是 `check_same_thread=False` + WAL，`run_eod` 自己的写入自带 `with conn`，
+    # 不需要这把锁保护（需要串行的是 tick 与快照线程之间的写，那是另一个场景）。
+    if True:
         for day in out["eod_days"]:
             try:
                 # 用钉在该日的时钟：run_eod 只认 clock.today()，快照日期闸保证不会写错日
@@ -631,7 +635,8 @@ def startup_recovery(cfg, conn, clock, *, reg, tick=None, dispatcher=None, loops
                 # 不写 marker 是对的（那天确实没跑成），但没必要把后面几天也试一遍。
                 out["eod_skipped"].append(day)
                 break
-            with conn:
+            # marker 是写共享连接，仍然要串行
+            with write_lock, conn:
                 conn.execute("INSERT OR REPLACE INTO job_state(name, value) VALUES (?, 'done')",
                              (f"eod.{day}",))
             out["eod_ran"].append(day)

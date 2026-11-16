@@ -1577,3 +1577,49 @@ def test_startup_recovery_does_not_deadlock_on_the_real_non_reentrant_lock(env):
         "启动恢复 10 秒未返回：外层持锁 + 回调再取同一把不可重入锁 = 死锁")
     assert fired == ["susp", "actions"], f"回调未按序执行：{fired}"
     assert done and done[0]["refresh_actions"] is True
+
+
+def test_eod_catchup_does_not_run_inside_the_write_lock():
+    """启动恢复的 EOD 补跑**不能在写锁里联网**。
+
+    `run_eod` 会取全市场快照、还可能回填缺口，一个交易日十几秒到几十秒；
+    放进写锁里会把这段时间的 tick 全部堵死（每秒一次的盘中循环直接停摆）。
+    """
+    import threading as _threading
+
+    from core.db import connect, migrate
+
+    import tempfile
+    from pathlib import Path as _Path
+
+    tmp = _Path(tempfile.mkdtemp())
+    conn = connect(tmp / "e.db")
+    migrate(conn)
+
+    import sqlite3
+
+    from tests.helpers import _trading_days_rev
+    with conn:
+        for d in _trading_days_rev(20261029, 40):
+            conn.execute(
+                "INSERT INTO daily_bars(code, date, open, high, low, close, volume,"
+                " amount, source) VALUES ('sh000300',?,3000,3000,3000,3000,0,0,'backfill')",
+                (d,))
+
+    held: list[bool] = []
+    lock = _threading.Lock()
+
+    def spy_runner(cfg, reg, conn_, clock):
+        # 用 is_locked 判断：EOD runner 被调用时这把锁不该被持有
+        held.append(lock.locked())
+        return SimpleNamespace(skipped=True)
+
+    jobs_main.startup_recovery(
+        SimpleNamespace(markets=SimpleNamespace(session=SimpleNamespace(close_time="15:00"))),
+        conn, FixedClock(datetime(2026, 11, 15, 20, 0)),
+        reg=None, tick=None, dispatcher=None,
+        loops=SimpleNamespace(lock=lock, start=lambda: None),
+        run_eod=spy_runner)
+
+    assert held, "EOD runner 没被调用（测试前提不成立）"
+    assert not any(held), "EOD 补跑是在写锁内执行的：联网期间 tick 全被堵死"

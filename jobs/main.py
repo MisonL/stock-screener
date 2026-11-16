@@ -4,9 +4,10 @@
 换成 `BackgroundScheduler` 后主线程一 `return` 进程就退出，16:00 清理、15:05 eod、
 23:30 备份全都永远跑不到，而容器看起来是「正常运行」。
 
-**除权/停牌刷新只有启动补跑、没有周期任务**（见 `make_refresh_hooks`）：客户端
-具备取数能力时，`startup_recovery` 按「距上次 ≥7 天就补跑」触发。
-能力缺失（如 CLI 客户端没有这两个方法）时回调为 `None`，该分支直接跳过并打 warning。
+**除权/停牌刷新既有启动补跑、也有周期任务**：`startup_recovery` 按「距上次
+≥7 天」补跑一次；`actions_refresh*` 几个 cron 在非交易时段每 20 分钟滚动推进
+一小段（上游限频决定了一次拉不完全市场，见 `mcp/westock.py::batch_dividend`）。
+能力缺失（客户端没有这两个方法）时回调为 `None`，两处都直接跳过并打 warning。
 
 **PID 1 必须自己装 SIGTERM**：容器里 `python -m jobs.main` 是 1 号进程，没装 handler
 时 SIGTERM 不执行默认终止，`docker stop` 会等满 10 秒再 SIGKILL，正在写的事务被硬杀。
@@ -14,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import logging
 import signal
 import sqlite3
@@ -477,6 +479,19 @@ def _llm_probe(cfg) -> bool:                       # pragma: no cover - 网络�
     return resp.status_code < 400
 
 
+def _call_with_lock(fn, lock):
+    """回调声明了参数就传 `lock`，否则原样调用。
+
+    除权/停牌回调需要一把共享锁才能安全写库；但零参回调（早期测试桩）也不该因此
+    报错。用 `inspect` 判一次，不做 try/except TypeError 那种会吞掉内部错误的写法。
+    """
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return fn()
+    return fn(lock) if params else fn()
+
+
 def startup_recovery(cfg, conn, clock, *, reg, tick=None, dispatcher=None, loops=None,
                      refresh_actions=None, refresh_suspensions=None, run_eod=None) -> dict:
     """D10 启动恢复：盘中立即起循环；跨日补跑 eod；除权刷新按「距上次 ≥7 天」补。"""
@@ -580,8 +595,12 @@ def startup_recovery(cfg, conn, clock, *, reg, tick=None, dispatcher=None, loops
             # 反过来的话，等分红那一百多个请求打完，停牌请求正好撞上上游
             # 「服务限频」返回 isError，于是整次刷新被判失败、时间戳不盖、
             # 下次启动从头再来一遍——实测就是这么卡住的。
-            susp = refresh_suspensions() if refresh_suspensions is not None else None
-            wrote = refresh_actions()
+            # 两个回调**能接锁就传锁**：`make_refresh_hooks` 的回调签名是
+            # `f(lock=None)`，传进去才会在写库那一步持锁（取数仍在锁外）。
+            # 零参回调（老测试桩）按原样调用，不做兼容包装。
+            susp = (_call_with_lock(refresh_suspensions, write_lock)
+                    if refresh_suspensions is not None else None)
+            wrote = _call_with_lock(refresh_actions, write_lock)
             failed = (wrote is None) or (refresh_suspensions is not None and susp is None)
             # **一条都没写就不要盖时间戳**：盖了会按「距上次 ≥7 天」把重试推到下周，
             # 而失败（取数空、账号没配、上游改结构）通常不会抛异常——0.2.33 上线时
@@ -781,17 +800,15 @@ def make_refresh_hooks(mcp, cfg, conn):
 
         # 一轮只拉游标之后的一小段（上游限频决定了一次拉不完），下一轮接着走
         batch = actions_cursor(conn, all_codes)[: ACTIONS_MAX_REQUESTS * 10]
-        actions = fetch_actions(mcp, batch, max_requests=ACTIONS_MAX_REQUESTS)
+        actions, done = fetch_actions(mcp, batch, max_requests=ACTIONS_MAX_REQUESTS)
         if actions is None:
             return None                      # 失败：游标不动，下次重试同一段
         with (lock if lock is not None else nullcontext()):
             written = store_actions(conn, actions)
-            # **一条都没写就不前移游标**：这一段全是 B 股/新股（本来没分红）时
-            # 前移是对的，但限频伪装成"空数据"时前移就等于永久跳过这 60 只
-            # ——滚动一圈约 3 天，等于三天后才可能再遇到。
-            # 代价是"确实没分红的一段"会被重拉一次，这比漏数据便宜得多。
-            if written:
-                advance_actions_cursor(conn, all_codes, batch)
+            # **游标只按"确实收到响应的代码"推进**：限频伪装成空/残缺数据时，
+            # 没出现的票不能算处理过，否则滚动一圈约 3 天才再遇到。
+            # 用 `done` 而不是整个 `batch`，残缺返回也不会把缺失的票跳过去。
+            advance_actions_cursor(conn, all_codes, done)
         return written
 
     def _suspensions(lock=None):

@@ -1064,7 +1064,7 @@ def test_refresh_hooks_wire_when_capability_present(env):
 
     class Fake:
         def batch_dividend(self, codes, years=10, max_requests=None, **kw):
-            return {}
+            return {}, set(codes)
 
         def suspension(self, start, end):
             return []
@@ -1288,7 +1288,7 @@ def test_actions_refresh_job_fetches_outside_the_write_lock(env):
 
         def batch_dividend(self, codes, years=10, max_requests=None, **kw):
             observed.append(SpyMcp.lock.depth if SpyMcp.lock is not None else -1)
-            return {}
+            return {}, set(codes)
 
         def suspension(self, start, end):
             return []

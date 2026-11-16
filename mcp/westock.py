@@ -205,10 +205,16 @@ class WestockMcp:
                        max_requests: int | None = None, budget_s: float = 120.0):
         """多只票的分红送转，返回 `{code: [CorpAction, ...]}`。
 
-        **字段名是实测出来的**（`data_dividend` 的返回，见 `_action_of`）：
-        `cashDiviRMB` 是「每 10 股派息（元）」，不是每股；`bonusShareRatio` 是
-        每股送股比例、`tranAddShareRatio` 是每股转增比例——这两个已经是"每股"
-        口径，不用再除 10。`exDiviDate` 是 `YYYYMMDD` 字符串。
+        **字段名与单位是实测出来的**（`data_dividend` 的返回，见 `_action_of`）：
+        `cashDiviRMB` / `bonusShareRatio` / `tranAddShareRatio` **三个都是
+        「每 10 股」刻度**，一律除以 10 才得到每股口径。`exDiviDate` 是
+        `YYYYMMDD` 字符串。
+
+        证据：同一行的 `dividendPlan` 文本可直接对照——
+        `cashDiviRMB='5.80'` ↔ `10派5.800元`、`tranAddShareRatio='4.00'` ↔
+        `10派…转4.000股`。`bonusShareRatio`（送股）暂未在真实返回中抓到非空样本，
+        但它与 `tranAddShareRatio` 是同一套刻度字段，故同除以 10；
+        `tests/mcp/test_westock.py` 里用非零样本钉住了这个换算。
 
         只保留 `procedure='方案实施'` 且 `exDiviDate` 合法的行：未实施的预案没有
         除权日，拿来算复权会把因子算错。
@@ -222,6 +228,7 @@ class WestockMcp:
 
         out: dict[str, list] = {}
         codes = list(codes)
+        done: set[str] = set()
         failed_chunks = 0
         # **整轮退避总预算**：一次滚动的耗时必须明显小于调度器的
         # `misfire_grace_time`（300 秒），否则下一次触发会被静默丢弃。
@@ -232,9 +239,10 @@ class WestockMcp:
             if max_requests is not None and i // chunk >= max_requests:
                 break                        # 本轮配额用完，剩下的下次再来
             remaining = max(0.0, budget_s - spent)
-            data, waited = self._fetch_chunk(part, years, backoff_s=backoff_s,
-                                             retries=retries, budget_s=remaining)
+            data, waited, handled = self._fetch_chunk(
+                part, years, backoff_s=backoff_s, retries=retries, budget_s=remaining)
             spent += waited
+            done.update(handled)
             if data is None:
                 # **单个 chunk 失败不再整体放弃**：5000 多只票要发 100 多个请求，
                 # 全丢会让整个周刷新白跑，而且因为不盖时间戳会每次启动都重来一遍。
@@ -262,13 +270,13 @@ class WestockMcp:
                 actions = _aggregate_plans(code, block.get("plans") or [])
                 if actions:
                     out.setdefault(code, []).extend(actions)
-        total_chunks = max(1, (len(codes) + chunk - 1) // chunk)
-        if failed_chunks and failed_chunks == total_chunks:
-            return None                      # 全失败：真的没取到数据，别盖"已完成"
+        if not done:
+            # **一个代码都没确认处理**：真的没取到数据，别盖"已完成"
+            return None, done
         if failed_chunks:
-            log.warning("分红取数 %d/%d 个批次失败（多为上游限频），已写入其余批次",
-                        failed_chunks, total_chunks)
-        return out
+            log.warning("分红取数 %d 个批次未取全（多为上游限频），已取到 %d/%d 只",
+                        failed_chunks, len(done), len(codes))
+        return out, done
 
     def _fetch_chunk(self, part, years, backoff_s: float, retries: int,
                      budget_s: float | None = None):
@@ -281,6 +289,10 @@ class WestockMcp:
 
         所以判据是**返回的票数明显少于请求数**（少于一半）就当限频，退避重试；
         重试仍不足才接受现有结果（B 股、新股本来就可能没有分红记录）。
+
+        返回 `(data, 已等待秒数, 已确认处理的 code 集合)`。第三项用于让游标
+        只跳过**真正处理过**的代码——限频伪装成空数据时，那一段必须留着重试，
+        否则滚动一圈才再遇到（约 3 天）。
 
         **实测的限频规律**（决定默认 `chunk=10` / `backoff_s=30`）：
         一次请求里塞多少只票都只返回一小部分（200 只 → 46 只，400 只 → 21 只），
@@ -299,13 +311,15 @@ class WestockMcp:
             if not resp.get("ok"):
                 reason = resp.get("reason") or ""
                 if "mcp_unavailable" in reason:
-                    return None, waited          # token 没了，重试也没用
+                    return None, waited, set()   # token 没了，重试也没用
                 data = None
             else:
                 data = _unwrap(resp.get("data"))
+                if isinstance(data, dict) and data.get("ok") is False:
+                    data = None              # 业务层失败（服务限频）≠ 空结果
             got = len(data) if isinstance(data, dict) else 0
             if got * 2 >= want:
-                return data, waited              # 够数，直接用
+                return data, waited, _codes_in(data)     # 够数，直接用
             # 不足一半：优先保留拿到最多的那次（残缺也比没有强）
             if best is None or got > len(best):
                 best = data if isinstance(data, dict) else best
@@ -315,19 +329,20 @@ class WestockMcp:
             if attempt < retries and self.sleep:
                 self.sleep(delay)
                 waited += delay
-        return best, waited
+        return best, waited, _codes_in(best)
 
     def suspension(self, start: str, end: str, market: str = SUSPENSION_MARKET):
         """停牌列表，返回 `[(code, start_date, end_date), ...]`。
 
-        `end_date` 用接口给的 `resumptionDate`（复牌日）。**未定复牌日（接口给
-        `19000101` 哨兵）落成 `None`**，不是"今天"。
+        **`end_date` 的语义是"最后一个停牌日"，不是"复牌日"。** 接口给的
+        `resumptionDate` 是**实际复牌日**，所以这里原样返回复牌日，
+        **由写库方（`jobs/eod.py::store_suspensions`）按交易日历往前推一个交易日**
+        再落 `end_date`——转换需要日历，取数层拿不到。
 
-        这一点原来想错了：把哨兵换成今天，等于告诉下游"今天复牌"——
-        `core/strategy/pool.py::_resume_dates` 用 `bisect_right` 取 `end` 之后的
-        第一个交易日，于是 `resume_cooldown` 被提前触发 1–2 天，而那条记录
-        每天又被新的 `end` 覆盖、永远清不掉。表结构 `end_date` 本来就可为 NULL，
-        下游也认 `None = 仍在停牌`，所以直接存 NULL 才是对的。
+        未定复牌日（接口给 `19000101` 哨兵）落成 `None`：表结构 `end_date` 可空，
+        下游（`core/strategy/pool.py::_resume_dates`、`jobs/eod.py::resume_dates`）
+        都把 `None` 当"仍在停牌"。**不能**用"今天"或任何具体日期伪造结束日——
+        那会告诉下游"某个确定的日子复牌了"。
 
         接口只按当前快照给"正在停牌"的票，没有区间查询参数，`start`/`end`
         仅用于日志与哨兵识别。
@@ -528,6 +543,22 @@ def _content_data(result: dict):
     if "structuredContent" in result:
         return result["structuredContent"]
     return result
+
+
+def _codes_in(data) -> set[str]:
+    """返回结构里**确实出现**的股票代码集合。
+
+    用于游标推进：只有出现在返回里的票才算"处理过"。限频伪装成空/残缺数据时，
+    没出现的票必须留着下一轮重试，否则滚动一圈才再遇到。
+    """
+    if not isinstance(data, dict):
+        return set()
+    # 单只票：`{code, end, plans}`
+    if "plans" in data:
+        one = _normalize_code(data.get("code"))
+        return {one} if one else set()
+    # 多只票：以 code 为键的字典
+    return {c for c in (_normalize_code(k) for k in data) if c}
 
 
 def _unwrap(data):

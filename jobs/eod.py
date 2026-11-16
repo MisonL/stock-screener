@@ -245,7 +245,10 @@ def run_eod(cfg, reg, conn, clock) -> EodReport:
 
 
 def fetch_actions(westock, codes, years: int = 10, max_requests: int | None = None):
-    """**只取数、不写库**（纯网络）。返回 `{code: [CorpAction]}` 或 `None`（失败）。
+    """**只取数、不写库**（纯网络）。返回 `({code: [CorpAction]}, 已处理 code 集合)`。
+
+    失败返回 `(None, set())`。第二项是**真正收到响应的代码**，游标只该按它推进：
+    限频伪装成空/残缺数据时，没出现的票必须留到下一轮重试。
 
     单独拆出来是为了让定时任务能「锁外取数、锁内写库」：一次取数要发好几个
     请求、还带退避，放进写锁里会把每秒的 tick 和 30 秒的心跳全堵住
@@ -273,6 +276,13 @@ def store_actions(conn, actions) -> int:
                      action.bonus_ratio, action.tran_ratio),
                 )
                 written += 1
+    if written:
+        # **写完官方除权事件必须立刻重建复权表**：否则在下一次 EOD/回填之前，
+        # 所有读 `daily_bars_adj` 的消费者拿到的仍是按旧事件算的价格。
+        # 滚动刷新常在 EOD 之后或次日盘前跑，正好卡在这个窗口里。
+        # `rebuild_adj(code=…)` 用 `actions_hash` 判断，未变的票会跳过，很便宜。
+        for code in actions:
+            rebuild_adj(conn, code)
     return written
 
 
@@ -283,7 +293,7 @@ def refresh_actions(cfg, westock, conn, codes, max_requests: int | None = None) 
     `fetch_actions()` + `store_actions()`，把网络请求放到写锁外面
     （见 `jobs/main.py::_actions`）。用本函数排定时任务会把 tick 堵住。
     """
-    actions = fetch_actions(westock, codes, max_requests=max_requests)
+    actions, _done = fetch_actions(westock, codes, max_requests=max_requests)
     if actions is None:
         return None
     return store_actions(conn, actions)
@@ -338,28 +348,55 @@ def advance_actions_cursor(conn, codes, pulled) -> None:
             (nxt,))
 
 
-def refresh_suspensions(cfg, westock, conn, codes=None) -> int:
-    """停牌日历（D24）：一次区间查询落 `suspension_calendar`。
+def store_suspensions(conn, rows, cal=None, codes=None) -> int:
+    """把 `(code, start, 复牌日或None)` 落 `suspension_calendar`。
 
-    `codes` 给定时只保留这几只（`jobs/main.py` 传 `stock_meta` 全体，测试传单只）。
+    **必须把复牌日往前推一个交易日**：下游两个消费者（
+    `core/strategy/pool.py::_resume_dates` 用 `bisect_right`、
+    `jobs/eod.py::resume_dates` 用 `end_date == 上一交易日`）都按
+    「`end_date` 是**最后一个停牌日**」来解释。接口给的 `resumptionDate`
+    是**实际复牌日**——原样写入会让策略晚一个交易日才识别到复牌，
+    `resume_cooldown` 也跟着晚。没有日历时退回"复牌日 - 1 天"这种日粒度近似。
     """
-    end = datetime.now(SH).date()
-    start = end - timedelta(days=SUSPENSION_DAYS)
-    rows = westock.suspension(start.isoformat(), end.isoformat())
-    if rows is None:
-        return None                     # 取数失败（`[]` 才是"今天没人停牌"）
     wanted = None if codes is None else set(codes)
     written = 0
     with conn:
-        for code, begin, finish in rows:
+        for code, begin, resumption in rows:
             if wanted is not None and code not in wanted:
                 continue
+            finish = _last_suspended_day(resumption, cal)
             conn.execute(
                 "INSERT OR REPLACE INTO suspension_calendar(code, start_date, end_date) VALUES (?,?,?)",
                 (code, begin, finish),
             )
             written += 1
     return written
+
+
+def _last_suspended_day(resumption, cal) -> int | None:
+    """复牌日 → 最后一个停牌日。`None`（未定复牌）原样返回。"""
+    if resumption is None:
+        return None
+    if cal is not None:
+        try:
+            return cal.prev(resumption)
+        except LookupError:
+            pass                       # 日历不完整：退回按自然日近似
+    return resumption - 1
+
+
+def refresh_suspensions(cfg, westock, conn, codes=None, cal=None) -> int:
+    """停牌日历（D24）：一次区间查询落 `suspension_calendar`。
+
+    `codes` 给定时只保留这几只（`jobs/main.py` 传 `stock_meta` 全体，测试传单只）。
+    `cal` 是交易日历，用来把复牌日换算成"最后一个停牌日"（见 `store_suspensions`）。
+    """
+    end = datetime.now(SH).date()
+    start = end - timedelta(days=SUSPENSION_DAYS)
+    rows = westock.suspension(start.isoformat(), end.isoformat())
+    if rows is None:
+        return None                     # 取数失败（`[]` 才是"今天没人停牌"）
+    return store_suspensions(conn, rows, cal=cal, codes=codes)
 
 
 def resume_dates(conn, cal, today: int) -> set[str]:

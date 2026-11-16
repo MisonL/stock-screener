@@ -145,9 +145,11 @@ class FakeWestockCli:
         return list(self.dividends.get(code, []))
 
     def batch_dividend(self, codes, years=10, chunk=300, max_requests=None):
-        # `max_requests` 是真实客户端的单轮配额（上游限频），假体只需要接受它
+        # `max_requests` 是真实客户端的单轮配额（上游限频），假体只需要接受它。
+        # 返回值形状与真实实现一致：`(数据 dict, 已处理的 code 集合)`。
         self.calls.append(("batch_dividend", tuple(codes), years))
-        return {code: list(self.dividends.get(code, [])) for code in codes}
+        out = {code: list(self.dividends.get(code, [])) for code in codes}
+        return out, set(codes)
 
     def suspension(self, start, end):
         self.calls.append(("suspension", start, end))

@@ -166,10 +166,17 @@ def test_st_prefix_variants(name, status):
 
 
 def test_refresh_suspensions_writes_calendar(env):      # D24：落 suspension_calendar
+    """`end_date` 落的是**最后一个停牌日**，不是接口给的复牌日。
+
+    下游两个消费者（`core/strategy/pool.py::_resume_dates` 用 `bisect_right`、
+    `jobs/eod.py::resume_dates` 用 `end_date == 上一交易日`）都按这个契约解释。
+    接口给 20260903 复牌，直接写 0903 会让策略晚一个交易日才认到复牌。
+    没有交易日历时按「复牌日 - 1 天」近似（这里是 0902）。
+    """
     assert refresh_suspensions(env.cfg, env.westock, env.conn, codes=["sh600519"]) == 1
     assert env.count("suspension_calendar", code="sh600519") == 1
     row = env.one("suspension_calendar", code="sh600519")
-    assert (row["start_date"], row["end_date"]) == (20260901, 20260903)
+    assert (row["start_date"], row["end_date"]) == (20260901, 20260902)
 
 
 def test_refresh_suspensions_filters_by_codes(env):
@@ -577,3 +584,69 @@ def test_actions_cursor_recovers_when_its_code_is_delisted(env):
                          " VALUES ('refresh_actions.next', 'sh600999')")
     codes = ["sh600000", "sh600001", "sh600002"]
     assert actions_cursor(env.conn, codes) == codes, "游标越界应回到开头"
+
+
+def test_store_suspensions_uses_calendar_not_natural_days(env):
+    """有日历时按**交易日历**往前推，而不是减一天。
+
+    复牌日 20261012（周一）前的最后一个交易日是 20261009（周五），
+    不是 20261011（周日）。减一天会把 end_date 落在休市日上，
+    下游 `end_date == 上一交易日` 就永远对不上。
+    """
+    from jobs.eod import store_suspensions
+
+    class Cal:
+        days = {20261008, 20261009, 20261012, 20261013}
+
+        def prev(self, d):
+            earlier = [x for x in self.days if x < d]
+            if not earlier:
+                raise LookupError(d)
+            return max(earlier)
+
+    n = store_suspensions(env.conn, [("sh600519", 20260930, 20261012)], cal=Cal())
+    assert n == 1
+    row = env.one("suspension_calendar", code="sh600519")
+    assert row["end_date"] == 20261009, f"应按交易日历取 1009，实际 {row['end_date']}"
+
+
+def test_store_suspensions_keeps_none_for_undecided_resumption(env):
+    """未定复牌（None）原样落 NULL，不能编一个确定日期。"""
+    from jobs.eod import store_suspensions
+
+    store_suspensions(env.conn, [("sh600519", 20260901, None)])
+    row = env.one("suspension_calendar", code="sh600519")
+    assert row["end_date"] is None
+
+
+def test_store_actions_rebuilds_adj_so_prices_follow_the_new_event(env):
+    """写入官方除权事件后**必须立刻重建复权表**。
+
+    否则在下一次 EOD/回填之前，所有读 `daily_bars_adj` 的消费者拿到的仍是
+    按旧事件算的价格。滚动刷新常在 EOD 之后或次日盘前跑，正好卡在这个窗口里。
+    """
+    from core.adjust import rebuild_adj
+    from core.datasource.westock import CorpAction
+
+    code = "sh600519"
+    with env.conn:
+        for d in range(20260901, 20261001):
+            env.conn.execute(
+                "INSERT OR REPLACE INTO daily_bars(code, date, open, high, low, close, volume, amount, source)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (code, d, 10.0, 10.0, 10.0, 10.0, 1000, 10000.0, "tencent"))
+    rebuild_adj(env.conn, code)
+    before = env.conn.execute(
+        "SELECT close FROM daily_bars_adj WHERE code=? AND date=?",
+        (code, 20260930)).fetchone()[0]
+
+    # 新增一条每股派息 0.5 的除权事件
+    from jobs.eod import store_actions
+    store_actions(env.conn, {code: [
+        CorpAction(code=code, ex_date=20260915, cash_per_share=0.5,
+                   bonus_ratio=0.0, tran_ratio=0.0)]})
+
+    after = env.conn.execute(
+        "SELECT close FROM daily_bars_adj WHERE code=? AND date=?",
+        (code, 20260930)).fetchone()[0]
+    assert after != before, "写入除权事件后复权价没变：复权表没重建"

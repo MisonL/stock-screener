@@ -525,7 +525,7 @@ def test_batch_dividend_maps_real_payload(env_file):
     复权因子整个算错——这类错误在图上不会报错，只会让价格看起来不对。
     """
     mcp = _mcp_with(env_file, {"data_dividend": _wrapped(_DIV_SINGLE)})
-    got = mcp.batch_dividend(["sh603259"], years=10)
+    got, _done = mcp.batch_dividend(["sh603259"], years=10)
 
     assert list(got) == ["sh603259"]
     actions = got["sh603259"]
@@ -546,7 +546,7 @@ def test_batch_dividend_reads_dict_shaped_multi_code_reply(env_file):
     "这段时间没有分红"，最难发现。
     """
     mcp = _mcp_with(env_file, {"data_dividend": _wrapped(_DIV_MULTI)})
-    got = mcp.batch_dividend(["sh600036", "sz300059"], years=10)
+    got, _done = mcp.batch_dividend(["sh600036", "sz300059"], years=10)
 
     assert set(got) == {"sh600036", "sz300059"}
     assert got["sh600036"][0].cash_per_share == pytest.approx(1.003)
@@ -574,7 +574,7 @@ def test_batch_dividend_returns_none_on_failure_instead_of_crashing(env_file):
     """
     mcp = WestockMcp(env_path=env_file, http=FakeHttp({}, status=401),
                      clock=FixedClock(datetime(2026, 11, 15, 10, 0)))
-    assert mcp.batch_dividend(["sh600519"]) is None
+    assert mcp.batch_dividend(["sh600519"])[0] is None
 
 
 def test_suspension_parses_real_payload_and_handles_undecided_resumption(env_file):
@@ -661,7 +661,7 @@ def test_batch_dividend_keeps_partial_results_when_one_chunk_fails(env_file):
         {"sh600036": {"code": "sh600036", "plans": [block]}})}), clock=FixedClock(
         datetime(2026, 11, 15, 10, 0)))
 
-    got = mcp.batch_dividend(["sh600036", "sz000002"], years=10, chunk=1)
+    got, _done = mcp.batch_dividend(["sh600036", "sz000002"], years=10, chunk=1)
     assert got is not None, "只有一个批次失败却返回 None：整个刷新会白跑"
     assert "sh600036" in got, "成功的批次被丢掉了"
 
@@ -670,7 +670,7 @@ def test_batch_dividend_returns_none_only_when_every_chunk_failed(env_file):
     """全部批次都失败才算失败——这时才不该盖「已完成」时间戳。"""
     mcp = WestockMcp(env_path=env_file, http=FakeHttp({}, status=401),
                      clock=FixedClock(datetime(2026, 11, 15, 10, 0)))
-    assert mcp.batch_dividend(["sh600036", "sz000002"], chunk=1) is None
+    assert mcp.batch_dividend(["sh600036", "sz000002"], chunk=1)[0] is None
 
 
 def test_batch_dividend_backs_off_after_a_rate_limit(env_file):
@@ -727,7 +727,7 @@ def test_batch_dividend_retries_when_response_is_suspiciously_short(env_file):
 
     mcp = WestockMcp(env_path=env_file, http=ShrinkingHttp({}), sleep=lambda s: None,
                      clock=FixedClock(datetime(2026, 11, 15, 10, 0)))
-    got = mcp.batch_dividend(["sh600036", "sz000002", "sh600000"], years=10, chunk=3)
+    got, _done = mcp.batch_dividend(["sh600036", "sz000002", "sh600000"], years=10, chunk=3)
 
     assert calls["n"] >= 3, "条数明显偏少却没重试：残缺数据会被当成真实结果"
     assert got is not None and len(got) == 3, f"重试后仍不完整：{got}"
@@ -766,7 +766,7 @@ def test_batch_dividend_merges_multiple_plans_on_the_same_ex_date(env_file):
              "procedure": "方案实施", "bonusShareRatio": "", "tranAddShareRatio": ""},
         ]}
     mcp = _mcp_with(env_file, {"data_dividend": _wrapped(plans)})
-    got = mcp.batch_dividend(["sz002460"], years=10)["sz002460"]
+    got = mcp.batch_dividend(["sz002460"], years=10)[0]["sz002460"]
 
     assert len(got) == 2, f"同日多条没合并：{got}"
     merged = [a for a in got if a.ex_date == 20260710][0]
@@ -802,3 +802,45 @@ def test_batch_dividend_caps_total_backoff_within_budget(env_file):
     mcp.batch_dividend(codes, chunk=10, backoff_s=30.0, retries=2, budget_s=100.0)
 
     assert sum(delays) <= 100.0 + 1e-6, f"退避总时长 {sum(delays)}s 超出预算 100s"
+
+
+def test_batch_dividend_reports_only_the_codes_it_actually_saw(env_file):
+    """返回第二个值必须是**确实收到响应的代码**，不是请求的全部。
+
+    游标按它推进：限频伪装成残缺/空数据时，没出现的票要留到下一轮重试，
+    否则滚动一圈约 3 天才再遇到。
+    """
+    # 请求 4 只，接口只回 1 只（模拟限频残缺），且重试也补不齐
+    only_one = {"sh600036": {"code": "sh600036", "plans": []}}
+    mcp = _mcp_with(env_file, {"data_dividend": _wrapped(only_one)})
+    data, done = mcp.batch_dividend(
+        ["sh600036", "sh600000", "sz000002", "sh601398"], chunk=4, retries=0)
+
+    assert done == {"sh600036"}, f"确认集应只有真正返回的那只，实际 {done}"
+    assert "sh600000" not in done
+
+
+def test_batch_dividend_returns_none_and_empty_set_when_nothing_seen(env_file):
+    """一个代码都没确认时返回 `(None, set())`，游标据此不动。"""
+    mcp = _mcp_with(env_file, {"data_dividend": _wrapped({})})
+    data, done = mcp.batch_dividend(["sh600036", "sh600000"], chunk=2, retries=0)
+    assert data is None and done == set()
+
+
+def test_nonzero_bonus_ratio_is_also_divided_by_ten(env_file):
+    """**送股比例（bonusShareRatio）同样除以 10**。
+
+    审查指出：fixture 里 bonusShareRatio 全是空串，去掉这个 /10 之后
+    8 个 batch 测试仍然全绿——等于这个换算根本没被验证过。这里钉一个非零样本。
+    （送股与转增是同一套刻度字段，接口的 `dividendPlan` 文本可以对照。）
+    """
+    plans = {"code": "sz000001", "end": "2026-11-15", "plans": [
+        {"cashDiviRMB": "", "bonusShareRatio": "8.00", "tranAddShareRatio": "",
+         "dividendPlan": "10送8.000股", "exDiviDate": "20260710",
+         "procedure": "方案实施"}]}
+    mcp = _mcp_with(env_file, {"data_dividend": _wrapped(plans)})
+    got, _done = mcp.batch_dividend(["sz000001"])
+
+    action = got["sz000001"][0]
+    assert action.bonus_ratio == pytest.approx(0.8), \
+        f"10送8股应是每股 0.8，实际 {action.bonus_ratio}（漏了 /10 会得 8.0）"

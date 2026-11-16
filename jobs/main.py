@@ -502,6 +502,16 @@ def _install_stack_dump() -> None:                  # pragma: no cover - 排障�
         pass
 
 
+def _trace_path() -> Path:
+    """trace 文件路径（测试可以 monkeypatch 掉）。"""
+    return Path("/tmp/actions_refresh.trace")
+
+
+#: `_trace()` 的互斥锁。滚动任务和启动恢复会并发调用它，而"读-改-写"
+#: 三步不是原子的：不加锁会互相覆盖，丢行。
+_TRACE_LOCK = threading.Lock()
+
+
 def _trace(msg: str) -> None:                       # pragma: no cover - 排障用
     """往 `/tmp/actions_refresh.trace` 追加一行（保留最近 200 行）。
 
@@ -510,11 +520,13 @@ def _trace(msg: str) -> None:                       # pragma: no cover - 排障�
     """
     from datetime import datetime
 
-    path = Path("/tmp/actions_refresh.trace")
+    path = _trace_path()
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()[-200:] if path.exists() else []
-        lines.append(f"{datetime.now(SH):%Y-%m-%d %H:%M:%S} {msg}")
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        with _TRACE_LOCK:
+            lines = (path.read_text(encoding="utf-8").splitlines()[-200:]
+                     if path.exists() else [])
+            lines.append(f"{datetime.now(SH):%Y-%m-%d %H:%M:%S} {msg}")
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     except OSError:
         pass
 
@@ -839,7 +851,7 @@ def make_refresh_hooks(mcp, cfg, conn):
     def _actions(lock=None):
         """取一段、写库、前移游标。
 
-        `lock` 给定时**取数在锁外、写库在锁内**：取数要发 6 个请求还带退避，
+        `lock` 给定时**取数在锁外、写库在锁内**：取数要发 4 个请求还带退避，
         放进写锁里会把每秒的 tick 堵住（`test_members_job_does_not_fetch_inside_the_lock`
         记录过这类故障）。
         """
@@ -848,7 +860,8 @@ def make_refresh_hooks(mcp, cfg, conn):
         from jobs.eod import fetch_actions, store_actions
 
         # 一轮只拉游标之后的一小段（上游限频决定了一次拉不完），下一轮接着走
-        batch = actions_cursor(conn, all_codes)[: ACTIONS_MAX_REQUESTS * 10]
+        tail = actions_cursor(conn, all_codes)
+        batch = tail[: ACTIONS_MAX_REQUESTS * 10]
         actions, done = fetch_actions(mcp, batch, max_requests=ACTIONS_MAX_REQUESTS)
         if actions is None:
             return None                      # 失败：游标不动，下次重试同一段
@@ -857,7 +870,8 @@ def make_refresh_hooks(mcp, cfg, conn):
             # **游标只按"确实收到响应的代码"推进**：限频伪装成空/残缺数据时，
             # 没出现的票不能算处理过，否则滚动一圈约 3 天才再遇到。
             # 用 `done` 而不是整个 `batch`，残缺返回也不会把缺失的票跳过去。
-            advance_actions_cursor(conn, all_codes, done)
+            advance_actions_cursor(conn, all_codes, done,
+                                   start=batch[0] if batch else None)
         return written
 
     def _suspensions(lock=None):
@@ -869,8 +883,15 @@ def make_refresh_hooks(mcp, cfg, conn):
         rows = fetch_suspensions(mcp)
         if rows is None:
             return None
+        from core.clock import TradingCalendar
+
+        # **必须传交易日历**：`suspension()` 给的是复牌日，而 `end_date` 的契约是
+        # 「最后一个停牌日」。不传 cal 就会退化成"复牌日 - 1 天"的自然日近似，
+        # 周一复牌会落成周日，`resume_dates()` 的 `end_date == 上一交易日`
+        # 永远对不上，`resume_cooldown` 迟一天（节后首日迟得更多）。
+        cal = TradingCalendar(conn)
         with (lock if lock is not None else nullcontext()):
-            return store_suspensions(conn, rows, codes=all_codes)
+            return store_suspensions(conn, rows, cal=cal, codes=all_codes)
 
     return _actions, _suspensions
 

@@ -131,13 +131,15 @@ def append_daily_bar(conn, code, *, date, close=10.0):
 class FakeWestockCli:
     """`WestockCli` 的假体：dividend / batch_dividend / suspension 全部离线返回预置数据。
 
-    `suspensions` 是 `{code: (start, end)}`，`suspension()` 忽略查询区间原样返回
-    （真 CLI 是区间查询，这里只需要「调一次拿回一批」这个形状）。
+    `suspensions` 是 `{code: (停牌起始日, 复牌日)}`——**第二项是复牌日**，与真实
+    接口同义（落库的 `end_date` 还要往前推一个交易日）。
+    `suspension()` 忽略查询区间原样返回（真 CLI 是区间查询，这里只需要
+    「调一次拿回一批」这个形状）。
     """
 
     def __init__(self, dividends=None, suspensions=None):
         self.dividends = dict(dividends or {})        # code -> list[CorpAction]
-        self.suspensions = dict(suspensions or {})    # code -> (start, end)
+        self.suspensions = dict(suspensions or {})    # code -> (start, 复牌日)
         self.calls = []
 
     def dividend(self, code, years=10):
@@ -152,8 +154,14 @@ class FakeWestockCli:
         return out, set(codes)
 
     def suspension(self, start, end):
+        """返回 `(code, 停牌起始日, 复牌日)`——**第三个是复牌日**，与真实
+        `WestockMcp.suspension()` 同义（落库时的 `end_date` 还要往前推一个交易日）。
+
+        早先这里返回的是"已经换算好的 end_date"，于是 EOD 的测试看起来覆盖了
+        换算，其实喂的是换算后的值——真实的换算路径从未被测到。
+        """
         self.calls.append(("suspension", start, end))
-        return [(code, begin, finish) for code, (begin, finish) in self.suspensions.items()]
+        return [(code, begin, resumed) for code, (begin, resumed) in self.suspensions.items()]
 
 
 def seed_fetch_log(conn, code, n, status, purpose="backfill"):

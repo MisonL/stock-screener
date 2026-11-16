@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
+import threading
+
 import pytest
 from apscheduler.triggers.cron import CronTrigger
 
@@ -1441,3 +1443,72 @@ def test_suspensions_fetches_outside_the_write_lock(env):
     susp(lock)
 
     assert observed and observed[0] == 0, f"停牌取数在锁内（深度 {observed[0]}）"
+
+
+def test_trace_does_not_lose_lines_under_concurrency(tmp_path, monkeypatch):
+    """并发写 trace 不能丢行。
+
+    滚动任务和启动恢复会同时调 `_trace()`，而"读-改-写"三步不是原子的：
+    不加锁时两个线程会互相覆盖，日志丢行——而 trace 正是用来排查"到底跑没跑"的，
+    丢行等于把排障工具本身变成误导源。
+    """
+    from jobs import main as jobs_main
+
+    target = tmp_path / "trace.log"
+    monkeypatch.setattr(jobs_main, "_trace_path", lambda: target, raising=False)
+
+    def worker(tag: str):
+        for i in range(40):
+            jobs_main._trace(f"{tag}-{i}")
+
+    threads = [threading.Thread(target=worker, args=(f"t{n}",)) for n in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    kept = target.read_text(encoding="utf-8").splitlines()
+    # 保留窗口是 200 行，4 线程各写 40 行共 160 行，应一行不少
+    assert len(kept) == 160, f"丢了 {160 - len(kept)} 行"
+    assert len(set(kept)) == 160, "有重复或覆盖"
+
+
+def test_suspensions_hook_uses_the_trading_calendar(env):
+    """生产路径的停牌写入**必须接上交易日历**。
+
+    `suspension()` 返回的是复牌日，`end_date` 的契约是"最后一个停牌日"。
+    不传 cal 会退化成"复牌日 − 1 天"的自然日近似：周一复牌会落成周日，
+    而 `resume_dates()` 要求 `end_date == 上一交易日`，于是 `resume_cooldown`
+    永远迟一天。这个洞出现过两次（0.2.44 加了 cal 参数、0.2.47 拆函数时又丢了）。
+    """
+    from jobs.main import make_refresh_hooks
+
+    # 生产路径按 stock_meta 过滤代码，先把它放进去
+    with env.conn:
+        env.conn.execute(
+            "INSERT OR REPLACE INTO stock_meta(code, name, market, updated_at) "
+            "VALUES ('sh600519','贵州茅台','cn_main','2026-11-16T00:00:00+08:00')")
+    # 日历里只有周五(1009)和周一(1012)：复牌日 1012 的"最后一个停牌日"必须是 1009
+    for d in (20261008, 20261009, 20261012):
+        with env.conn:
+            env.conn.execute(
+                "INSERT OR REPLACE INTO daily_bars(code, date, open, high, low, close,"
+                " volume, amount, source) VALUES ('sh000300',?,10,10,10,10,1,1,'tencent')",
+                (d,))
+
+    class Mcp:
+        def batch_dividend(self, codes, years=10, max_requests=None, **kw):
+            return {}, set(codes)
+
+        def suspension(self, start, end):
+            return [("sh600519", 20260930, 20261012)]      # 周一复牌
+
+    _acts, susp = make_refresh_hooks(Mcp(), env.cfg, env.conn)
+    susp()
+
+    row = env.conn.execute(
+        "SELECT end_date FROM suspension_calendar WHERE code='sh600519'").fetchone()
+    assert row is not None, "停牌没落库"
+    assert row[0] == 20261009, (
+        f"应按交易日历落成 1009（周五），实际 {row[0]}——"
+        "说明生产路径没接 cal，退化成自然日 -1 了")

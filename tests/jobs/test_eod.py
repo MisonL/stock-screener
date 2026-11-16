@@ -650,3 +650,26 @@ def test_store_actions_rebuilds_adj_so_prices_follow_the_new_event(env):
         "SELECT close FROM daily_bars_adj WHERE code=? AND date=?",
         (code, 20260930)).fetchone()[0]
     assert after != before, "写入除权事件后复权价没变：复权表没重建"
+
+
+def test_cursor_does_not_skip_codes_missed_in_the_middle(env):
+    """中间那一段没确认时，游标**不能越过它**。
+
+    限频时常出现「开头几段正常、中间某段只回 1 只、后面又正常」。
+    按 `max(done)` 推进的话，中间没确认的 9 只被整段跳过，要等滚动一整圈
+    （约 3 天）才再遇到。游标只能推进到"连续确认"的断点。
+    """
+    from jobs.eod import actions_cursor, advance_actions_cursor
+
+    codes = [f"sh60{i:04d}" for i in range(1, 41)]      # 40 只
+    advance_actions_cursor(env.conn, codes, codes[:10])
+    assert actions_cursor(env.conn, codes)[0] == codes[10]
+
+    # 第二轮：第 2 段（codes[10:20]）只确认了第一只，后面 10:20 之后全部正常
+    done = {codes[10]} | set(codes[20:40])
+    advance_actions_cursor(env.conn, codes, done, start=codes[10])
+
+    nxt = actions_cursor(env.conn, codes)[0]
+    assert nxt == codes[11], (
+        f"游标应停在断点 codes[11]，实际 {nxt}——"
+        "中间没确认的 9 只被跳过了")

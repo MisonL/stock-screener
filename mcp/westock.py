@@ -332,12 +332,13 @@ class WestockMcp:
         return best, waited, _codes_in(best)
 
     def suspension(self, start: str, end: str, market: str = SUSPENSION_MARKET):
-        """停牌列表，返回 `[(code, start_date, end_date), ...]`。
+        """停牌列表，返回 `[(code, 停牌起始日, **复牌日**或None), ...]`。
 
-        **`end_date` 的语义是"最后一个停牌日"，不是"复牌日"。** 接口给的
-        `resumptionDate` 是**实际复牌日**，所以这里原样返回复牌日，
-        **由写库方（`jobs/eod.py::store_suspensions`）按交易日历往前推一个交易日**
-        再落 `end_date`——转换需要日历，取数层拿不到。
+        **第三个元素是接口给的"复牌日"，不是落库用的 `end_date`。**
+        落库契约里 `end_date` 是"最后一个停牌日"，两者差一个交易日：
+        转换需要交易日历，取数层拿不到，所以由写库方
+        （`jobs/eod.py::store_suspensions`）负责往前推。
+        调这个方法的代码不要直接把第三个元素当 `end_date` 用。
 
         未定复牌日（接口给 `19000101` 哨兵）落成 `None`：表结构 `end_date` 可空，
         下游（`core/strategy/pool.py::_resume_dates`、`jobs/eod.py::resume_dates`）

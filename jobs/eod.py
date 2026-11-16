@@ -299,16 +299,20 @@ def refresh_actions(cfg, westock, conn, codes, max_requests: int | None = None) 
     return store_actions(conn, actions)
 
 
-#: 每轮最多发几个请求。上游实测连发 8–10 个就限频；停牌那 1 个请求也要占额度，
-#: 所以分红只发 4 个（4 + 1 = 5，留足余量）。原来取 6，启动时有 1/6 概率把停牌
-#: 挤成限频失败，而一次失败要等下周才重试。
+#: 每轮最多发几个**批次**。上游实测连发 8–10 个请求就限频；停牌那 1 个请求也要
+#: 占额度，所以分红只发 4 个批次（4 + 1 = 5，留足余量）。原来取 6，
+#: 启动时有相当概率把停牌挤成限频失败，而一次失败要等下周才重试。
+#:
+#: **注意这是"批次"不是"请求"**：`_fetch_chunk` 内部撞限频还会重试（最多
+#: `retries + 1` 次），所以实际请求数上限是 `4 × 3 + 1 = 13`。整轮耗时有
+#: `budget_s` 封顶（见 `batch_dividend`），不会无限拖。
 ACTIONS_MAX_REQUESTS = 4
 
 
 def actions_cursor(conn, codes) -> list:
     """按游标取出「本轮要拉的那一段」股票代码。
 
-    全市场 5000 多只、每轮只能发 6 个请求（60 只），一次拉完不可能。
+    全市场 5000 多只、每轮只能发 4 个请求（40 只），一次拉完不可能。
     游标存在 `job_state('refresh_actions.next')`，每轮从上次停下的地方继续，
     走到末尾就从头开始——滚动刷新，循环覆盖全市场。
     """
@@ -330,20 +334,38 @@ def actions_cursor(conn, codes) -> list:
     return codes[lo:]
 
 
-def advance_actions_cursor(conn, codes, pulled) -> None:
-    """按本轮实际拉到的数量前移游标（`pulled` 为代码列表）。"""
+def advance_actions_cursor(conn, codes, pulled, start=None) -> None:
+    """把游标推进到"本轮**连续**确认过的最后一只之后"。
+
+    `pulled` 是**确实收到响应的代码**（`batch_dividend` 的第二个返回值）。
+    关键是"连续"：限频时常出现"开头几段正常、中间某段只回 1 只、后面又正常"，
+    若按 `max(pulled)` 推进，中间那段没确认的代码就被整段跳过了——要等滚动一整圈
+    （约 3 天）才再遇到。
+
+    `start` 是本轮的起点代码（没给就从头算）。换算成"从 start 开始的最长连续前缀"。
+    """
     codes = sorted(codes)
     if not codes:
         return
-    if not pulled or len(pulled) >= len(codes):
+    pulled = {c for c in (pulled or ()) if c in set(codes)}
+    if not pulled or (start is None and len(pulled) >= len(codes)):
         nxt = codes[0]                        # 一轮走完了，回到起点
     else:
-        last = max(pulled)
-        try:
-            idx = codes.index(last) + 1
-        except ValueError:
-            idx = 0
-        nxt = codes[idx] if idx < len(codes) else codes[0]
+        begin = 0
+        if start is not None:
+            try:
+                begin = codes.index(start)
+            except ValueError:
+                begin = 0
+        # 从 begin 往后找最长连续命中，第一次断点就停
+        idx = begin
+        while idx < len(codes) and codes[idx] in pulled:
+            idx += 1
+        if idx == begin:
+            # 起点本身就没拿到：游标不动，下次重试同一段
+            nxt = codes[begin]
+        else:
+            nxt = codes[idx] if idx < len(codes) else codes[0]
     with conn:
         conn.execute(
             "INSERT OR REPLACE INTO job_state(name, value) VALUES ('refresh_actions.next', ?)",

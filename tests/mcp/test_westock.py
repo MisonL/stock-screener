@@ -934,3 +934,22 @@ def test_retry_keeps_the_better_response_by_stock_count(env_file):
 
     assert done == {"sh600000", "sh600001"}, (
         f"重试结果被丢弃了：确认集 {done}（应保留 2 只的那次响应）")
+
+
+def test_block_code_must_match_the_outer_key(env_file):
+    """块内 `code` 与外层键不一致时不能确认。
+
+    解析动作用的是**块内 `code`**，确认用的是**外层键**。两者不一致会出现
+    "确认了 A、数据写到 B"或"确认了 A 但一行没写"，A 就被游标永久跳过了。
+    """
+    plan = {"procedure": "方案实施", "exDiviDate": "20260710", "cashDiviRMB": "5.80"}
+
+    for value in (
+        {"plans": [plan]},                                    # 缺块内 code
+        {"code": "sh600002", "plans": [plan]},                # 块内 code 不同
+        {"code": "not-a-code", "plans": [plan]},              # 块内 code 无效
+    ):
+        mcp = _mcp_with(env_file, {"data_dividend": _wrapped({"sh600000": value})})
+        data, done = mcp.batch_dividend(["sh600000"], chunk=1, retries=0)
+        assert "sh600000" not in done, f"块内 code 不匹配仍被确认：{done}"
+        assert not data, f"块内 code 不匹配仍写入了数据：{data}"

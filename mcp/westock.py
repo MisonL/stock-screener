@@ -589,6 +589,13 @@ def _codes_in(data) -> set[str]:
             continue
         if not isinstance(val.get("plans"), list):
             continue
+        # **块内 `code` 必须与外层键一致**：解析动作用的是块内 `code`
+        # （见 `_aggregate_plans` 的调用处），确认用的却是外层键。
+        # 两者不一致时会出现"确认了 A、数据写到 B"或"确认了 A 但什么都没写"，
+        # 于是 A 被游标永久跳过去。块内缺 code 也按同一标准拒绝。
+        inner = _normalize_code(val.get("code"))
+        if inner != code:
+            continue
         out.add(code)
     return out
 

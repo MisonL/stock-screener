@@ -123,6 +123,36 @@ def run_eod(cfg, reg, conn, clock) -> EodReport:
     reported: set[str] = set()          # 本轮已补拉并计入 gaps 的票，第二遍不再重复补
     last_dates: dict[str, int | None] = {}
 
+    # **联网的缺口补拉必须在写事务之前做完**：
+    # `run_eod` 的事务要写几千行，本来就已经跑 1～3 分钟；再把 30 根 K 线的
+    # HTTP 塞进事务里，会让 SQLite 的单写者锁被占住更久——并发写者
+    # （快照线程、请求记账）等满 busy_timeout 就 `database is locked`，
+    # 记账钩子还会把这种失败静默吞掉。
+    #
+    # 所以分两段：① 事务外判缺口 + 取数（`_fetch_gap_bars`）；
+    # ② 事务内只写。判缺口需要「最后一根 bar」和「是否有缺口标记」，
+    # 这里先只读地扫一遍，结果供第二段使用。
+    # 配额 `GAP_MAX` 在两遍循环里是按 `attempted` 累计的，所以预扫描也要
+    # 按同样的上限收集（且顺序一致），否则第二遍会用不到已经取好的数据。
+    prefetched_gaps: dict[str, list | None] = {}
+    if prev_day is not None:
+        for code in codes:
+            if len(prefetched_gaps) >= GAP_MAX:
+                break
+            # 停牌的票今天不会有新 bar，不值得为它发一次 K 线请求。
+            # **快照缺行的票不能因此跳过**：它可能正是"上游没给快照但 K 线能补"
+            # 的情形——那种票的缺口恰恰最该补（第二遍循环专门处理它们）。
+            quote = quotes.get(code)
+            if quote is not None and _is_suspended(quote, today_date):
+                continue
+            row = conn.execute(
+                "SELECT date FROM daily_bars WHERE code = ? AND date < ? "
+                "ORDER BY date DESC LIMIT 1", (code, today)).fetchone()
+            last_date = row[0] if row else None
+            if last_date is None or last_date >= prev_day:
+                continue
+            prefetched_gaps[code] = _fetch_gap_bars(reg, code, now)
+
     with conn:                                # 跨表写入单事务
         for code in codes:
             # 只看到「今天之前」的最后一根：重复跑 eod 时昨天那根仍是除权比对的基准，
@@ -170,7 +200,15 @@ def run_eod(cfg, reg, conn, clock) -> EodReport:
                             report.gaps_deferred += 1
                     else:
                         attempted.add(code)
-                        gapped = _backfill_gap(reg, conn, code, now)
+                        # 用事务外取好的数据写入（联网已经在上面做完了）
+                        if code in prefetched_gaps:
+                            _write_gap_bars(conn, prefetched_gaps[code])
+                            gapped = True
+                            _log_gap_ok = prefetched_gaps[code] is not None
+                            if not _log_gap_ok:
+                                _log(conn, code, 0, "error", now, purpose="gap_backfill")
+                        else:
+                            gapped = False
                 if gapped:
                     report.gaps += 1
                     _clear_gap(conn, code)
@@ -233,7 +271,11 @@ def run_eod(cfg, reg, conn, clock) -> EodReport:
                     report.gaps_deferred += 1
                 continue
             attempted.add(code)
-            if _backfill_gap(reg, conn, code, now):
+            # 同第一遍：用事务外取好的数据，不再在写事务里发请求
+            if code in prefetched_gaps:
+                _write_gap_bars(conn, prefetched_gaps[code])
+                if prefetched_gaps[code] is None:
+                    _log(conn, code, 0, "error", now, purpose="gap_backfill")
                 report.gaps += 1
                 _clear_gap(conn, code)
                 filled.add(code)

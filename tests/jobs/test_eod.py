@@ -840,3 +840,36 @@ def test_resume_dates_matches_pool_for_a_weekend_end_date(env):
     assert resume_day in pool_set, "pool 侧没算出复牌日（测试前提就不成立）"
     assert eod_set == {"sh600519"}, (
         f"eod 侧认不出这只票的复牌日；pool 侧是 {pool_set}，两处口径不一致")
+
+
+def test_gap_backfill_network_happens_before_the_write_transaction(env):
+    """缺口补拉的**联网必须在写事务之外**。
+
+    `run_eod` 的事务要写几千行、跑 1～3 分钟。再把 HTTP 塞进去会让
+    SQLite 的单写者锁被占得更久——快照线程、请求记账等满 `busy_timeout`
+    就 `database is locked`，而记账钩子会把这种失败静默吞掉。
+
+    做法：在事务真正开始写入那一刻检查 `conn.in_transaction`，
+    `kline_daily` 被调用时连接不该已经在事务中。
+    """
+    env.conn.executemany(
+        "INSERT INTO daily_bars VALUES (?, 20260901, 10, 10, 10, 10, 1000, 10000, 'backfill')",
+        [("sz000001",)],
+    )
+    env.conn.commit()
+    env.reg_today.primary.pop("sz000001")       # 历史停在 09-01 = 真缺口
+
+    in_tx_at_fetch: list[bool] = []
+    source = env.reg_today.primary
+    original = source.fetch_kline_daily
+
+    def spy(code, count=1700, end=None, scope="backfill"):
+        in_tx_at_fetch.append(env.conn.in_transaction)
+        return original(code, count, end, scope)
+
+    source.fetch_kline_daily = spy
+    _run(env, env.reg_today, dt(2026, 10, 30, 15, 5))
+
+    assert in_tx_at_fetch, "缺口补拉根本没被调用（测试前提不成立）"
+    assert not any(in_tx_at_fetch), (
+        "缺口补拉的 HTTP 发生在写事务内：会把 SQLite 的写锁占得更久")

@@ -592,7 +592,10 @@ def startup_recovery(cfg, conn, clock, *, reg, tick=None, dispatcher=None, loops
         loops.start()
         out["loops_started"] = True
     # **起了循环之后就有并发写者了**：`loops.start()` 立刻拉起快照线程，
-    # 它们经 `_write_cache` 写共享连接。所以下面所有补跑/marker 写入都必须拿锁。
+    # 它们经 `_write_cache` 写共享连接。所以下面凡是要写**共享连接**的地方
+    # （marker、除权/停牌回调的写库）都走 `write_lock`。
+    # 例外是 EOD 补跑：它跑在自己的连接上（见 `_own_connection`），
+    # 事务与共享连接天然隔离，因此不持这把锁、也不会被快照线程打断。
     # （无 loops 时是 nullcontext，单测里照常可跑。）
     import contextlib
 
@@ -655,26 +658,25 @@ def startup_recovery(cfg, conn, clock, *, reg, tick=None, dispatcher=None, loops
     # 独立连接让两边的事务彻底隔离；WAL 下双方照常并发，写冲突由
     # `busy_timeout` 和 SQLite 自身的写锁串行化。
     eod_conn = _own_connection(conn)
-    if True:
-        for day in out["eod_days"]:
-            try:
-                # 用钉在该日的时钟：run_eod 只认 clock.today()，快照日期闸保证不会写错日
-                report = runner(cfg, reg, eod_conn, _DayClock(clock, day))
-            except Exception as exc:               # noqa: BLE001 —— 补跑失败停在这里并留痕
-                out["eod_failed"].append({"date": day, "error": repr(exc)})
-                break
-            if getattr(report, "skipped", False):
-                # **跳过就停**：`skipped` 的成因是「快照日期不是该日」（节假日/上游还停在
-                # 上个交易日），后续日期必然同样跳过。继续 `continue` 会把 5 天各跑一遍，
-                # 每次重启都会白发一批重复的快照请求（`job_state` 为空时必然如此）。
-                # 不写 marker 是对的（那天确实没跑成），但没必要把后面几天也试一遍。
-                out["eod_skipped"].append(day)
-                break
-            # marker 走共享连接，由共享写锁保护
-            with write_lock, conn:
-                conn.execute("INSERT OR REPLACE INTO job_state(name, value) VALUES (?, 'done')",
-                             (f"eod.{day}",))
-            out["eod_ran"].append(day)
+    for day in out["eod_days"]:
+        try:
+            # 用钉在该日的时钟：run_eod 只认 clock.today()，快照日期闸保证不会写错日
+            report = runner(cfg, reg, eod_conn, _DayClock(clock, day))
+        except Exception as exc:               # noqa: BLE001 —— 补跑失败停在这里并留痕
+            out["eod_failed"].append({"date": day, "error": repr(exc)})
+            break
+        if getattr(report, "skipped", False):
+            # **跳过就停**：`skipped` 的成因是「快照日期不是该日」（节假日/上游还停在
+            # 上个交易日），后续日期必然同样跳过。继续 `continue` 会把 5 天各跑一遍，
+            # 每次重启都会白发一批重复的快照请求（`job_state` 为空时必然如此）。
+            # 不写 marker 是对的（那天确实没跑成），但没必要把后面几天也试一遍。
+            out["eod_skipped"].append(day)
+            break
+        # marker 走共享连接，由共享写锁保护
+        with write_lock, conn:
+            conn.execute("INSERT OR REPLACE INTO job_state(name, value) VALUES (?, 'done')",
+                         (f"eod.{day}",))
+        out["eod_ran"].append(day)
 
     # refresh_actions：键不存在或距上次 ≥7 天就补跑（周日不是交易日，不能用 contains 判）
     row = conn.execute("SELECT value FROM job_state WHERE name='refresh_actions.last'").fetchone()
@@ -688,39 +690,38 @@ def startup_recovery(cfg, conn, clock, *, reg, tick=None, dispatcher=None, loops
         # 调度器永远起不来，快照线程也跟着等锁。
         #
         # 正确做法：把锁**传进**去，由回调自己在写库时持有（取数仍在锁外）。
-        if True:
-            # **`None` = 取数失败，`0` = 查到了但确实没有**。
-            # 两者必须分开：停牌返回 0 行是正常的（今天没人停牌），
-            # 而"取数失败"如果被当成成功，就会按「距上次 ≥7 天」把重试推到下周
-            # ——0.2.33 上线时正是这样，`corporate_actions` 官方行一直是 0。
-            # **先停牌后分红**：停牌只要 1 个请求，分红要 100 多个。
-            # 反过来的话，等分红那一百多个请求打完，停牌请求正好撞上上游
-            # 「服务限频」返回 isError，于是整次刷新被判失败、时间戳不盖、
-            # 下次启动从头再来一遍——实测就是这么卡住的。
-            # **停牌失败不连坐除权**：停牌只有 1 个请求，撞上个限频很容易；
-            # 若因此判定整次刷新失败、不盖时间戳，分红那边已经写进去的数据
-            # 每次启动都要重拉一遍，反而持续消耗配额、持续撞限频。
-            # 所以：除权失败才不盖戳；停牌单独记失败，下次启动再试。
-            susp = (_call_with_lock(refresh_suspensions, write_lock)
-                    if refresh_suspensions is not None else None)
-            wrote = _call_with_lock(refresh_actions, write_lock)
-            failed = wrote is None
-            if refresh_suspensions is not None and susp is None:
-                log.warning("停牌刷新取数失败（不连坐除权；除权本次写入 %s 行）", wrote)
-            # **一条都没写就不要盖时间戳**：盖了会按「距上次 ≥7 天」把重试推到下周，
-            # 而失败（取数空、账号没配、上游改结构）通常不会抛异常——0.2.33 上线时
-            # 就是这样：写入 0 行、时间戳照样落下，之后一周都不会再试一次。
-            # 不盖的话每次启动都会重试，日志里也看得出来。
-            if not failed:
-                # **盖戳本身也是写库**，必须和回调的写库串行（快照线程在用同一个 conn）
-                with write_lock, conn:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO job_state(name, value)"
-                        " VALUES ('refresh_actions.last', ?)", (str(_ymd(today)),))
-                out["refresh_actions"] = True
-            else:
-                log.warning("除权/停牌刷新取数失败（除权=%s，停牌=%s），不盖时间戳（下次启动重试）",
-                            wrote, susp)
+        # **`None` = 取数失败，`0` = 查到了但确实没有**。
+        # 两者必须分开：停牌返回 0 行是正常的（今天没人停牌），
+        # 而"取数失败"如果被当成成功，就会按「距上次 ≥7 天」把重试推到下周
+        # ——0.2.33 上线时正是这样，`corporate_actions` 官方行一直是 0。
+        # **先停牌后分红**：停牌只要 1 个请求，分红要 100 多个。
+        # 反过来的话，等分红那一百多个请求打完，停牌请求正好撞上上游
+        # 「服务限频」返回 isError，于是整次刷新被判失败、时间戳不盖、
+        # 下次启动从头再来一遍——实测就是这么卡住的。
+        # **停牌失败不连坐除权**：停牌只有 1 个请求，撞上个限频很容易；
+        # 若因此判定整次刷新失败、不盖时间戳，分红那边已经写进去的数据
+        # 每次启动都要重拉一遍，反而持续消耗配额、持续撞限频。
+        # 所以：除权失败才不盖戳；停牌单独记失败，下次启动再试。
+        susp = (_call_with_lock(refresh_suspensions, write_lock)
+                if refresh_suspensions is not None else None)
+        wrote = _call_with_lock(refresh_actions, write_lock)
+        failed = wrote is None
+        if refresh_suspensions is not None and susp is None:
+            log.warning("停牌刷新取数失败（不连坐除权；除权本次写入 %s 行）", wrote)
+        # **一条都没写就不要盖时间戳**：盖了会按「距上次 ≥7 天」把重试推到下周，
+        # 而失败（取数空、账号没配、上游改结构）通常不会抛异常——0.2.33 上线时
+        # 就是这样：写入 0 行、时间戳照样落下，之后一周都不会再试一次。
+        # 不盖的话每次启动都会重试，日志里也看得出来。
+        if not failed:
+            # **盖戳本身也是写库**，必须和回调的写库串行（快照线程在用同一个 conn）
+            with write_lock, conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO job_state(name, value)"
+                    " VALUES ('refresh_actions.last', ?)", (str(_ymd(today)),))
+            out["refresh_actions"] = True
+        else:
+            log.warning("除权/停牌刷新取数失败（除权=%s，停牌=%s），不盖时间戳（下次启动重试）",
+                        wrote, susp)
     return out
 
 
@@ -822,8 +823,9 @@ def main() -> int:                                  # pragma: no cover - 进程�
     _westock = _make_westock()
     sched, state = make_scheduler(cfg, conn, clock, loops=loops, tick=tick,
                                   dispatcher=dispatcher, reg=reg, mcp=_westock)
-    # `startup_recovery` **内部自己会加锁**（它第 3 步就 `loops.start()`，
-    # 快照线程随即开始写共享连接，所以补跑 EOD / 写 marker 都在 `loops.lock` 内）。
+    # `startup_recovery` **自己管理锁**：它先 `loops.start()` 拉起快照线程，
+    # 之后凡写共享连接的动作（marker、除权/停牌回调）都在 `loops.lock` 内；
+    # 只有 EOD 补跑例外——它用独立连接，事务与共享连接隔离。
     # 早先这里写过「调度器没起来就没有并发写者」，那是错的——漏了 `loops.start()`
     # 拉起的快照线程（Codex 用 LockSpy 观测到 lock_enters=0 且线程已启动）。
     # **心跳线程必须在启动恢复之前起**：`startup_recovery` 可能要拉几分钟的

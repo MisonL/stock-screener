@@ -33,6 +33,23 @@
 
 ## [Unreleased]
 
+### 修复
+
+终审复核（v0.2.59）指出的根本问题：
+
+- **缺口补拉的 HTTP 仍在 EOD 长事务里**。上一版加了 `_fetch_gap_bars` /
+  `_write_gap_bars` 但**没有接上**——`run_eod` 的两遍循环都还在事务内调用
+  `_backfill_gap`。EOD 事务本来就要写几千行、跑 1～3 分钟，再塞进 30 根 K 线的
+  请求，SQLite 的单写者锁被占得更久：快照线程和请求记账等满 `busy_timeout`
+  就 `database is locked`，而记账钩子还会把这种失败静默吞掉。
+
+  现在分两段：**事务外**判缺口并取数（预扫描，跳过停牌股、按 `GAP_MAX`
+  与循环同序收集），**事务内只写**。并补了测试：在 `fetch_kline_daily`
+  被调用那一刻断言 `conn.in_transaction` 为假。
+
+- 清理两处 `if True:` 死分支，并修正"补跑 EOD / 写 marker 都在 loops.lock 内"
+  这类与实际实现矛盾的注释（EOD 已改用独立连接）。
+
 ## [0.2.60] - 2026-11-17
 
 ### 修复

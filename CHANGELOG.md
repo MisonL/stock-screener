@@ -33,6 +33,8 @@
 
 ## [Unreleased]
 
+## [0.2.50] - 2026-11-16
+
 ### 新增
 
 - 收到 `SIGUSR1` 时把所有线程的调用栈打到 stderr（`faulthandler.register`）。

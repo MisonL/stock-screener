@@ -790,7 +790,7 @@ def make_refresh_hooks(mcp, cfg, conn):
         ACTIONS_MAX_REQUESTS,
         actions_cursor,
         advance_actions_cursor,
-        refresh_suspensions,
+        store_suspensions,
     )
 
     all_codes = [r[0] for r in conn.execute("SELECT code FROM stock_meta ORDER BY code")]
@@ -820,9 +820,16 @@ def make_refresh_hooks(mcp, cfg, conn):
         return written
 
     def _suspensions(lock=None):
+        """取数在锁外、写库在锁内（与 `_actions` 同一套理由）。"""
         from contextlib import nullcontext
+
+        from jobs.eod import fetch_suspensions
+
+        rows = fetch_suspensions(mcp)
+        if rows is None:
+            return None
         with (lock if lock is not None else nullcontext()):
-            return refresh_suspensions(cfg, mcp, conn, codes=all_codes)
+            return store_suspensions(conn, rows, codes=all_codes)
 
     return _actions, _suspensions
 

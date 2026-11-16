@@ -1404,3 +1404,40 @@ def test_heartbeat_thread_starts_before_startup_recovery():
     touch_at = src.index("_touch_loop")
     recovery_at = src.index("startup_recovery(")
     assert touch_at < recovery_at, "心跳线程被放在启动恢复之后：恢复期间容器会判 unhealthy"
+
+
+def test_suspensions_fetches_outside_the_write_lock(env):
+    """停牌刷新也要**锁外取数、锁内写库**。
+
+    `refresh_suspensions()` 内部会发 HTTP；直接把它放进 `with lock` 里，
+    一次请求就能把每秒的 tick 堵住好几秒（撞限频时更久）。
+    """
+    from jobs.main import make_refresh_hooks
+
+    observed: list[int] = []
+
+    class SpyLock:
+        depth = 0
+
+        def __enter__(self):
+            SpyLock.depth += 1
+            return self
+
+        def __exit__(self, *a):
+            SpyLock.depth -= 1
+            return False
+
+    lock = SpyLock()
+
+    class SpyMcp:
+        def batch_dividend(self, codes, years=10, max_requests=None, **kw):
+            return {}, set(codes)
+
+        def suspension(self, start, end):
+            observed.append(SpyLock.depth)
+            return []
+
+    _acts, susp = make_refresh_hooks(SpyMcp(), env.cfg, env.conn)
+    susp(lock)
+
+    assert observed and observed[0] == 0, f"停牌取数在锁内（深度 {observed[0]}）"

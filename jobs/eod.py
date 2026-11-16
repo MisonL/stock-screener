@@ -387,15 +387,23 @@ def _last_suspended_day(resumption, cal) -> int | None:
     return resumption - 1
 
 
+def fetch_suspensions(westock):
+    """**只取数、不写库**（纯网络）。返回 `[(code, start, 复牌日或None)]` 或 `None`。"""
+    end = datetime.now(SH).date()
+    start = end - timedelta(days=SUSPENSION_DAYS)
+    return westock.suspension(start.isoformat(), end.isoformat())
+
+
 def refresh_suspensions(cfg, westock, conn, codes=None, cal=None) -> int:
     """停牌日历（D24）：一次区间查询落 `suspension_calendar`。
 
     `codes` 给定时只保留这几只（`jobs/main.py` 传 `stock_meta` 全体，测试传单只）。
     `cal` 是交易日历，用来把复牌日换算成"最后一个停牌日"（见 `store_suspensions`）。
+
+    **会联网**：生产调度里应改用 `fetch_suspensions()` + `store_suspensions()`，
+    把请求放到写锁外面（见 `jobs/main.py::_suspensions`）。
     """
-    end = datetime.now(SH).date()
-    start = end - timedelta(days=SUSPENSION_DAYS)
-    rows = westock.suspension(start.isoformat(), end.isoformat())
+    rows = fetch_suspensions(westock)
     if rows is None:
         return None                     # 取数失败（`[]` 才是"今天没人停牌"）
     return store_suspensions(conn, rows, cal=cal, codes=codes)

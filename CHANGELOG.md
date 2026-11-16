@@ -33,6 +33,14 @@
 
 ## [Unreleased]
 
+### 修复
+
+- **停牌刷新仍然在写锁里联网**。上一轮把除权拆成了 `fetch_actions()`（锁外）+
+  `store_actions()`（锁内），但停牌那边调用的 `refresh_suspensions()` 是
+  「取数 + 写库」一体的，仍然整个跑在 `with lock` 里——一次 HTTP 就能把每秒的
+  tick 堵住好几秒，撞限频时更久。现在拆出 `fetch_suspensions()`，
+  两个刷新都遵守「锁外取数、锁内写库」。
+
 ## [0.2.46] - 2026-11-16
 
 ### 修复

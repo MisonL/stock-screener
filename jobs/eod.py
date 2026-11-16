@@ -134,24 +134,33 @@ def run_eod(cfg, reg, conn, clock) -> EodReport:
     # 这里先只读地扫一遍，结果供第二段使用。
     # 配额 `GAP_MAX` 在两遍循环里是按 `attempted` 累计的，所以预扫描也要
     # 按同样的上限收集（且顺序一致），否则第二遍会用不到已经取好的数据。
-    prefetched_gaps: dict[str, list | None] = {}
+    # **配额在这一步一次定完**，两遍循环只消费这份计划。
+    # 早先的写法是预扫描按自己的顺序选前 GAP_MAX，循环里又按另一套条件
+    # 重新认领配额——结果预取到的票被写入阶段的配额挡掉（数据白拿），
+    # 而真正没请求到的票又没留下待补标记，默认 backfill 还会按旧 ok 跳过它。
+    #
+    # 优先级照旧：第一遍只处理"快照新鲜且缺口"的票，第二遍处理
+    # "快照缺行/陈旧"的票。先按这个顺序排好候选，再按 GAP_MAX 截断。
+    gap_plan: dict[str, list | None] = {}
     if prev_day is not None:
+        first_pass: list[str] = []
+        second_pass: list[str] = []
         for code in codes:
-            if len(prefetched_gaps) >= GAP_MAX:
-                break
-            # 停牌的票今天不会有新 bar，不值得为它发一次 K 线请求。
-            # **快照缺行的票不能因此跳过**：它可能正是"上游没给快照但 K 线能补"
-            # 的情形——那种票的缺口恰恰最该补（第二遍循环专门处理它们）。
             quote = quotes.get(code)
             if quote is not None and _is_suspended(quote, today_date):
-                continue
+                continue                     # 停牌：今天不会有新 bar
             row = conn.execute(
                 "SELECT date FROM daily_bars WHERE code = ? AND date < ? "
                 "ORDER BY date DESC LIMIT 1", (code, today)).fetchone()
             last_date = row[0] if row else None
             if last_date is None or last_date >= prev_day:
-                continue
-            prefetched_gaps[code] = _fetch_gap_bars(reg, code, now)
+                continue                     # 没有缺口
+            usable_snapshot = (
+                quote is not None
+                and not _is_stale(quote, today_date, close_time, now))
+            (first_pass if usable_snapshot else second_pass).append(code)
+        for code in (first_pass + second_pass)[:GAP_MAX]:
+            gap_plan[code] = _fetch_gap_bars(reg, code, now)
 
     with conn:                                # 跨表写入单事务
         for code in codes:
@@ -189,26 +198,34 @@ def run_eod(cfg, reg, conn, clock) -> EodReport:
             # 判除权前先补昨日：缺 T-1 时 last_close 是 T-2 的收盘，拿它跟今天的 f[4] 比
             # 会把「正常涨跌 + 缺少一根」误判成除权，写出一个不存在的 snapshot_implied。
             if prev_day is not None and last_date is not None and last_date < prev_day:
-                # 配额在**发请求前**认领：失败也消耗，且同一只票两遍只试一次
                 gapped = False
-                if code not in attempted:
-                    if len(attempted) >= GAP_MAX:
-                        # **不要 `continue`**：配额只推迟「K 线补拉」，当天快照 bar
-                        # 必须照常写。用一次补拉请求换掉一天的数据，方向反了。
-                        attempted.add(code)
+                # **只有第一遍真的会处理它时才消费**：`attempted` 是两遍共享的
+                # 配额集，若在"本遍走不下去"的票上先占掉，第二遍就没机会了
+                # ——预取到的数据白拿（实测 `sh600080` 被请求但没落库）。
+                if code in gap_plan and quote is not None and not _is_stale(
+                        quote, today_date, close_time, now):
+                    attempted.add(code)
+                    bars = gap_plan[code]
+                    if bars is None:
+                        # **取数失败不是"补成功"**：记错误、留待补标记，不能进
+                        # `filled`/`_clear_gap`，否则这只票的历史缺口会从默认
+                        # 续跑范围里消失（backfill 见到旧 ok 记录就跳过）。
+                        _log(conn, code, 0, "error", now, purpose="gap_backfill")
                         if _defer_gap(conn, code, last_date, now):
                             report.gaps_deferred += 1
+                    elif _write_gap_bars(conn, bars):
+                        gapped = True
                     else:
-                        attempted.add(code)
-                        # 用事务外取好的数据写入（联网已经在上面做完了）
-                        if code in prefetched_gaps:
-                            _write_gap_bars(conn, prefetched_gaps[code])
-                            gapped = True
-                            _log_gap_ok = prefetched_gaps[code] is not None
-                            if not _log_gap_ok:
-                                _log(conn, code, 0, "error", now, purpose="gap_backfill")
-                        else:
-                            gapped = False
+                        # 上游成功但没给任何 bar：等同于没补上
+                        _log(conn, code, 0, "error", now, purpose="gap_backfill")
+                        if _defer_gap(conn, code, last_date, now):
+                            report.gaps_deferred += 1
+                elif code not in gap_plan and quote is not None and not _is_stale(
+                        quote, today_date, close_time, now):
+                    # 第一遍能处理但没进计划 = 配额不够：只留待补标记
+                    attempted.add(code)
+                    if _defer_gap(conn, code, last_date, now):
+                        report.gaps_deferred += 1
                 if gapped:
                     report.gaps += 1
                     _clear_gap(conn, code)
@@ -265,20 +282,26 @@ def run_eod(cfg, reg, conn, clock) -> EodReport:
             last_date = last_dates.get(code)
             if last_date == prev_day:
                 continue
-            if len(attempted) >= GAP_MAX:
+            if code not in gap_plan:
                 attempted.add(code)
                 if _defer_gap(conn, code, last_date, now):
                     report.gaps_deferred += 1
                 continue
             attempted.add(code)
-            # 同第一遍：用事务外取好的数据，不再在写事务里发请求
-            if code in prefetched_gaps:
-                _write_gap_bars(conn, prefetched_gaps[code])
-                if prefetched_gaps[code] is None:
-                    _log(conn, code, 0, "error", now, purpose="gap_backfill")
-                report.gaps += 1
-                _clear_gap(conn, code)
-                filled.add(code)
+            bars = gap_plan[code]
+            if bars is None:
+                _log(conn, code, 0, "error", now, purpose="gap_backfill")
+                if _defer_gap(conn, code, last_date, now):
+                    report.gaps_deferred += 1
+                continue
+            if not _write_gap_bars(conn, bars):
+                _log(conn, code, 0, "error", now, purpose="gap_backfill")
+                if _defer_gap(conn, code, last_date, now):
+                    report.gaps_deferred += 1
+                continue
+            report.gaps += 1
+            _clear_gap(conn, code)
+            filled.add(code)
 
     for code in sorted(changed | filled):
         rebuild_adj(conn, code)               # Task 10：新增 bar 必须立刻进 adj
@@ -854,14 +877,21 @@ def _fetch_gap_bars(reg, code: str, now: datetime):
     return [b for b in bars if b.date < today and (used == "tencent" or b.source == "tencent")]
 
 
-def _write_gap_bars(conn, bars) -> None:
-    """把 `_fetch_gap_bars` 拿到的 bar 落库（调用方负责事务）。"""
+def _write_gap_bars(conn, bars) -> bool:
+    """把 `_fetch_gap_bars` 拿到的 bar 落库（调用方负责事务）。
+
+    返回**是否真的写入了 bar**。上游"成功但返回空数组"也是常见形态
+    （限频、停牌、指数代码），那种情况下什么都不会落库——调用方若照旧
+    当成"补成功"，就会清掉待补标记，缺口从 default backfill 的续跑范围里消失。
+    """
     if bars:
         conn.executemany(
             "INSERT OR REPLACE INTO daily_bars(code,date,open,high,low,close,volume,amount,source) "
             "VALUES (?,?,?,?,?,?,?,?,?)",
             [(b.code, b.date, b.open, b.high, b.low, b.close, b.volume, b.amount, b.source)
              for b in bars])
+        return True
+    return False
 
 
 def _backfill_gap(reg, conn, code: str, now: datetime) -> bool:

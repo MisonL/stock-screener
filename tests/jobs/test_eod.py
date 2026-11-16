@@ -116,8 +116,13 @@ def test_gap_backfills_but_suspension_does_not(env):   # 停牌股不触发补�
     rep = _run(env, env.reg_today, dt(2026, 10, 30, 15, 5))
 
     # 缺口口径是「缺上一交易日那一根」：sz000001（历史停在 09-01）与 sh600080（历史只有 08-12）
-    # 都算真缺口；sh600519 当日在停牌集合里，不补拉。
-    assert rep.suspended == 1 and rep.gaps == 2
+    # 都算真缺口，各发一次请求；sh600519 当日在停牌集合里，不补拉。
+    #
+    # 这个 fixture 的 `gap_bars` 是空的（上游成功但没给 bar），所以**不算补齐**：
+    # `gaps` 为 0、`gaps_deferred` 计数。以前这里断言 `gaps == 2`，是把
+    # "请求发出去了"当成"缺口补上了"——那正是待补标记被误删的根源。
+    assert rep.suspended == 1 and rep.gaps == 0
+    assert rep.gaps_deferred == 2, "空结果没留下待补标记"
     calls = set(env.reg_today.primary.kline_calls)
     assert calls == {("sz000001", 30), ("sh600080", 30)}
     assert env.count("daily_bars", code="sh600519", date=20261030) == 0
@@ -873,3 +878,60 @@ def test_gap_backfill_network_happens_before_the_write_transaction(env):
     assert in_tx_at_fetch, "缺口补拉根本没被调用（测试前提不成立）"
     assert not any(in_tx_at_fetch), (
         "缺口补拉的 HTTP 发生在写事务内：会把 SQLite 的写锁占得更久")
+
+
+def test_gap_fetch_failure_keeps_the_pending_marker(env):
+    """取数失败（`None`）**不能**当成"补成功"。
+
+    失败若进 `filled`/`_clear_gap`，这只票的历史缺口就从默认续跑范围里消失了
+    （backfill 见到旧 ok 记录就跳过），T-1 永远补不回来。
+    """
+    env.conn.executemany(
+        "INSERT INTO daily_bars VALUES (?, 20260901, 10, 10, 10, 10, 1000, 10000, 'backfill')",
+        [("sz000001",)],
+    )
+    env.conn.commit()
+    env.reg_today.primary.pop("sz000001")        # 历史停在 09-01 = 真缺口
+
+    # 取数失败：假源抛上游错误（`_fetch_gap_bars` 会转成 None）
+    from core.http import UpstreamError
+
+    def boom(code, count=1700, end=None, scope="backfill"):
+        raise UpstreamError("upstream down")
+
+    env.reg_today.primary.fetch_kline_daily = boom
+    env.reg_today.fallback.fetch_kline_daily = boom
+
+    rep = _run(env, env.reg_today, dt(2026, 10, 30, 15, 5))
+
+    assert rep.gaps == 0, f"取数失败被计成补成功了：gaps={rep.gaps}"
+    assert rep.gaps_deferred >= 1, "取数失败没有留下待补标记"
+    assert env.count("gap_pending", code="sz000001") == 1, "待补标记被删掉了"
+
+
+def test_prefetched_gap_is_not_blocked_by_write_stage_quota(env, monkeypatch):
+    """**预取到的数据不能被写入阶段的配额挡掉**。
+
+    早先预扫描按自己的顺序选前 `GAP_MAX`，事务里又按另一套条件重新认领配额：
+    缺行的票在第一遍根本走不到，配额先被新鲜快照的票花光，于是
+    第二遍把已经**取回来**的那只推迟了——请求白花、数据白拿。
+
+    这里只断言核心不变量：**凡是被请求过的票，这一轮就必须真的写进库**。
+    """
+    from jobs import eod as eod_mod
+
+    # 让假源真的回 T-1 的 bar（空结果按新语义不算补齐，测不变量就没意义）
+    env.reg_today.primary.gap_bars = [
+        ("sz000001", 20261029, 10, 10, 10, 10, 1000, 10000),
+        ("sh600080", 20261029, 10, 10, 10, 10, 1000, 10000),
+        ("sh600519", 20261029, 10, 10, 10, 10, 1000, 10000),
+    ]
+    monkeypatch.setattr(eod_mod, "GAP_MAX", 2)
+    rep = _run(env, env.reg_today, dt(2026, 10, 30, 15, 5))
+
+    requested = [code for code, _n in env.reg_today.primary.kline_calls]
+    assert requested, "没有任何缺口票被请求（测试前提不成立）"
+    for code in requested:
+        assert env.count("daily_bars", code=code, date=20261029) == 1, (
+            f"{code} 被请求了但 T-1 没落库：预取结果被写入阶段的配额挡掉了"
+            f"（gaps={rep.gaps}, deferred={rep.gaps_deferred}）")

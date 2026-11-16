@@ -1,6 +1,6 @@
 {
   "name": "stock-screener-tools",
-  "version": "0.2.55",
+  "version": "0.2.56",
   "private": true,
   "description": "镜像内 westock-data-clawhub CLI（除权/停牌事件），由 jobs 通过 npx --no-install 调用",
   "dependencies": {

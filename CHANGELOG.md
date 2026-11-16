@@ -33,6 +33,8 @@
 
 ## [Unreleased]
 
+## [0.2.56] - 2026-11-17
+
 ### 修复
 
 - **两个 `resume_dates` 口径分叉**。`core/strategy/pool.py::_resume_dates` 按

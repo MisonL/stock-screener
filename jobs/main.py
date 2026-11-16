@@ -531,6 +531,28 @@ def _trace(msg: str) -> None:                       # pragma: no cover - 排障�
         pass
 
 
+def _own_connection(conn):
+    """给启动恢复的 EOD 补跑开一份**独立连接**。
+
+    共享连接是 `check_same_thread=False`，多个线程可以在它上面调用，
+    但它们**共享同一个事务状态**：一个线程 `with conn` 提交时，
+    会把另一个线程还没写完的事务一起提交掉（实测能留下半条 EOD 数据）。
+    EOD 补跑是一个跨表长事务，必须与快照线程隔离。
+    """
+    import sqlite3
+
+    row = conn.execute("PRAGMA database_list").fetchone()
+    path = row[2] if row and row[2] else None
+    if not path:
+        return conn                          # 内存库（测试）：无法隔离，退回共享连接
+    own = sqlite3.connect(path, check_same_thread=False)
+    own.row_factory = sqlite3.Row
+    own.execute("PRAGMA journal_mode = WAL")
+    own.execute("PRAGMA busy_timeout = 5000")
+    own.execute("PRAGMA foreign_keys = ON")
+    return own
+
+
 def _call_with_lock(fn, lock):
     """回调声明了参数就传 `lock`，否则原样调用。
 
@@ -616,15 +638,24 @@ def startup_recovery(cfg, conn, clock, *, reg, tick=None, dispatcher=None, loops
         from jobs.eod import run_eod as _run_eod
 
         runner = _run_eod
-    # **EOD 补跑必须锁外执行**：`run_eod` 内部会取全市场快照、还可能回填缺口，
-    # 一个交易日就要十几秒到几十秒；放进写锁里会把这些时间里的 tick 全堵死。
-    # 连接是 `check_same_thread=False` + WAL，`run_eod` 自己的写入自带 `with conn`，
-    # 不需要这把锁保护（需要串行的是 tick 与快照线程之间的写，那是另一个场景）。
+    # **EOD 补跑用独立连接，不持写锁**。
+    #
+    # 两个约束同时成立：
+    # ① 不能持锁——`run_eod` 会取全市场快照、还可能回填缺口，一个交易日
+    #    十几秒到几十秒，持锁期间每秒的 tick 全被堵死。
+    # ② 不能用**共享连接**——`check_same_thread=False` 只允许跨线程调用，
+    #    WAL 也不会为同一连接的不同线程开独立事务。`run_eod` 有一个跨表长事务，
+    #    期间若快照线程在同一连接上 `with conn` 提交，会把 EOD 的**半成品事务
+    #    一起提交掉**（实测：第一根 bar 残留、第二根回滚、adj 表为空）。
+    #
+    # 独立连接让两边的事务彻底隔离；WAL 下双方照常并发，写冲突由
+    # `busy_timeout` 和 SQLite 自身的写锁串行化。
+    eod_conn = _own_connection(conn)
     if True:
         for day in out["eod_days"]:
             try:
                 # 用钉在该日的时钟：run_eod 只认 clock.today()，快照日期闸保证不会写错日
-                report = runner(cfg, reg, conn, _DayClock(clock, day))
+                report = runner(cfg, reg, eod_conn, _DayClock(clock, day))
             except Exception as exc:               # noqa: BLE001 —— 补跑失败停在这里并留痕
                 out["eod_failed"].append({"date": day, "error": repr(exc)})
                 break
@@ -635,7 +666,7 @@ def startup_recovery(cfg, conn, clock, *, reg, tick=None, dispatcher=None, loops
                 # 不写 marker 是对的（那天确实没跑成），但没必要把后面几天也试一遍。
                 out["eod_skipped"].append(day)
                 break
-            # marker 是写共享连接，仍然要串行
+            # marker 走共享连接，由共享写锁保护
             with write_lock, conn:
                 conn.execute("INSERT OR REPLACE INTO job_state(name, value) VALUES (?, 'done')",
                              (f"eod.{day}",))

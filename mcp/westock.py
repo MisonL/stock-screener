@@ -253,10 +253,17 @@ class WestockMcp:
             #   单只票 → `{code, end, plans:[…]}`
             #   多只票 → `{sh600036: {code, end, plans:[…]}, sz002415: {…}}`
             # 判据是"顶层有没有 plans"：有就是单只，没有就按 code 键遍历。
+            # **只解析"已确认"的块**：`_codes_in` 已经校验过外层键与块内 code
+            # 一致、plans 是列表；这里若还遍历原始 `data`，混在里面的错配块
+            # 会被照样解析——数据写到别的股票上（覆盖它的既有派息），
+            # 而那只票可能根本不在本次请求里。
             if isinstance(data, dict) and "plans" in data:
-                blocks = [data]
+                blocks = [data] if _codes_in(data) else []
             elif isinstance(data, dict):
-                blocks = list(data.values())
+                blocks = [val for key, val in data.items()
+                          if isinstance(val, dict)
+                          and _normalize_code(key) in done
+                          and _normalize_code(val.get("code")) == _normalize_code(key)]
             elif isinstance(data, list):
                 blocks = data
             else:

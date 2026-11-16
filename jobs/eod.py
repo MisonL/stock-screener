@@ -792,6 +792,36 @@ def _sync_status(conn, code: str, name: str, today: int, prev_day: int | None) -
     )
 
 
+def _fetch_gap_bars(reg, code: str, now: datetime):
+    """**只取数不写库**：返回该股可落的 K 线，或 None 表示取数失败。
+
+    单独拆出来是为了让调用方能把联网放到数据库写事务**之外**：
+    `run_eod` 原来整轮都在一个 `with conn` 里，中间插一次 30 根 K 线的 HTTP，
+    事务就一直开着。WAL 下长事务会长期占住写锁，而且并发写者一旦在别的线程
+    提交，就会把这条连接里**半成品的事务一起提交**（实测复现）。
+    """
+    from core.http import ForbiddenHost, UpstreamBlocked, UpstreamError, UpstreamTimeout
+
+    try:
+        bars, used = reg.kline_daily(code, GAP_COUNT)
+    except (UpstreamError, UpstreamBlocked, UpstreamTimeout, ForbiddenHost):
+        return None
+    today = int(now.strftime("%Y%m%d"))
+    # 只写今天之前的 bar（kline_daily 会带今天盘中那根，会把刚验收的收盘覆盖成 14:00 的值）；
+    # 只写主源的 bar（新浪日线只用于校验，不落 daily_bars）。
+    return [b for b in bars if b.date < today and (used == "tencent" or b.source == "tencent")]
+
+
+def _write_gap_bars(conn, bars) -> None:
+    """把 `_fetch_gap_bars` 拿到的 bar 落库（调用方负责事务）。"""
+    if bars:
+        conn.executemany(
+            "INSERT OR REPLACE INTO daily_bars(code,date,open,high,low,close,volume,amount,source) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            [(b.code, b.date, b.open, b.high, b.low, b.close, b.volume, b.amount, b.source)
+             for b in bars])
+
+
 def _backfill_gap(reg, conn, code: str, now: datetime) -> bool:
     """单只补拉最近 30 根；上游全挂时不拖垮整轮 eod。
 

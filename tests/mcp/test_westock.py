@@ -953,3 +953,22 @@ def test_block_code_must_match_the_outer_key(env_file):
         data, done = mcp.batch_dividend(["sh600000"], chunk=1, retries=0)
         assert "sh600000" not in done, f"块内 code 不匹配仍被确认：{done}"
         assert not data, f"块内 code 不匹配仍写入了数据：{data}"
+
+
+def test_mismatched_block_is_not_parsed_even_when_others_are_valid(env_file):
+    """混在有效块里的错配块**不能被解析**（不能写到别的股票上）。
+
+    只过滤确认集是不够的：解析遍历的是原始 `data`，错配块会照样按块内
+    `code` 落库——覆盖那只票的既有派息，而它可能根本不在本次请求里。
+    """
+    plan = {"procedure": "方案实施", "exDiviDate": "20260710", "cashDiviRMB": "5.80"}
+    payload = {
+        "sh600000": {"code": "sh600002", "plans": [plan]},   # 错配：会写到 sh600002
+        "sh600036": {"code": "sh600036", "plans": []},       # 有效
+    }
+    mcp = _mcp_with(env_file, {"data_dividend": _wrapped(payload)})
+    data, done = mcp.batch_dividend(["sh600000", "sh600036"], chunk=2, retries=0)
+
+    assert "sh600002" not in data, (
+        f"错配块被解析并写到了 sh600002：{data.get('sh600002')}")
+    assert "sh600000" not in done, "错配块的外层键被确认了"

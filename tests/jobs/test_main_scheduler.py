@@ -1623,3 +1623,41 @@ def test_eod_catchup_does_not_run_inside_the_write_lock():
 
     assert held, "EOD runner 没被调用（测试前提不成立）"
     assert not any(held), "EOD 补跑是在写锁内执行的：联网期间 tick 全被堵死"
+
+
+def test_eod_catchup_uses_an_isolated_connection(tmp_path):
+    """EOD 补跑必须在**独立连接**上跑。
+
+    共享连接是 `check_same_thread=False`，多线程能调用但**共用同一个事务状态**：
+    EOD 写了一半时，快照线程在同一个连接上 `with conn` 提交，
+    会把 EOD 的半成品事务一起提交掉（实测：第一根 bar 残留、第二根回滚、
+    adj 表为空）。独立连接让两边事务彻底隔离。
+    """
+    from core.db import connect, migrate
+
+    conn = connect(tmp_path / "iso.db")
+    migrate(conn)
+    # 要有交易日历，"补跑跨日缺口"才成立
+    from tests.helpers import _trading_days_rev
+    with conn:
+        for d in _trading_days_rev(20261029, 40):
+            conn.execute(
+                "INSERT INTO daily_bars(code, date, open, high, low, close, volume,"
+                " amount, source) VALUES ('sh000300',?,3000,3000,3000,3000,0,0,'backfill')",
+                (d,))
+
+    seen: list[object] = []
+
+    def spy_runner(cfg, reg, conn_, clock):
+        seen.append(conn_)
+        return SimpleNamespace(skipped=True)
+
+    jobs_main.startup_recovery(
+        SimpleNamespace(markets=SimpleNamespace(session=SimpleNamespace(close_time="15:00"))),
+        conn, FixedClock(datetime(2026, 11, 15, 20, 0)),
+        reg=None, tick=None, dispatcher=None,
+        loops=SimpleNamespace(lock=__import__("threading").Lock(), start=lambda: None),
+        run_eod=spy_runner)
+
+    assert seen, "EOD runner 没被调用"
+    assert seen[0] is not conn, "EOD 补跑仍在共享连接上跑：事务会与快照线程交错"

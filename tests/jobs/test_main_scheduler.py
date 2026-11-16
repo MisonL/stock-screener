@@ -1512,3 +1512,22 @@ def test_suspensions_hook_uses_the_trading_calendar(env):
     assert row[0] == 20261009, (
         f"应按交易日历落成 1009（周五），实际 {row[0]}——"
         "说明生产路径没接 cal，退化成自然日 -1 了")
+
+
+def test_call_with_lock_does_not_pass_lock_to_varargs_callbacks():
+    """`*args` 形式的回调不该收到锁。
+
+    光看"参数列表非空"会把 `def f(*args)` 也算成"能接锁"，于是 lock 被塞进它的
+    args 里——那个回调拿到的是一把锁，而不是它以为的参数。
+    """
+    from jobs.main import _call_with_lock
+
+    def varargs(*args):
+        return args
+
+    def named(lock=None):
+        return lock
+
+    assert _call_with_lock(varargs, "LOCK") == ()
+    assert _call_with_lock(named, "LOCK") == "LOCK"
+    assert _call_with_lock(lambda: "ok", "LOCK") == "ok"

@@ -538,10 +538,15 @@ def _call_with_lock(fn, lock):
     报错。用 `inspect` 判一次，不做 try/except TypeError 那种会吞掉内部错误的写法。
     """
     try:
-        params = inspect.signature(fn).parameters
+        params = inspect.signature(fn).parameters.values()
     except (TypeError, ValueError):
         return fn()
-    return fn(lock) if params else fn()
+    # 只有存在"能接收一个位置参数"的形参时才传 lock。
+    # 光看"参数列表非空"会把 `*args` 形式的包装回调也算进去，
+    # 于是 lock 被塞进它的 args 里——那个回调拿到的是一把锁而不是自己想要的参数。
+    accepts_positional = any(
+        p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) for p in params)
+    return fn(lock) if accepts_positional else fn()
 
 
 def startup_recovery(cfg, conn, clock, *, reg, tick=None, dispatcher=None, loops=None,

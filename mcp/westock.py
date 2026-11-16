@@ -196,8 +196,8 @@ class WestockMcp:
 
     # ---- 除权 / 停牌（jobs 的周刷新用，不进 agent 工具集） -----------------
 
-    def batch_dividend(self, codes, years: int = 10, chunk: int = 50,
-                       backoff_s: float = 5.0, retries: int = 3):
+    def batch_dividend(self, codes, years: int = 10, chunk: int = 10,
+                       backoff_s: float = 30.0, retries: int = 2, max_requests: int | None = None):
         """多只票的分红送转，返回 `{code: [CorpAction, ...]}`。
 
         **字段名是实测出来的**（`data_dividend` 的返回，见 `_action_of`）：
@@ -220,6 +220,8 @@ class WestockMcp:
         failed_chunks = 0
         for i in range(0, len(codes), chunk):
             part = codes[i:i + chunk]
+            if max_requests is not None and i // chunk >= max_requests:
+                break                        # 本轮配额用完，剩下的下次再来
             data = self._fetch_chunk(part, years, backoff_s=backoff_s, retries=retries)
             if data is None:
                 # **单个 chunk 失败不再整体放弃**：5000 多只票要发 100 多个请求，
@@ -267,6 +269,11 @@ class WestockMcp:
 
         所以判据是**返回的票数明显少于请求数**（少于一半）就当限频，退避重试；
         重试仍不足才接受现有结果（B 股、新股本来就可能没有分红记录）。
+
+        **实测的限频规律**（决定默认 `chunk=10` / `backoff_s=30`）：
+        一次请求里塞多少只票都只返回一小部分（200 只 → 46 只，400 只 → 21 只），
+        10 只一批则稳定满额；连续发到第 8–10 个请求就开始返回空，
+        冷却约 60 秒后恢复。所以**单次调用拉不完全市场**，调用方要分轮推进。
         """
         want = len(part)
         best: dict | None = None

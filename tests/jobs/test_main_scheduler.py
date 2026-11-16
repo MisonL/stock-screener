@@ -1063,7 +1063,7 @@ def test_refresh_hooks_wire_when_capability_present(env):
     from jobs.main import make_refresh_hooks
 
     class Fake:
-        def batch_dividend(self, codes, years=10):
+        def batch_dividend(self, codes, years=10, max_requests=None, **kw):
             return {}
 
         def suspension(self, start, end):

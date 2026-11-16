@@ -281,6 +281,22 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
         with _write_lock(loops):
             return renew_if_needed(conn, clock, runner, dispatcher=dispatcher, **kwargs)
 
+    def actions_refresh_job():
+        """滚动推进除权/停牌刷新（每轮一小段，见 `make_refresh_hooks`）。"""
+        refine_actions, refine_susp = make_refresh_hooks(mcp, cfg, conn)
+        if refine_actions is None:
+            return
+        from jobs.eod import refresh_suspensions
+        try:
+            n = refine_actions()
+            # 停牌很便宜（1 个请求），每轮顺手带上
+            refine_susp() if refine_susp is not None else None
+        except Exception as exc:                                  # noqa: BLE001
+            log.warning("除权/停牌滚动刷新异常：%s: %s", type(exc).__name__, exc)
+            return
+        if n is not None:
+            log.info("除权滚动刷新：本段写入 %s 行", n)
+
     def westock_import_job():
         """09:00：手机自选股单向导入 `watch_stock(source='westock')`（只增不改）。"""
         if mcp is None:
@@ -358,6 +374,19 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
     sched.add_job(westock_import_job,
                   CronTrigger(hour=9, minute=0, day_of_week="mon-fri", timezone=SH),
                   id="westock_import", **JOB_DEFAULTS)
+    # **除权/停牌滚动刷新**：上游限频决定了一次拉不完全市场（实测连发 8–10 个
+    # 请求就限频、单次返回也残缺），所以每 30 分钟推进一小段（游标见
+    # `jobs/eod.py::actions_cursor`），几天滚完一遍全市场。避开 09:25–15:10
+    # 的盘中时段——那时行情请求优先，别抢同一个限频额度。
+    sched.add_job(actions_refresh_job,
+                  CronTrigger(hour="8-9,15-23", minute="*/30", day_of_week="mon-fri",
+                              timezone=SH),
+                  id="actions_refresh", **JOB_DEFAULTS)
+    # 周末大盘不动但上游额度照样刷新：周末也推进，尽快补齐缺口
+    sched.add_job(actions_refresh_job,
+                  CronTrigger(hour="8-23", minute="15", day_of_week="sat,sun",
+                              timezone=SH),
+                  id="actions_refresh_weekend", **JOB_DEFAULTS)
     state["arm_startup_renew"] = arm_startup_renew
     return sched, state
 
@@ -709,15 +738,28 @@ def make_refresh_hooks(mcp, cfg, conn):
                     "、".join(missing))
         return None, None
 
-    from jobs.eod import refresh_actions, refresh_suspensions
+    from jobs.eod import (
+        ACTIONS_MAX_REQUESTS,
+        actions_cursor,
+        advance_actions_cursor,
+        refresh_actions,
+        refresh_suspensions,
+    )
 
-    codes = [r[0] for r in conn.execute("SELECT code FROM stock_meta ORDER BY code")]
+    all_codes = [r[0] for r in conn.execute("SELECT code FROM stock_meta ORDER BY code")]
 
     def _actions():
-        return refresh_actions(cfg, mcp, conn, codes)
+        # 一轮只拉游标之后的一小段（上游限频决定了一次拉不完），下一轮接着走
+        batch = actions_cursor(conn, all_codes)[: ACTIONS_MAX_REQUESTS * 10]
+        written = refresh_actions(cfg, mcp, conn, batch,
+                                  max_requests=ACTIONS_MAX_REQUESTS)
+        if written is None:
+            return None                      # 失败：游标不动，下次重试同一段
+        advance_actions_cursor(conn, all_codes, batch)
+        return written
 
     def _suspensions():
-        return refresh_suspensions(cfg, mcp, conn, codes=codes)
+        return refresh_suspensions(cfg, mcp, conn, codes=all_codes)
 
     return _actions, _suspensions
 

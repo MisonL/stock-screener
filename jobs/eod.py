@@ -244,12 +244,14 @@ def run_eod(cfg, reg, conn, clock) -> EodReport:
 # ---- 周期任务（jobs/main.py 调度） ---------------------------------------
 
 
-def refresh_actions(cfg, westock, conn, codes) -> int:
-    """全量重拉 `dividend --years 10`，覆盖同日的 `snapshot_implied`。
+def refresh_actions(cfg, westock, conn, codes, max_requests: int | None = None) -> int:
+    """重拉 `dividend --years 10`，覆盖同日的 `snapshot_implied`。
 
-    **没有周期触发器**：只由 `startup_recovery` 在「距上次 ≥7 天」时补跑。
+    **一次调用拉不完全市场**：上游单次请求只返回一小部分票（实测 10 只一批才
+    稳定满额），且连发 8–10 个请求就限频。所以这里按 `max_requests` 限量，
+    配合 `refresh_actions.next` 游标分轮推进（见 `advance_actions_cursor`）。
     """
-    actions = westock.batch_dividend(list(codes), years=10)
+    actions = westock.batch_dividend(list(codes), years=10, max_requests=max_requests)
     if actions is None:
         return None                     # 取数失败：让调用方不要盖"已完成"时间戳
     written = 0
@@ -270,6 +272,55 @@ def refresh_actions(cfg, westock, conn, codes) -> int:
                 )
                 written += 1
     return written
+
+
+#: 每轮最多发几个请求。上游实测连发 8–10 个就限频，取 6 留余量。
+ACTIONS_MAX_REQUESTS = 6
+
+
+def actions_cursor(conn, codes) -> list:
+    """按游标取出「本轮要拉的那一段」股票代码。
+
+    全市场 5000 多只、每轮只能发 6 个请求（60 只），一次拉完不可能。
+    游标存在 `job_state('refresh_actions.next')`，每轮从上次停下的地方继续，
+    走到末尾就从头开始——滚动刷新，循环覆盖全市场。
+    """
+    codes = sorted(codes)
+    if not codes:
+        return []
+    row = conn.execute("SELECT value FROM job_state WHERE name='refresh_actions.next'").fetchone()
+    start_code = str(row[0]) if row and row[0] else codes[0]
+    # 游标可能指向已退市的代码：用二分找出第一个 >= 游标的
+    lo, hi = 0, len(codes)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if codes[mid] < start_code:
+            lo = mid + 1
+        else:
+            hi = mid
+    if lo >= len(codes):
+        lo = 0                                # 到末尾了，从头上绕回去
+    return codes[lo:]
+
+
+def advance_actions_cursor(conn, codes, pulled) -> None:
+    """按本轮实际拉到的数量前移游标（`pulled` 为代码列表）。"""
+    codes = sorted(codes)
+    if not codes:
+        return
+    if not pulled or len(pulled) >= len(codes):
+        nxt = codes[0]                        # 一轮走完了，回到起点
+    else:
+        last = max(pulled)
+        try:
+            idx = codes.index(last) + 1
+        except ValueError:
+            idx = 0
+        nxt = codes[idx] if idx < len(codes) else codes[0]
+    with conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO job_state(name, value) VALUES ('refresh_actions.next', ?)",
+            (nxt,))
 
 
 def refresh_suspensions(cfg, westock, conn, codes=None) -> int:

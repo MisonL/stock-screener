@@ -542,3 +542,38 @@ def test_deferred_gap_still_appends_today_bar(env):
     assert rep.gaps_deferred >= 1
     assert env.count("daily_bars", code="sz000001", date=20261030) == 1, \
         "补拉被推迟，但当天快照 bar 也一起丢了"
+
+
+def test_actions_cursor_walks_the_whole_list_then_wraps(env):
+    """游标滚动推进：每轮从上次停下的地方继续，走到末尾后回到开头。
+
+    全市场 5000 多只、每轮只能发 6 个请求（上游限频），一次拉完不可能。
+    游标让"每 30 分钟推进一段"能真正覆盖全市场，而不是每次都从头拉同一批。
+    """
+    from jobs.eod import actions_cursor, advance_actions_cursor
+
+    codes = [f"sh60{i:04d}" for i in range(1, 21)]        # 20 只
+    assert actions_cursor(env.conn, codes)[0] == codes[0]  # 无游标：从头开始
+
+    advance_actions_cursor(env.conn, codes, codes[:10])
+    rest = actions_cursor(env.conn, codes)
+    assert rest[0] == codes[10], f"第二轮应从第 11 只开始，实际 {rest[0]}"
+
+    advance_actions_cursor(env.conn, codes, rest)          # 走完剩余
+    assert actions_cursor(env.conn, codes)[0] == codes[0], "走完应绕回开头"
+
+    # **只走一轮就该绕回**：游标落在最后一只时，下一轮必须回到开头，
+    # 否则最后那段永远拉不到（round-robin 变成"卡在末尾"）。
+    advance_actions_cursor(env.conn, codes, codes[-1:])
+    assert actions_cursor(env.conn, codes)[0] == codes[0], "走到最后一只后没有绕回"
+
+
+def test_actions_cursor_recovers_when_its_code_is_delisted(env):
+    """游标指向的代码退市后，不能卡死——按顺序取第一个更大的。"""
+    from jobs.eod import actions_cursor
+
+    with env.conn:
+        env.conn.execute("INSERT OR REPLACE INTO job_state(name, value)"
+                         " VALUES ('refresh_actions.next', 'sh600999')")
+    codes = ["sh600000", "sh600001", "sh600002"]
+    assert actions_cursor(env.conn, codes) == codes, "游标越界应回到开头"

@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
+import contextlib
 import threading
 
 import pytest
@@ -1531,3 +1532,48 @@ def test_call_with_lock_does_not_pass_lock_to_varargs_callbacks():
     assert _call_with_lock(varargs, "LOCK") == ()
     assert _call_with_lock(named, "LOCK") == "LOCK"
     assert _call_with_lock(lambda: "ok", "LOCK") == "ok"
+
+
+def test_startup_recovery_does_not_deadlock_on_the_real_non_reentrant_lock(env):
+    # env 的 db 会被同一模块里前面的测试写脏（时间戳挡住了 due 分支），先清掉
+    """启动恢复**不能**在外层持锁后再调回调——生产锁是 `threading.Lock()`。
+
+    回调遵循 `f(lock=None)` 契约，会在写库那一步自己取锁。启动恢复若先
+    `with write_lock` 再调回调，同一线程二次取得不可重入锁 = 死锁，
+    而 `sched.start()` 在恢复之后：主线程一卡，调度器永远起不来。
+
+    这条测试用**真实的 threading.Lock**（不是 RLock、不是假锁），
+    并用超时守护，卡住会直接失败而不是挂住整个测试会话。
+    """
+    import threading as _threading
+
+    with env.conn:
+        env.conn.execute("DELETE FROM job_state WHERE name='refresh_actions.last'")
+    real_lock = _threading.Lock()          # 与 jobs/intraday.py 生产锁同类
+    loops = SimpleNamespace(lock=real_lock, start=lambda: None)
+    fired = []
+
+    def actions(lock=None):
+        # 模拟真实回调：写库那一步才取锁
+        with (lock if lock is not None else contextlib.nullcontext()):
+            fired.append("actions")
+        return 7
+
+    def susp(lock=None):
+        with (lock if lock is not None else contextlib.nullcontext()):
+            fired.append("susp")
+        return 2
+
+    done = []
+    t = _threading.Thread(target=lambda: done.append(jobs_main.startup_recovery(
+        env.cfg, env.conn, FixedClock(datetime(2026, 11, 15, 20, 0)),
+        reg=None, tick=None, dispatcher=None, loops=loops,
+        refresh_actions=actions, refresh_suspensions=susp)))
+    t.daemon = True
+    t.start()
+    t.join(timeout=10)
+
+    assert not t.is_alive(), (
+        "启动恢复 10 秒未返回：外层持锁 + 回调再取同一把不可重入锁 = 死锁")
+    assert fired == ["susp", "actions"], f"回调未按序执行：{fired}"
+    assert done and done[0]["refresh_actions"] is True

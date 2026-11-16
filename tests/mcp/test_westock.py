@@ -844,3 +844,46 @@ def test_nonzero_bonus_ratio_is_also_divided_by_ten(env_file):
     action = got["sz000001"][0]
     assert action.bonus_ratio == pytest.approx(0.8), \
         f"10送8股应是每股 0.8，实际 {action.bonus_ratio}（漏了 /10 会得 8.0）"
+
+
+def test_error_envelope_with_payload_data_is_not_treated_as_success(env_file):
+    """业务失败的壳里**带着 data** 时，不能被当成成功。
+
+    `{"ok":false,"msg":"服务限频","data":{...}}` 若先剥壳再查 `ok`，
+    失败标记就丢了，被当成"这些票没分红"——静默丢数据，还会推进游标。
+    """
+    poisoned = {"sh600036": {"code": "sh600036", "plans": [
+        {"cashDiviRMB": "5.80", "exDiviDate": "20260710", "procedure": "方案实施"}]}}
+    mcp = _mcp_with(env_file, {"data_dividend": {"ok": False, "msg": "服务限频",
+                                                 "data": poisoned}})
+    data, done = mcp.batch_dividend(["sh600036"], chunk=1, retries=0)
+    assert data is None, "带 data 的业务失败信封被当成了成功"
+    assert done == set(), f"失败返回却确认了代码：{done}"
+
+
+def test_null_entry_is_not_confirmed(env_file):
+    """`{"sh600000": null}` 是坏数据，不能算"确认处理"（否则游标跳过这只票）。"""
+    mcp = _mcp_with(env_file, {"data_dividend": _wrapped({"sh600000": None})})
+    data, done = mcp.batch_dividend(["sh600000"], chunk=1, retries=0)
+    assert "sh600000" not in done, "null 条目被算成已确认"
+
+
+def test_single_stock_shape_is_counted_as_one_stock_not_three_fields(env_file):
+    """单股票结构 `{code,end,plans}` 有 3 个字段，但只是**一只票**。
+
+    按 `len()` 计票会算成 3，于是一只票的残缺返回也能"够数"，
+    直接跳过"不足一半就退避"的判断——限频残缺就不会重试了。
+    """
+    # 请求 4 只，只回 1 只（单股票结构）
+    http = FakeHttp({"data_dividend": _wrapped(
+        {"code": "sh600036", "end": "2026-11-15", "plans": []})})
+    mcp = WestockMcp(env_path=env_file, http=http, sleep=lambda _s: None,
+                     clock=FixedClock(datetime(2026, 11, 15, 10, 0)))
+    _data, done = mcp.batch_dividend(
+        ["sh600036", "sh600000", "sz000002", "sh601398"],
+        chunk=4, retries=1, backoff_s=0)
+
+    assert len(http.calls) >= 2, (
+        f"只发了 {len(http.calls)} 次请求：单股票结构被按 3 个字段计票，"
+        "误判成『够数』，没有退避重试")
+    assert done == {"sh600036"}

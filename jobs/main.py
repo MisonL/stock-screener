@@ -642,8 +642,13 @@ def startup_recovery(cfg, conn, clock, *, reg, tick=None, dispatcher=None, loops
     # **必须按日期差**：YYYYMMDD 当整数减，20261101-20261031 = 70，跨月会被误判成「满 7 天」
     due = last_refresh is None or _days_between(_ymd(today), last_refresh) >= 7
     if due and refresh_actions is not None:
-        # 同 EOD 补跑：`loops.start()` 之后快照线程已在写共享连接，这里也必须持锁
-        with write_lock:
+        # **这里不能先 `with write_lock` 再调回调**：回调遵循 `f(lock=None)` 契约，
+        # 会在**写库那一步**自己取这把锁；而生产锁是 `threading.Lock()`（不可重入），
+        # 同线程二次取得就死锁——`sched.start()` 在恢复之后，主线程一卡，
+        # 调度器永远起不来，快照线程也跟着等锁。
+        #
+        # 正确做法：把锁**传进**去，由回调自己在写库时持有（取数仍在锁外）。
+        if True:
             # **`None` = 取数失败，`0` = 查到了但确实没有**。
             # 两者必须分开：停牌返回 0 行是正常的（今天没人停牌），
             # 而"取数失败"如果被当成成功，就会按「距上次 ≥7 天」把重试推到下周
@@ -667,7 +672,8 @@ def startup_recovery(cfg, conn, clock, *, reg, tick=None, dispatcher=None, loops
             # 就是这样：写入 0 行、时间戳照样落下，之后一周都不会再试一次。
             # 不盖的话每次启动都会重试，日志里也看得出来。
             if not failed:
-                with conn:
+                # **盖戳本身也是写库**，必须和回调的写库串行（快照线程在用同一个 conn）
+                with write_lock, conn:
                     conn.execute(
                         "INSERT OR REPLACE INTO job_state(name, value)"
                         " VALUES ('refresh_actions.last', ?)", (str(_ymd(today)),))

@@ -314,10 +314,20 @@ class WestockMcp:
                     return None, waited, set()   # token 没了，重试也没用
                 data = None
             else:
-                data = _unwrap(resp.get("data"))
-                if isinstance(data, dict) and data.get("ok") is False:
-                    data = None              # 业务层失败（服务限频）≠ 空结果
-            got = len(data) if isinstance(data, dict) else 0
+                # **先看业务成功标记，再剥壳**：顺序反了的话
+                # `{"ok":false,"msg":"服务限频","data":{...}}` 剥壳后只剩 data，
+                # 失败标记丢失，就被当成"这些票没分红"——静默丢数据。
+                raw = resp.get("data")
+                if isinstance(raw, dict) and raw.get("ok") is False:
+                    data = None
+                else:
+                    data = _unwrap(raw)
+                    if isinstance(data, dict) and data.get("ok") is False:
+                        data = None
+            # **计票要按"股票"而不是按"键"**：单股票结构 `{code,end,plans}`
+            # 有 3 个字段，`len()` 会算成 3 票，于是一只票的残缺返回也能"够数"，
+            # 直接跳过"不足一半就退避"的判断。
+            got = len(_codes_in(data)) if isinstance(data, dict) else 0
             if got * 2 >= want:
                 return data, waited, _codes_in(data)     # 够数，直接用
             # 不足一半：优先保留拿到最多的那次（残缺也比没有强）
@@ -554,12 +564,28 @@ def _codes_in(data) -> set[str]:
     """
     if not isinstance(data, dict):
         return set()
-    # 单只票：`{code, end, plans}`
+    # 单只票：`{code, end, plans}`。
+    # **`plans` 必须是列表**：坏结构（缺 plans、plans 是字符串/None）不能算"确认处理"，
+    # 否则它会被写进 done 集合、推进游标，把这只票永久跳过去。
     if "plans" in data:
+        if not isinstance(data.get("plans"), list):
+            return set()
         one = _normalize_code(data.get("code"))
         return {one} if one else set()
-    # 多只票：以 code 为键的字典
-    return {c for c in (_normalize_code(k) for k in data) if c}
+    # 多只票：以 code 为键的字典；value 必须是含 plans 列表的字典或 None
+    out: set[str] = set()
+    for key, val in data.items():
+        code = _normalize_code(key)
+        if not code:
+            continue
+        if val is None:
+            continue                    # `{"sh600000": null}` 是坏数据，不算确认
+        if isinstance(val, dict) and "plans" in val and not isinstance(val.get("plans"), list):
+            continue
+        if not isinstance(val, (dict, list)):
+            continue
+        out.add(code)
+    return out
 
 
 def _unwrap(data):

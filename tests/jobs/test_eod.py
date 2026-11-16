@@ -729,3 +729,72 @@ def test_suspension_stays_open_when_there_is_no_bar_evidence(env):
 
     assert env.one("suspension_calendar", code=code)["end_date"] is None, \
         "没有成交证据却闭合了停牌区间：伪造了复牌日"
+
+
+def test_zero_volume_bar_is_not_resumption_evidence(env):
+    """**零成交量的 bar 不能当复牌证据**。
+
+    停牌期间有的数据源仍会给一根 volume=0 / amount=0 的占位 bar
+    （`core/datasource/tencent.py` 接受零量）。拿它当复牌会伪造复牌日，
+    还会把停牌天数少算——`suspended_250` 偏低，本该剔除的票留在池里。
+    """
+    from jobs.eod import store_suspensions
+
+    code = "sh600519"
+    with env.conn:
+        for d in (20261013, 20261014, 20261015, 20261016, 20261017):
+            env.conn.execute(
+                "INSERT OR REPLACE INTO daily_bars(code, date, open, high, low, close,"
+                " volume, amount, source) VALUES ('sh000300',?,10,10,10,10,1,1,'tencent')",
+                (d,))
+        # 占位 bar：有日期但零成交
+        env.conn.execute(
+            "INSERT OR REPLACE INTO daily_bars(code, date, open, high, low, close,"
+            " volume, amount, source) VALUES (?,20261016,10,10,10,10,0,0,'tencent')",
+            (code,))
+
+    store_suspensions(env.conn, [(code, 20261013, None)])
+
+    assert env.one("suspension_calendar", code=code)["end_date"] is None, \
+        "零成交量的占位 bar 被当成了复牌证据"
+
+
+def test_cursor_three_arg_calls_continue_from_saved_position(env):
+    """连续两次三参调用必须**接着上一轮**走，不能回到开头重算。
+
+    这是旧的滚动调用方式；`start=None` 若被实现成"从头算连续前缀"，
+    第二轮会把已经确认过的开头再算一遍，游标原地踏步。
+    """
+    from jobs.eod import advance_actions_cursor
+
+    codes = [f"sh60000{i}" for i in range(5)]
+    advance_actions_cursor(env.conn, codes, codes[:2])
+    advance_actions_cursor(env.conn, codes, codes[2:4])
+
+    row = env.conn.execute(
+        "SELECT value FROM job_state WHERE name='refresh_actions.next'").fetchone()
+    assert row[0] == codes[4], f"第二轮应推进到 {codes[4]}，实际 {row[0]}"
+
+
+def test_cursor_stays_at_start_when_nothing_confirmed(env):
+    """空确认集时游标**不动**，留在本轮起点，不要归零重来。"""
+    from jobs.eod import advance_actions_cursor
+
+    codes = [f"sh60000{i}" for i in range(5)]
+    advance_actions_cursor(env.conn, codes, [], start=codes[2])
+
+    row = env.conn.execute(
+        "SELECT value FROM job_state WHERE name='refresh_actions.next'").fetchone()
+    assert row[0] == codes[2], f"空确认集应停在 {codes[2]}，实际 {row[0]}"
+
+
+def test_cursor_handles_a_retired_start_code(env):
+    """起点代码已退市（不在当前列表里）时要按二分定位，而不是从头开始。"""
+    from jobs.eod import advance_actions_cursor
+
+    codes = ["sh600000", "sh600002", "sh600004"]
+    advance_actions_cursor(env.conn, codes, ["sh600002"], start="sh600001")
+
+    row = env.conn.execute(
+        "SELECT value FROM job_state WHERE name='refresh_actions.next'").fetchone()
+    assert row[0] == "sh600004", f"应推进到 sh600004，实际 {row[0]}"

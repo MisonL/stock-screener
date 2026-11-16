@@ -304,6 +304,7 @@ class WestockMcp:
         """
         want = len(part)
         best: dict | None = None
+        best_count = 0
         waited = 0.0
         for attempt in range(retries + 1):
             resp = self._rpc(MCP_TOOLS["dividend"],
@@ -330,9 +331,13 @@ class WestockMcp:
             got = len(_codes_in(data)) if isinstance(data, dict) else 0
             if got * 2 >= want:
                 return data, waited, _codes_in(data)     # 够数，直接用
-            # 不足一半：优先保留拿到最多的那次（残缺也比没有强）
-            if best is None or got > len(best):
+            # 不足一半：优先保留拿到最多的那次（残缺也比没有强）。
+            # **比较也要按股票数**：`len(best)` 对单股票结构是字段数，
+            # 会出现"2 只的响应比不过 1 只（3 个字段）的响应"，
+            # 把更好的重试结果丢弃。
+            if best is None or got > best_count:
                 best = data if isinstance(data, dict) else best
+                best_count = got
             delay = backoff_s * (attempt + 1)
             if budget_s is not None and waited + delay > budget_s:
                 break                            # 预算用完，不再退避
@@ -572,17 +577,17 @@ def _codes_in(data) -> set[str]:
             return set()
         one = _normalize_code(data.get("code"))
         return {one} if one else set()
-    # 多只票：以 code 为键的字典；value 必须是含 plans 列表的字典或 None
+    # 多只票：以 code 为键的字典。
+    # **value 必须是含 plans 列表的字典**——`_action_of` 只认这个形状，
+    # 所以"确认"也必须用同一套判定：缺 plans 的字典、任意列表、null、
+    # plans 非列表一律不算确认（否则游标会跳过这只票，把"没拿到可用结构"
+    # 当成"查到且无分红"）。
     out: set[str] = set()
     for key, val in data.items():
         code = _normalize_code(key)
-        if not code:
+        if not code or not isinstance(val, dict):
             continue
-        if val is None:
-            continue                    # `{"sh600000": null}` 是坏数据，不算确认
-        if isinstance(val, dict) and "plans" in val and not isinstance(val.get("plans"), list):
-            continue
-        if not isinstance(val, (dict, list)):
+        if not isinstance(val.get("plans"), list):
             continue
         out.add(code)
     return out

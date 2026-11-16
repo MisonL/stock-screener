@@ -347,25 +347,59 @@ def advance_actions_cursor(conn, codes, pulled, start=None) -> None:
     codes = sorted(codes)
     if not codes:
         return
-    pulled = {c for c in (pulled or ()) if c in set(codes)}
-    if not pulled or (start is None and len(pulled) >= len(codes)):
-        nxt = codes[0]                        # 一轮走完了，回到起点
+    code_set = set(codes)
+    pulled = {c for c in (pulled or ()) if c in code_set}
+
+    # **起点**：显式给了就用它；没给就沿用已保存的游标（不是"从头算"）。
+    # 后者是兼容旧的"直接三参调用"：连续两轮调用时，第二轮必须接着第一轮的
+    # 结果往后走，而不是回到开头重算。
+    if start is None:
+        row = conn.execute(
+            "SELECT value FROM job_state WHERE name = 'refresh_actions.next'").fetchone()
+        cursor = str(row[0]) if row and row[0] else None
+        # 游标可能指向已退市代码：用二分找第一个 >= 游标的，与 `actions_cursor` 同口径
+        begin = len(codes)
+        if cursor:
+            i, j = 0, len(codes)
+            while i < j:
+                mid = (i + j) // 2
+                if codes[mid] < cursor:
+                    i = mid + 1
+                else:
+                    j = mid
+            begin = i
+        if begin >= len(codes):
+            begin = 0                    # 游标已经走到末尾：从头开始
     else:
-        begin = 0
-        if start is not None:
-            try:
-                begin = codes.index(start)
-            except ValueError:
-                begin = 0
-        # 从 begin 往后找最长连续命中，第一次断点就停
-        idx = begin
-        while idx < len(codes) and codes[idx] in pulled:
-            idx += 1
-        if idx == begin:
-            # 起点本身就没拿到：游标不动，下次重试同一段
-            nxt = codes[begin]
-        else:
-            nxt = codes[idx] if idx < len(codes) else codes[0]
+        begin = len(codes)
+        i, j = 0, len(codes)
+        while i < j:
+            mid = (i + j) // 2
+            if codes[mid] < start:
+                i = mid + 1
+            else:
+                j = mid
+        begin = i if i < len(codes) else 0   # 起点不存在（退市）：从头开始
+
+    if not pulled:
+        # **空确认集时游标不动**：留在本轮起点，下次重试同一段。
+        # （原来直接归零回 `codes[0]`，等于把已经走过的部分又重头拉一遍。）
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO job_state(name, value) VALUES ('refresh_actions.next', ?)",
+                (codes[begin],))
+        return
+
+    # 从 begin 往后找最长连续命中，遇到第一个断点就停
+    idx = begin
+    while idx < len(codes) and codes[idx] in pulled:
+        idx += 1
+    if idx == begin:
+        nxt = codes[begin]                   # 起点本身没拿到：不动
+    elif idx < len(codes):
+        nxt = codes[idx]                     # 停在断点
+    else:
+        nxt = codes[0]                       # 整段连续确认到底：回到起点
     with conn:
         conn.execute(
             "INSERT OR REPLACE INTO job_state(name, value) VALUES ('refresh_actions.next', ?)",
@@ -420,11 +454,17 @@ def _close_resumed_from_bars(conn) -> int:
         return 0
     closed = 0
     for code, start in rows:
+        # **必须有成交量才算"恢复交易"**：停牌期间有的数据源仍会给一根
+        # volume=0 / amount=0 的占位 bar（`core/datasource/tencent.py` 接受零量），
+        # 拿它当复牌证据会伪造复牌日，且把停牌天数少算——`suspended_250`
+        # 偏低会让本该剔除的票留在池里。
+        # 只看 volume 不看 amount：部分数据源本来就没有成交额。
         first_bar = conn.execute(
-            "SELECT min(date) FROM daily_bars WHERE code = ? AND date > ?",
+            "SELECT min(date) FROM daily_bars"
+            " WHERE code = ? AND date > ? AND volume > 0",
             (code, int(start))).fetchone()
         if not first_bar or first_bar[0] is None:
-            continue                    # 还没看到成交：保持 NULL（仍在停牌/无证据）
+            continue                    # 还没有可信成交：保持 NULL（仍在停牌/无证据）
         resumed = int(first_bar[0])
         last_suspended = _last_trading_day_before(conn, resumed)
         if last_suspended is None or last_suspended < int(start):

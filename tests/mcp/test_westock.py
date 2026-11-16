@@ -25,6 +25,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from types import SimpleNamespace
+
 import pytest
 
 from core.clock import FixedClock
@@ -887,3 +889,48 @@ def test_single_stock_shape_is_counted_as_one_stock_not_three_fields(env_file):
         f"只发了 {len(http.calls)} 次请求：单股票结构被按 3 个字段计票，"
         "误判成『够数』，没有退避重试")
     assert done == {"sh600036"}
+
+
+def test_multi_stock_block_without_plans_is_not_confirmed(env_file):
+    """缺 `plans` 的多股票块不能被确认。
+
+    `_action_of` 只认 `{"code","plans":[...]}` 这个形状；"确认"若用更松的判定，
+    游标就会跳过这只票，把"没拿到可用结构"当成"查到且无分红"。
+    """
+    for bad_value in ({"code": "sh600000", "end": "2026-11-15"}, {}, []):
+        mcp = _mcp_with(env_file, {"data_dividend": _wrapped({"sh600000": bad_value})})
+        _data, done = mcp.batch_dividend(["sh600000"], chunk=1, retries=0)
+        assert "sh600000" not in done, f"坏结构 {bad_value!r} 被算成已确认"
+
+
+def test_retry_keeps_the_better_response_by_stock_count(env_file):
+    """重试要保留**股票数更多**的那次，即使字段数更少。
+
+    `len(dict)` 对单股票结构是字段数：会出现"2 只的响应比不过 1 只（3 个字段）"，
+    把更好的重试结果丢掉。
+    """
+    responses = [
+        _wrapped({"code": "sh600000", "end": "2026-11-15", "plans": []}),   # 1 只/3 个字段
+        _wrapped({"sh600000": {"code": "sh600000", "plans": []},
+                  "sh600001": {"code": "sh600001", "plans": []}}),          # 2 只/2 个字段
+    ]
+    http = FakeHttp({"data_dividend": responses[0]})
+    calls = {"n": 0}
+
+    def post(url, json=None, headers=None, timeout=None, **kw):     # noqa: A002
+        resp = http.post(url, json=json, headers=headers, timeout=timeout)
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            return FakeHttp({"data_dividend": responses[1]}).post(
+                url, json=json, headers=headers, timeout=timeout)
+        return resp
+
+    mcp = WestockMcp(env_path=env_file, http=SimpleNamespace(post=post),
+                     sleep=lambda _s: None,
+                     clock=FixedClock(datetime(2026, 11, 15, 10, 0)))
+    _data, done = mcp.batch_dividend(
+        ["sh600000", "sh600001", "sh600002", "sh600003", "sh600004", "sh600005"],
+        chunk=6, retries=1, backoff_s=0)
+
+    assert done == {"sh600000", "sh600001"}, (
+        f"重试结果被丢弃了：确认集 {done}（应保留 2 只的那次响应）")

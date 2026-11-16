@@ -33,6 +33,15 @@
 
 ## [Unreleased]
 
+### 修复
+
+- **滚动刷新的网络请求原本在写锁内，会把每秒的 tick 全堵住**：一次取数要发
+  6 个请求还带退避（撞限频时 30 秒起）。现在拆成 `fetch_actions()`（锁外）+
+  `store_actions()`（锁内），并用
+  `test_actions_refresh_job_fetches_outside_the_write_lock` 钉住这个不变式
+  （`test_members_job_does_not_fetch_inside_the_lock` 记录过同类故障：
+  心跳等锁超 30 秒导致 `maximum number of running instances reached`）。
+
 ## [0.2.41] - 2026-11-16
 
 ### 文档

@@ -244,16 +244,18 @@ def run_eod(cfg, reg, conn, clock) -> EodReport:
 # ---- 周期任务（jobs/main.py 调度） ---------------------------------------
 
 
-def refresh_actions(cfg, westock, conn, codes, max_requests: int | None = None) -> int:
-    """重拉 `dividend --years 10`，覆盖同日的 `snapshot_implied`。
+def fetch_actions(westock, codes, years: int = 10, max_requests: int | None = None):
+    """**只取数、不写库**（纯网络）。返回 `{code: [CorpAction]}` 或 `None`（失败）。
 
-    **一次调用拉不完全市场**：上游单次请求只返回一小部分票（实测 10 只一批才
-    稳定满额），且连发 8–10 个请求就限频。所以这里按 `max_requests` 限量，
-    配合 `refresh_actions.next` 游标分轮推进（见 `advance_actions_cursor`）。
+    单独拆出来是为了让定时任务能「锁外取数、锁内写库」：一次取数要发好几个
+    请求、还带退避，放进写锁里会把每秒的 tick 和 30 秒的心跳全堵住
+    （参见 `test_members_job_does_not_fetch_inside_the_lock` 记录的那次故障）。
     """
-    actions = westock.batch_dividend(list(codes), years=10, max_requests=max_requests)
-    if actions is None:
-        return None                     # 取数失败：让调用方不要盖"已完成"时间戳
+    return westock.batch_dividend(list(codes), years=int(years), max_requests=max_requests)
+
+
+def store_actions(conn, actions) -> int:
+    """把取到的除权事件写库（**只写、不联网**）。同日两源并存时 westock 是真值。"""
     written = 0
     with conn:
         for code, items in actions.items():
@@ -272,6 +274,18 @@ def refresh_actions(cfg, westock, conn, codes, max_requests: int | None = None) 
                 )
                 written += 1
     return written
+
+
+def refresh_actions(cfg, westock, conn, codes, max_requests: int | None = None) -> int:
+    """取数 + 写库一步做完。返回写入行数；取数失败返回 `None`。
+
+    会联网的定时任务应改用 `fetch_actions()` + `store_actions()`，把网络请求放到
+    写锁外面（见 `jobs/main.py::_actions`）。
+    """
+    actions = fetch_actions(westock, codes, max_requests=max_requests)
+    if actions is None:
+        return None
+    return store_actions(conn, actions)
 
 
 #: 每轮最多发几个请求。上游实测连发 8–10 个就限频，取 6 留余量。

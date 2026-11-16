@@ -286,11 +286,12 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
         refine_actions, refine_susp = make_refresh_hooks(mcp, cfg, conn)
         if refine_actions is None:
             return
-        from jobs.eod import refresh_suspensions
         try:
-            n = refine_actions()
+            # 取数在锁外、写库在锁内，见 `_actions` 的说明
+            n = refine_actions(_write_lock(loops))
             # 停牌很便宜（1 个请求），每轮顺手带上
-            refine_susp() if refine_susp is not None else None
+            if refine_susp is not None:
+                refine_susp()
         except Exception as exc:                                  # noqa: BLE001
             log.warning("除权/停牌滚动刷新异常：%s: %s", type(exc).__name__, exc)
             return
@@ -748,14 +749,25 @@ def make_refresh_hooks(mcp, cfg, conn):
 
     all_codes = [r[0] for r in conn.execute("SELECT code FROM stock_meta ORDER BY code")]
 
-    def _actions():
+    def _actions(lock=None):
+        """取一段、写库、前移游标。
+
+        `lock` 给定时**取数在锁外、写库在锁内**：取数要发 6 个请求还带退避，
+        放进写锁里会把每秒的 tick 堵住（`test_members_job_does_not_fetch_inside_the_lock`
+        记录过这类故障）。
+        """
+        from contextlib import nullcontext
+
+        from jobs.eod import fetch_actions, store_actions
+
         # 一轮只拉游标之后的一小段（上游限频决定了一次拉不完），下一轮接着走
         batch = actions_cursor(conn, all_codes)[: ACTIONS_MAX_REQUESTS * 10]
-        written = refresh_actions(cfg, mcp, conn, batch,
-                                  max_requests=ACTIONS_MAX_REQUESTS)
-        if written is None:
+        actions = fetch_actions(mcp, batch, max_requests=ACTIONS_MAX_REQUESTS)
+        if actions is None:
             return None                      # 失败：游标不动，下次重试同一段
-        advance_actions_cursor(conn, all_codes, batch)
+        with (lock if lock is not None else nullcontext()):
+            written = store_actions(conn, actions)
+            advance_actions_cursor(conn, all_codes, batch)
         return written
 
     def _suspensions():

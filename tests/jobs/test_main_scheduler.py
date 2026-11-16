@@ -1254,3 +1254,58 @@ def test_refresh_stamps_when_it_wrote_zero_rows_but_succeeded(tmp_path):
     assert out["refresh_actions"] is True, "0 行但没失败，应当算完成"
     row = conn.execute("SELECT value FROM job_state WHERE name='refresh_actions.last'").fetchone()
     assert row and row[0] == "20261115"
+
+
+def test_actions_refresh_job_fetches_outside_the_write_lock(env):
+    """滚动刷新的**网络请求必须在写锁外**，只有写库才持锁。
+
+    一次取数要发 6 个请求还带退避（撞限频时 30 秒起）。放进 `loops.lock` 里，
+    每秒的 tick 和 30 秒的心跳会全程堵着——`test_members_job_does_not_fetch_inside_the_lock`
+    记录的 `skipped: maximum number of running instances` 就是这么来的。
+    """
+    from jobs.main import make_scheduler
+
+    class SpyLock:
+        def __init__(self):
+            self.depth = 0
+            self.max_depth = 0
+
+        def __enter__(self):
+            self.depth += 1
+            self.max_depth = max(self.max_depth, self.depth)
+            return self
+
+        def __exit__(self, *a):
+            self.depth -= 1
+            return False
+
+    observed: list[int] = []
+
+    class SpyMcp:
+        """记录"取数时"的锁深度——**不能用 assert**：job 体里 `except Exception`
+        会把断言吞掉，测试就永远绿（第一版就是这么写错的）。"""
+        lock = None
+
+        def batch_dividend(self, codes, years=10, max_requests=None, **kw):
+            observed.append(SpyMcp.lock.depth if SpyMcp.lock is not None else -1)
+            return {}
+
+        def suspension(self, start, end):
+            return []
+
+    class Loops:
+        def __init__(self):
+            self.lock = SpyLock()
+
+    loops = Loops()
+    SpyMcp.lock = loops.lock
+    sched, _ = make_scheduler(env.cfg, env.conn, env.clock, loops=loops, mcp=SpyMcp())
+    job = sched.get_job("actions_refresh")
+    assert job is not None, "滚动刷新任务没注册"
+
+    # 直接调 job 的函数体，避免依赖 APScheduler 的触发时机
+    job.func()
+
+    assert observed, "取数根本没发生"
+    assert observed[0] == 0, f"取数发生在写锁内（深度 {observed[0]}）：会堵住 tick"
+    assert loops.lock.max_depth >= 1, "写库时没有持锁：会和 tick 抢同一个连接"

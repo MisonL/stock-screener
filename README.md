@@ -153,7 +153,10 @@ docker compose -f deploy/docker-compose.yml --project-directory . up -d api jobs
 > `data_suspension`，没有账号时对应刷新回调为 `None`，启动时会打印一条 WARNING，
 > 此时 `corporate_actions` 只会有快照反推的 `snapshot_implied` 行、
 > `suspension_calendar` 保持空表——**这两张表此时不要用来做判断**。
-> 有账号时刷新在启动补跑（距上次 ≥7 天触发），不是周期任务。
+> 有账号时除权数据按**游标滚动**推进：上游对 `data_dividend` 有很紧的限频
+> （实测单次请求塞 200 只票只返回 46 只，连发 8–10 个请求就返回空数据），
+> 所以每 30 分钟推进一小段（约 60 只），几天滚完一遍全市场，首装后当天
+> 只覆盖一小部分属于正常现象。停牌数据每轮顺带刷新（只需 1 个请求）。
 
 ### 其他已知限制
 

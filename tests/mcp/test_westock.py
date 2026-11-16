@@ -502,8 +502,10 @@ _SUSPENSION = {"market": "hs", "stocks": [
 
 
 def _mcp_with(env_file, rows):
-    return WestockMcp(env_path=env_file, http=FakeHttp(rows), clock=FixedClock(
-        datetime(2026, 11, 15, 10, 0)))
+    # `sleep=lambda _s: None`：生产默认是**真的** time.sleep（退避必须真生效），
+    # 测试里不注入就会真的等，跑一次要两分钟。
+    return WestockMcp(env_path=env_file, http=FakeHttp(rows), sleep=lambda _s: None,
+                      clock=FixedClock(datetime(2026, 11, 15, 10, 0)))
 
 
 def _wrapped(payload):
@@ -576,11 +578,12 @@ def test_batch_dividend_returns_none_on_failure_instead_of_crashing(env_file):
 
 
 def test_suspension_parses_real_payload_and_handles_undecided_resumption(env_file):
-    """`resumptionDate=19000101` 是"还没定"的哨兵值，不能原样落成 1900 年。
+    """`resumptionDate=19000101` 是"还没定"的哨兵值，必须落成 `None`。
 
-    接口用它表示"至今未复牌"。原样落库的话 `resume_dates()`（按
-    `end_date == 上一交易日` 找复牌股）永远命中不了，但这条记录也永远清不掉。
-    这里换成查询区间的右端（今天），语义是"仍在停牌"。
+    原实现换成"今天"，等于告诉下游"今天复牌"：`_resume_dates()` 用
+    `bisect_right(days, end)` 取 end 之后的第一个交易日，于是 `resume_cooldown`
+    被提前触发。表结构 `end_date` 可为 NULL、下游也认 `None = 仍在停牌`，
+    所以直接存 NULL 才对。
     """
     mcp = _mcp_with(env_file, {"data_suspension": _wrapped(_SUSPENSION)})
     rows = mcp.suspension("2026-11-01", "2026-11-15")
@@ -588,7 +591,7 @@ def test_suspension_parses_real_payload_and_handles_undecided_resumption(env_fil
     assert (("sz000831", 20261102, 20261116) in rows), rows
     stuck = [r for r in rows if r[0] == "sz000635"][0]
     assert stuck[1] == 20261113
-    assert stuck[2] == 20261115, f"19000101 应换成区间右端，实际 {stuck[2]}"
+    assert stuck[2] is None, f"19000101 应落成 None（仍在停牌），实际 {stuck[2]}"
 
 
 def test_suspension_uses_hs_market_argument(env_file):
@@ -728,3 +731,74 @@ def test_batch_dividend_retries_when_response_is_suspiciously_short(env_file):
 
     assert calls["n"] >= 3, "条数明显偏少却没重试：残缺数据会被当成真实结果"
     assert got is not None and len(got) == 3, f"重试后仍不完整：{got}"
+
+
+def test_production_default_sleep_is_real(env_file):
+    """**不注入 sleep 时必须是真正的 `time.sleep`。**
+
+    这里踩过一次狠的：`self.sleep = sleep`（默认 None），生产实例不传这个参数，
+    于是 `if self.sleep:` 永远为假——退避代码从未执行过，CHANGELOG 里写的
+    「撞限频后退避 2 秒」在线上一次都没发生。而测试全都注入了假 sleep，
+    所以测试一直是绿的。
+    """
+    mcp = WestockMcp(env_path=env_file, http=FakeHttp({}),
+                     clock=FixedClock(datetime(2026, 11, 15, 10, 0)))
+    assert mcp.sleep is time.sleep, f"生产默认 sleep 不是 time.sleep：{mcp.sleep!r}"
+
+
+def test_batch_dividend_merges_multiple_plans_on_the_same_ex_date(env_file):
+    """同一天既派现又送转，**必须求和成一条**。
+
+    落库是 `INSERT OR REPLACE`，主键 `(code, ex_date, source)`。不聚合的话
+    第二条会把第一条覆盖掉，只剩最后一条——复权因子
+    `(P−Σ现金)/(1+Σ送转)` 直接用错值，而且 `written` 计数虚高一倍。
+    CLI 路径（`WestockCli._aggregate`）一直是聚合的，MCP 路径不能不一样。
+    """
+    plans = {
+        "code": "sz002460", "end": "2026-11-15",
+        "plans": [
+            {"cashDiviRMB": "5.80", "exDiviDate": "20260710",
+             "procedure": "方案实施", "bonusShareRatio": "", "tranAddShareRatio": ""},
+            {"cashDiviRMB": "2.00", "exDiviDate": "20260710",
+             "procedure": "方案实施", "bonusShareRatio": "", "tranAddShareRatio": "3.00"},
+            # 另一天，不该被合并进来
+            {"cashDiviRMB": "1.00", "exDiviDate": "20250710",
+             "procedure": "方案实施", "bonusShareRatio": "", "tranAddShareRatio": ""},
+        ]}
+    mcp = _mcp_with(env_file, {"data_dividend": _wrapped(plans)})
+    got = mcp.batch_dividend(["sz002460"], years=10)["sz002460"]
+
+    assert len(got) == 2, f"同日多条没合并：{got}"
+    merged = [a for a in got if a.ex_date == 20260710][0]
+    assert merged.cash_per_share == pytest.approx(0.78), "同日现金没求和（5.80+2.00)/10"
+    assert merged.tran_ratio == pytest.approx(0.30)
+
+
+def test_suspension_returns_none_when_business_layer_reports_failure(env_file):
+    """**业务层的 `ok=false` 也是失败**：上游限流返回 `{"ok":false,"msg":"服务限频"}`，
+    JSON-RPC 外层却是成功的。只看外层会把限频当成「今天没人停牌」。"""
+    mcp = _mcp_with(env_file, {"data_suspension": {"ok": False, "msg": "服务限频"}})
+    assert mcp.suspension("2026-11-01", "2026-11-15") is None
+
+
+def test_batch_dividend_caps_total_backoff_within_budget(env_file):
+    """整轮退避有总预算，**不能超过调度器的 misfire_grace_time**。
+
+    6 个 chunk × (30+60) 秒 = 540 秒 > `JOB_DEFAULTS` 的 300 秒；一旦超了，
+    下一次触发会被 APScheduler 静默丢弃，而下一轮还要再等 20 分钟。
+    """
+    delays: list[float] = []
+
+    class AlwaysShort(FakeHttp):
+        def post(self, url, json=None, headers=None, timeout=None, **kw):
+            self.calls.append({"url": url, "json": json or {}, "headers": dict(headers or {})})
+            return Resp(200, {"jsonrpc": "2.0", "id": 1, "result": {
+                "content": [{"type": "text", "text": _json.dumps(
+                    {"ok": True, "data": {}}, ensure_ascii=False)}], "isError": False}})
+
+    mcp = WestockMcp(env_path=env_file, http=AlwaysShort({}), sleep=delays.append,
+                     clock=FixedClock(datetime(2026, 11, 15, 10, 0)))
+    codes = [f"sh60{i:04d}" for i in range(60)]           # 6 个 chunk
+    mcp.batch_dividend(codes, chunk=10, backoff_s=30.0, retries=2, budget_s=100.0)
+
+    assert sum(delays) <= 100.0 + 1e-6, f"退避总时长 {sum(delays)}s 超出预算 100s"

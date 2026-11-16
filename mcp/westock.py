@@ -21,6 +21,7 @@ reason: "mcp_unavailable"`，**绝不抛异常**，主链路（选股、推送�
 from __future__ import annotations
 
 import logging
+import time
 
 import json
 from datetime import datetime
@@ -63,8 +64,11 @@ class WestockMcp:
     def __init__(self, env_path=ENV_PATH, http=None, clock=None, limiter=None,
                  sleep=None):
         self.env_path = Path(env_path)
-        #: 退避用的 sleep，测试注入成空函数即可不真的等
-        self.sleep = sleep
+        #: 退避用的 sleep。**默认必须是真的 time.sleep**：原先默认 None，
+        #: 生产实例不传这个参数，于是 `if self.sleep:` 永远为假——退避代码
+        #: 一次都没跑过（CHANGELOG 里写的「退避 2 秒」在线上从未生效）。
+        #: 测试注入空函数即可不真的等。
+        self.sleep = sleep if sleep is not None else time.sleep
         self._http = http
         self.clock = clock
         self.limiter = limiter or RateLimiter(MIN_INTERVAL_S)
@@ -197,7 +201,8 @@ class WestockMcp:
     # ---- 除权 / 停牌（jobs 的周刷新用，不进 agent 工具集） -----------------
 
     def batch_dividend(self, codes, years: int = 10, chunk: int = 10,
-                       backoff_s: float = 30.0, retries: int = 2, max_requests: int | None = None):
+                       backoff_s: float = 30.0, retries: int = 2,
+                       max_requests: int | None = None, budget_s: float = 120.0):
         """多只票的分红送转，返回 `{code: [CorpAction, ...]}`。
 
         **字段名是实测出来的**（`data_dividend` 的返回，见 `_action_of`）：
@@ -218,11 +223,18 @@ class WestockMcp:
         out: dict[str, list] = {}
         codes = list(codes)
         failed_chunks = 0
+        # **整轮退避总预算**：一次滚动的耗时必须明显小于调度器的
+        # `misfire_grace_time`（300 秒），否则下一次触发会被静默丢弃。
+        # 6 个 chunk × (30+60) 秒 = 540 秒就超了，所以这里封顶。
+        spent = 0.0
         for i in range(0, len(codes), chunk):
             part = codes[i:i + chunk]
             if max_requests is not None and i // chunk >= max_requests:
                 break                        # 本轮配额用完，剩下的下次再来
-            data = self._fetch_chunk(part, years, backoff_s=backoff_s, retries=retries)
+            remaining = max(0.0, budget_s - spent)
+            data, waited = self._fetch_chunk(part, years, backoff_s=backoff_s,
+                                             retries=retries, budget_s=remaining)
+            spent += waited
             if data is None:
                 # **单个 chunk 失败不再整体放弃**：5000 多只票要发 100 多个请求，
                 # 全丢会让整个周刷新白跑，而且因为不盖时间戳会每次启动都重来一遍。
@@ -247,10 +259,9 @@ class WestockMcp:
                 code = _normalize_code(block.get("code"))
                 if not code:
                     continue
-                for plan in block.get("plans") or []:
-                    action = _action_of(code, plan)
-                    if action is not None:
-                        out.setdefault(code, []).append(action)
+                actions = _aggregate_plans(code, block.get("plans") or [])
+                if actions:
+                    out.setdefault(code, []).extend(actions)
         total_chunks = max(1, (len(codes) + chunk - 1) // chunk)
         if failed_chunks and failed_chunks == total_chunks:
             return None                      # 全失败：真的没取到数据，别盖"已完成"
@@ -259,7 +270,8 @@ class WestockMcp:
                         failed_chunks, total_chunks)
         return out
 
-    def _fetch_chunk(self, part, years, backoff_s: float, retries: int):
+    def _fetch_chunk(self, part, years, backoff_s: float, retries: int,
+                     budget_s: float | None = None):
         """取一个批次，撞上限频就退避重试；拿到数据返回按 code 分组的块。
 
         **限频的伪装必须看穿**：上游被限流时不会报错，而是返回
@@ -274,38 +286,51 @@ class WestockMcp:
         一次请求里塞多少只票都只返回一小部分（200 只 → 46 只，400 只 → 21 只），
         10 只一批则稳定满额；连续发到第 8–10 个请求就开始返回空，
         冷却约 60 秒后恢复。所以**单次调用拉不完全市场**，调用方要分轮推进。
+
+        返回 `(数据, 本次真正等待的秒数)`；`budget_s` 给定时，退避不会超过这个
+        总预算（用完就停止重试、返回已拿到的最好结果）。
         """
         want = len(part)
         best: dict | None = None
+        waited = 0.0
         for attempt in range(retries + 1):
             resp = self._rpc(MCP_TOOLS["dividend"],
                              {"codes": ",".join(part), "years": int(years)})
             if not resp.get("ok"):
                 reason = resp.get("reason") or ""
                 if "mcp_unavailable" in reason:
-                    return None                  # token 没了，重试也没用
+                    return None, waited          # token 没了，重试也没用
                 data = None
             else:
                 data = _unwrap(resp.get("data"))
             got = len(data) if isinstance(data, dict) else 0
             if got * 2 >= want:
-                return data                      # 够数，直接用
+                return data, waited              # 够数，直接用
             # 不足一半：优先保留拿到最多的那次（残缺也比没有强）
             if best is None or got > len(best):
                 best = data if isinstance(data, dict) else best
+            delay = backoff_s * (attempt + 1)
+            if budget_s is not None and waited + delay > budget_s:
+                break                            # 预算用完，不再退避
             if attempt < retries and self.sleep:
-                self.sleep(backoff_s * (attempt + 1))
-        return best
+                self.sleep(delay)
+                waited += delay
+        return best, waited
 
     def suspension(self, start: str, end: str, market: str = SUSPENSION_MARKET):
         """停牌列表，返回 `[(code, start_date, end_date), ...]`。
 
-        `end_date` 用接口给的 `resumptionDate`（复牌日）；**未定复牌日的返回
-        `19000101` 这个哨兵值**，这里换成 `end`（今天）——把它当"还在停牌"，
-        比记成一个 1900 年的日期安全得多：`resume_dates()` 按 `end_date == 上一
-        交易日` 找复牌股，1900 年的记录永远不会误命中，但也永远清不掉。
-        接口只按当前快照给"正在停牌"的票，没有区间查询参数，`start`/`end` 仅用于
-        把哨兵值夹到今天。
+        `end_date` 用接口给的 `resumptionDate`（复牌日）。**未定复牌日（接口给
+        `19000101` 哨兵）落成 `None`**，不是"今天"。
+
+        这一点原来想错了：把哨兵换成今天，等于告诉下游"今天复牌"——
+        `core/strategy/pool.py::_resume_dates` 用 `bisect_right` 取 `end` 之后的
+        第一个交易日，于是 `resume_cooldown` 被提前触发 1–2 天，而那条记录
+        每天又被新的 `end` 覆盖、永远清不掉。表结构 `end_date` 本来就可为 NULL，
+        下游也认 `None = 仍在停牌`，所以直接存 NULL 才是对的。
+
+        接口只按当前快照给"正在停牌"的票，没有区间查询参数，`start`/`end`
+        仅用于日志与哨兵识别。
 
         **取数失败返回 `None`**（理由同 `batch_dividend`）：空列表是正常结果
         （今天没有票停牌），不能拿来当失败信号。
@@ -313,7 +338,13 @@ class WestockMcp:
         resp = self._rpc(MCP_TOOLS["suspension"], {"market": market})
         if not resp.get("ok"):
             return None
-        data = _unwrap(resp.get("data"))
+        raw = resp.get("data")
+        # **业务层的 ok=false 也是失败**：上游被限流时返回
+        # `{"ok":false,"msg":"服务限频"}`，外层 JSON-RPC 仍然是成功的。
+        # 只判外层的话，限频会被当成「今天没人停牌」——空表被记成成功。
+        if isinstance(raw, dict) and raw.get("ok") is False:
+            return None
+        data = _unwrap(raw)
         rows = data.get("stocks") if isinstance(data, dict) else None
         out = []
         for row in rows or []:
@@ -324,9 +355,9 @@ class WestockMcp:
             if not code or begin is None:
                 continue
             finish = _ymd(row.get("resumptionDate"))
-            if finish is None or finish <= begin:
-                finish = _ymd(end) or begin      # 19000101 / 未定 → 当作"仍在停牌"
-            out.append((code, begin, finish))
+            if finish is not None and finish <= begin:
+                finish = None                    # 复牌日不晚于停牌日 → 数据无意义
+            out.append((code, begin, finish))     # 未定复牌 → None（见 docstring）
         return out
 
 
@@ -398,6 +429,30 @@ def _num(raw) -> float:
         return float(str(raw).strip() or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _aggregate_plans(code: str, plans) -> list:
+    """把同一天的多条 plans 合成一条（**同一天既派现又送转是常态**）。
+
+    照抄 `core/datasource/westock.py::WestockCli._aggregate` 的口径：按 `ex_date`
+    把现金/送股/转增分别求和。不聚合就会在 `INSERT OR REPLACE`（主键
+    `code, ex_date, source`）上互相覆盖，只剩最后一条——复权因子直接算错，
+    而且 `written` 计数虚高。
+    """
+    agg: dict[int, list[float]] = {}
+    for plan in plans:
+        action = _action_of(code, plan)
+        if action is None:
+            continue
+        slot = agg.setdefault(action.ex_date, [0.0, 0.0, 0.0])
+        slot[0] += action.cash_per_share
+        slot[1] += action.bonus_ratio
+        slot[2] += action.tran_ratio
+    from core.datasource.westock import CorpAction
+
+    return [CorpAction(code=code, ex_date=ex, cash_per_share=v[0], bonus_ratio=v[1],
+                       tran_ratio=v[2], source="westock_dividend")
+            for ex, v in sorted(agg.items())]
 
 
 def _action_of(code: str, plan) -> "object | None":

@@ -289,9 +289,10 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
         try:
             # 取数在锁外、写库在锁内，见 `_actions` 的说明
             n = refine_actions(_write_lock(loops))
-            # 停牌很便宜（1 个请求），每轮顺手带上
+            # 停牌很便宜（1 个请求），每轮顺手带上；**写库同样要持锁**
+            # （它写 suspension_calendar，与 tick 共享同一个 conn）
             if refine_susp is not None:
-                refine_susp()
+                refine_susp(_write_lock(loops))
         except Exception as exc:                                  # noqa: BLE001
             log.warning("除权/停牌滚动刷新异常：%s: %s", type(exc).__name__, exc)
             return
@@ -376,18 +377,36 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
                   CronTrigger(hour=9, minute=0, day_of_week="mon-fri", timezone=SH),
                   id="westock_import", **JOB_DEFAULTS)
     # **除权/停牌滚动刷新**：上游限频决定了一次拉不完全市场（实测连发 8–10 个
-    # 请求就限频、单次返回也残缺），所以每 30 分钟推进一小段（游标见
-    # `jobs/eod.py::actions_cursor`），几天滚完一遍全市场。避开 09:25–15:10
-    # 的盘中时段——那时行情请求优先，别抢同一个限频额度。
+    # 请求就限频、单次返回也残缺），所以每 20 分钟推进一小段（游标见
+    # `jobs/eod.py::actions_cursor`），几天滚完一遍全市场。
+    #
+    # 避开盘中：15:05 的 eod 与 09:15–15:10 的
+    # tick 才是主链路。除权数据不是实时数据，晚几小时无所谓，所以只在
+    # 非交易时段（开盘前 + 收盘后 + 全天周末）推进，把白天的限频额度留给行情。
+    # **盘中禁区 09:15–15:10**：`minute="*/20"` 会把 15:00 也算进去（落在禁区内
+    # 且紧贴 15:05 的 eod），所以小时段只留 6–8 点与 16–23 点。
+    # 开盘前（09:00、09:10）与收盘后（15:20、15:40）用独立的分钟级触发补上。
     sched.add_job(actions_refresh_job,
-                  CronTrigger(hour="8-9,15-23", minute="*/30", day_of_week="mon-fri",
+                  CronTrigger(hour="6-8,16-23", minute="*/20", day_of_week="mon-fri",
                               timezone=SH),
                   id="actions_refresh", **JOB_DEFAULTS)
-    # 周末大盘不动但上游额度照样刷新：周末也推进，尽快补齐缺口
     sched.add_job(actions_refresh_job,
-                  CronTrigger(hour="8-23", minute="15", day_of_week="sat,sun",
+                  CronTrigger(hour=9, minute="0,10", day_of_week="mon-fri", timezone=SH),
+                  id="actions_refresh_premarket", **JOB_DEFAULTS)
+    sched.add_job(actions_refresh_job,
+                  CronTrigger(hour=15, minute="20,40", day_of_week="mon-fri", timezone=SH),
+                  id="actions_refresh_postclose", **JOB_DEFAULTS)
+    # 周末同样避开 09:20–15:00（虽然没行情，但保持同一套口径、也少打扰用户）
+    sched.add_job(actions_refresh_job,
+                  CronTrigger(hour="6-8,16-23", minute="*/20", day_of_week="sat,sun",
                               timezone=SH),
                   id="actions_refresh_weekend", **JOB_DEFAULTS)
+    sched.add_job(actions_refresh_job,
+                  CronTrigger(hour="9", minute="0,10", day_of_week="sat,sun", timezone=SH),
+                  id="actions_refresh_weekend_am", **JOB_DEFAULTS)
+    sched.add_job(actions_refresh_job,
+                  CronTrigger(hour="15", minute="20,40", day_of_week="sat,sun", timezone=SH),
+                  id="actions_refresh_weekend_pm", **JOB_DEFAULTS)
     state["arm_startup_renew"] = arm_startup_renew
     return sched, state
 
@@ -575,7 +594,8 @@ def startup_recovery(cfg, conn, clock, *, reg, tick=None, dispatcher=None, loops
                         " VALUES ('refresh_actions.last', ?)", (str(_ymd(today)),))
                 out["refresh_actions"] = True
             else:
-                log.warning("除权/停牌刷新取数失败（返回 None），不盖时间戳（下次启动重试）")
+                log.warning("除权/停牌刷新取数失败（除权=%s，停牌=%s），不盖时间戳（下次启动重试）",
+                            wrote, susp)
     return out
 
 
@@ -743,7 +763,6 @@ def make_refresh_hooks(mcp, cfg, conn):
         ACTIONS_MAX_REQUESTS,
         actions_cursor,
         advance_actions_cursor,
-        refresh_actions,
         refresh_suspensions,
     )
 
@@ -767,11 +786,18 @@ def make_refresh_hooks(mcp, cfg, conn):
             return None                      # 失败：游标不动，下次重试同一段
         with (lock if lock is not None else nullcontext()):
             written = store_actions(conn, actions)
-            advance_actions_cursor(conn, all_codes, batch)
+            # **一条都没写就不前移游标**：这一段全是 B 股/新股（本来没分红）时
+            # 前移是对的，但限频伪装成"空数据"时前移就等于永久跳过这 60 只
+            # ——滚动一圈约 3 天，等于三天后才可能再遇到。
+            # 代价是"确实没分红的一段"会被重拉一次，这比漏数据便宜得多。
+            if written:
+                advance_actions_cursor(conn, all_codes, batch)
         return written
 
-    def _suspensions():
-        return refresh_suspensions(cfg, mcp, conn, codes=all_codes)
+    def _suspensions(lock=None):
+        from contextlib import nullcontext
+        with (lock if lock is not None else nullcontext()):
+            return refresh_suspensions(cfg, mcp, conn, codes=all_codes)
 
     return _actions, _suspensions
 

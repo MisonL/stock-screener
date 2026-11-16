@@ -1309,3 +1309,41 @@ def test_actions_refresh_job_fetches_outside_the_write_lock(env):
     assert observed, "取数根本没发生"
     assert observed[0] == 0, f"取数发生在写锁内（深度 {observed[0]}）：会堵住 tick"
     assert loops.lock.max_depth >= 1, "写库时没有持锁：会和 tick 抢同一个连接"
+
+
+def test_actions_refresh_avoids_market_hours(env):
+    """滚动刷新**不能落在盘中**（09:15–15:10）。
+
+    那段是 tick / 快照的主链路，而除权数据不是实时数据、晚几小时无所谓。
+    抢同一个上游限频额度会让行情取数变慢。
+    """
+    from datetime import datetime
+
+    from zoneinfo import ZoneInfo
+
+    from jobs.main import make_scheduler
+
+    sched, _ = make_scheduler(env.cfg, env.conn, env.clock, mcp=None)
+    tz = ZoneInfo("Asia/Shanghai")
+    for job_id in ("actions_refresh", "actions_refresh_weekend",
+                  "actions_refresh_premarket", "actions_refresh_postclose",
+                  "actions_refresh_weekend_am", "actions_refresh_weekend_pm"):
+        job = sched.get_job(job_id)
+        assert job is not None, f"{job_id} 没注册"
+        # 取两天内的触发时刻，检查没有一个落在 09:15–15:10。
+        # **必须 `prev = nxt + 1 秒`**：`get_next_fire_time` 对 `prev` 本身
+        # 是"含"的语义，直接 `prev = nxt` 会永远返回同一个时刻——
+        # 第一版就这么写错了，循环 200 次其实只检查了第一个时刻，恒定绿。
+        prev = datetime(2026, 11, 16, 0, 0, tzinfo=tz)
+        seen = []
+        for _ in range(200):
+            nxt = job.trigger.get_next_fire_time(None, prev)
+            if nxt is None:
+                break
+            local = nxt.astimezone(tz)
+            seen.append(local)
+            minutes = local.hour * 60 + local.minute
+            assert not (9 * 60 + 15 <= minutes <= 15 * 60 + 10), \
+                f"{job_id} 在盘中触发：{local}"
+            prev = nxt + timedelta(seconds=1)
+        assert len(seen) >= 30, f"{job_id} 只取到 {len(seen)} 个触发时刻，覆盖不足"

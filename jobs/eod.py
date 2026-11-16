@@ -279,8 +279,9 @@ def store_actions(conn, actions) -> int:
 def refresh_actions(cfg, westock, conn, codes, max_requests: int | None = None) -> int:
     """取数 + 写库一步做完。返回写入行数；取数失败返回 `None`。
 
-    会联网的定时任务应改用 `fetch_actions()` + `store_actions()`，把网络请求放到
-    写锁外面（见 `jobs/main.py::_actions`）。
+    **仅供测试与一次性脚本使用**：它会联网，在生产调度里应改用
+    `fetch_actions()` + `store_actions()`，把网络请求放到写锁外面
+    （见 `jobs/main.py::_actions`）。用本函数排定时任务会把 tick 堵住。
     """
     actions = fetch_actions(westock, codes, max_requests=max_requests)
     if actions is None:

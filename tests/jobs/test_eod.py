@@ -673,3 +673,59 @@ def test_cursor_does_not_skip_codes_missed_in_the_middle(env):
     assert nxt == codes[11], (
         f"游标应停在断点 codes[11]，实际 {nxt}——"
         "中间没确认的 9 只被跳过了")
+
+
+def test_undecided_suspension_is_closed_by_real_bar_evidence(env):
+    """"未定复牌"的区间要能被**真实成交**闭合。
+
+    接口只给"当前正在停牌"的快照：某只票复牌后就不在返回里了，那条
+    `end_date IS NULL` 的行永远留着，于是复牌之后的**每个交易日都被算成停牌**
+    ——`suspended_250` 虚高、`resume_cooldown` 永不触发。
+
+    闭合依据只能是有成交（该股出现了晚于停牌起始日的 bar）。
+    """
+    from jobs.eod import store_suspensions
+
+    code = "sh600519"
+    with env.conn:
+        # 交易日历：1013-1017 那周
+        for d in (20261013, 20261014, 20261015, 20261016, 20261017):
+            env.conn.execute(
+                "INSERT OR REPLACE INTO daily_bars(code, date, open, high, low, close,"
+                " volume, amount, source) VALUES ('sh000300',?,10,10,10,10,1,1,'tencent')",
+                (d,))
+        # 该股 1016 恢复成交
+        env.conn.execute(
+            "INSERT OR REPLACE INTO daily_bars(code, date, open, high, low, close,"
+            " volume, amount, source) VALUES (?,20261016,10,10,10,10,1,1,'tencent')",
+            (code,))
+
+    # 落一条"未定复牌"。**此刻已知 1016 有成交**，所以应当场就闭合，
+    # 不用等下一轮——落库时就能判断的事没必要留个洞。
+    store_suspensions(env.conn, [(code, 20261013, None)])
+
+    end = env.one("suspension_calendar", code=code)["end_date"]
+    assert end == 20261015, (
+        f"应按成交证据闭合为 1015（1016 复牌的前一交易日），实际 {end}")
+
+
+def test_suspension_stays_open_when_there_is_no_bar_evidence(env):
+    """**没有成交证据时不能闭合**——否则数据源失败会伪造复牌日。
+
+    只凭"这次快照里没有它"就闭合是错的：请求残缺、限频、账号失效时同样没有它。
+    """
+    from jobs.eod import store_suspensions
+
+    code = "sh600519"
+    with env.conn:
+        for d in (20261013, 20261014, 20261015):
+            env.conn.execute(
+                "INSERT OR REPLACE INTO daily_bars(code, date, open, high, low, close,"
+                " volume, amount, source) VALUES ('sh000300',?,10,10,10,10,1,1,'tencent')",
+                (d,))
+
+    store_suspensions(env.conn, [(code, 20261013, None)])
+    store_suspensions(env.conn, [])            # 空快照，且该股没有任何成交
+
+    assert env.one("suspension_calendar", code=code)["end_date"] is None, \
+        "没有成交证据却闭合了停牌区间：伪造了复牌日"

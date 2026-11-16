@@ -394,7 +394,54 @@ def store_suspensions(conn, rows, cal=None, codes=None) -> int:
                 (code, begin, finish),
             )
             written += 1
+        # **顺手闭合"未定复牌"的旧区间**：只靠本轮快照永远不会闭合，
+        # 复牌后的每个交易日都会被当成停牌（见 `_close_resumed_from_bars`）。
+        _close_resumed_from_bars(conn)
     return written
+
+
+def _close_resumed_from_bars(conn) -> int:
+    """用**实际成交证据**闭合"未定复牌"的停牌区间，返回闭合条数。
+
+    接口只给"当前正在停牌"的快照：某只票今天复牌后就不在返回里了，
+    那条 `end_date IS NULL` 的行永远留着，于是**复牌之后的每个交易日都被算成停牌**
+    ——`stock_stats.suspended_250` 虚高、`resume_cooldown` 也永远不会触发。
+
+    闭合依据只能是"复牌后真的有成交"（`daily_bars` 里出现了该股、且日期晚于
+    停牌起始日的 bar）。**不能因为"这次快照里没有它就闭合"**：数据源失败、
+    请求残缺时同样没有它，那样会伪造复牌日。
+
+    `end_date` 落"最后一个停牌日"= 复牌后第一根 bar 的前一个交易日。
+    """
+    rows = conn.execute(
+        "SELECT code, start_date FROM suspension_calendar WHERE end_date IS NULL"
+    ).fetchall()
+    if not rows:
+        return 0
+    closed = 0
+    for code, start in rows:
+        first_bar = conn.execute(
+            "SELECT min(date) FROM daily_bars WHERE code = ? AND date > ?",
+            (code, int(start))).fetchone()
+        if not first_bar or first_bar[0] is None:
+            continue                    # 还没看到成交：保持 NULL（仍在停牌/无证据）
+        resumed = int(first_bar[0])
+        last_suspended = _last_trading_day_before(conn, resumed)
+        if last_suspended is None or last_suspended < int(start):
+            continue
+        conn.execute(
+            "UPDATE suspension_calendar SET end_date = ? WHERE code = ? AND start_date = ?",
+            (last_suspended, code, int(start)))
+        closed += 1
+    return closed
+
+
+def _last_trading_day_before(conn, day: int) -> int | None:
+    """`day` 之前最近的一个有 sh000300 bar 的交易日。"""
+    row = conn.execute(
+        "SELECT max(date) FROM daily_bars WHERE code = 'sh000300' AND date < ?",
+        (day,)).fetchone()
+    return int(row[0]) if row and row[0] is not None else None
 
 
 def _last_suspended_day(resumption, cal) -> int | None:

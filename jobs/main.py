@@ -486,6 +486,22 @@ def _llm_probe(cfg) -> bool:                       # pragma: no cover - 网络�
     return resp.status_code < 400
 
 
+def _install_stack_dump() -> None:                  # pragma: no cover - 排障用
+    """收到 `SIGUSR1` 时把所有线程的调用栈打到 stderr。
+
+    容器里没有 gdb / py-spy，进程卡住时只能靠这个。日志管道不通时，
+    `/proc/<pid>/fd/2` 仍能直接读到这段输出。
+    """
+    import faulthandler
+    import signal
+
+    try:
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
+        log.info("已注册 SIGUSR1 栈转储（kill -USR1 <pid>）")
+    except (AttributeError, ValueError):
+        pass
+
+
 def _trace(msg: str) -> None:                       # pragma: no cover - 排障用
     """往 `/tmp/actions_refresh.trace` 追加一行（保留最近 200 行）。
 
@@ -715,6 +731,7 @@ def main() -> int:                                  # pragma: no cover - 进程�
     from core.intraday.detector import EventDetector
 
     _setup_logging()
+    _install_stack_dump()
     cfg = load_config(Path("config"))
     _warn_if_placeholder_config(cfg)
     conn = connect()

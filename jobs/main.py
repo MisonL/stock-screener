@@ -548,7 +548,11 @@ def _own_connection(conn):
     own = sqlite3.connect(path, check_same_thread=False)
     own.row_factory = sqlite3.Row
     own.execute("PRAGMA journal_mode = WAL")
-    own.execute("PRAGMA busy_timeout = 5000")
+    # **要比共享连接的 5 秒长得多**：EOD 一个事务要写几千行、跑 1～3 分钟，
+    # 期间快照线程会在另一条连接上要写锁。5 秒一过就 `database is locked`，
+    # 而 EOD 一旦中途失败会整轮回滚、重跑一遍又是同样结果。
+    # 给足 60 秒，让 SQLite 自己排队等，而不是让 EOD 输掉这场竞争。
+    own.execute("PRAGMA busy_timeout = 60000")
     own.execute("PRAGMA foreign_keys = ON")
     return own
 

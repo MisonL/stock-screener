@@ -1661,3 +1661,21 @@ def test_eod_catchup_uses_an_isolated_connection(tmp_path):
 
     assert seen, "EOD runner 没被调用"
     assert seen[0] is not conn, "EOD 补跑仍在共享连接上跑：事务会与快照线程交错"
+
+
+def test_eod_connection_waits_longer_than_the_shared_one(tmp_path):
+    """EOD 独立连接的 busy_timeout 必须远大于共享连接的 5 秒。
+
+    EOD 一个事务要写几千行、跑 1～3 分钟，期间快照线程会在另一条连接上要写锁。
+    5 秒一过就 `database is locked`，EOD 输掉这场竞争——而它一旦中途失败
+    整轮回滚，重跑还是同样的结果。
+    """
+    from core.db import connect, migrate
+
+    conn = connect(tmp_path / "t.db")
+    migrate(conn)
+    own = jobs_main._own_connection(conn)
+
+    assert own is not conn
+    timeout = own.execute("PRAGMA busy_timeout").fetchone()[0]
+    assert timeout >= 60000, f"EOD 连接的 busy_timeout 只有 {timeout}ms，撑不过自己的长事务"

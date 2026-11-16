@@ -33,6 +33,15 @@
 
 ## [Unreleased]
 
+### 修复
+
+- **两个 `resume_dates` 口径分叉**。`core/strategy/pool.py::_resume_dates` 按
+  "`end_date` 之后第一个交易日"算（bisect，容忍 `end_date` 落在休市日），
+  而 `jobs/eod.py::resume_dates` 要求 `end_date == 上一交易日`（严格相等）。
+  同一只票在两个模块里的"复牌日"可能不一致，尤其对旧版本按自然日 −1
+  写下的遗留数据。现在 `eod.resume_dates` 统一到同一口径，并加了一条
+  **跨模块一致性**测试（周末 `end_date`，断言两侧认同一天）。
+
 ## [0.2.55] - 2026-11-17
 
 ### 修复

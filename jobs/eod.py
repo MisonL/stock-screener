@@ -17,6 +17,8 @@
 """
 from __future__ import annotations
 
+from bisect import bisect_right
+
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 
@@ -519,12 +521,26 @@ def refresh_suspensions(cfg, westock, conn, codes=None, cal=None) -> int:
 
 
 def resume_dates(conn, cal, today: int) -> set[str]:
-    """复牌日期 = 上一交易日 的 code 集合（`universe.resume_cooldown` 的输入）。"""
-    prev_day = _prev(cal, today)
-    if prev_day is None:
-        return set()
-    rows = conn.execute("SELECT code FROM suspension_calendar WHERE end_date = ?", (prev_day,))
-    return {row[0] for row in rows}
+    """今天复牌的 code 集合（`universe.resume_cooldown` 的输入）。
+
+    **口径与 `core/strategy/pool.py::_resume_dates` 一致**：
+    复牌日 = `end_date` 之后的**第一个交易日**。
+
+    早先这里写成 `end_date == 上一交易日`（严格相等），两个后果：
+    ① `end_date` 落在休市日时（旧版本按自然日 −1 写下的遗留数据）永远匹配不到；
+    ② 同一个概念在两个模块里有两套算法，改一处忘另一处。
+    """
+    days = sorted(d for d in cal.days if d <= today)
+    if today not in days:
+        return set()                       # 今天不是交易日：没人"今天复牌"
+    rows = conn.execute(
+        "SELECT code, end_date FROM suspension_calendar WHERE end_date IS NOT NULL").fetchall()
+    out: set[str] = set()
+    for code, end in rows:
+        i = bisect_right(days, int(end))
+        if i < len(days) and days[i] == today:
+            out.add(code)
+    return out
 
 
 def fetch_sector_members(sina) -> list[tuple[str, str, list[str]]]:

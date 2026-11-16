@@ -185,13 +185,27 @@ def test_refresh_suspensions_filters_by_codes(env):
     assert env.count("suspension_calendar", code="sz000001") == 0
 
 
-def test_resume_dates_derived_from_calendar(env):       # end_date == 上一交易日 的 code 集合
+def test_resume_dates_derived_from_calendar(env):
+    """复牌日 = `end_date` 之后的**第一个交易日**（与 `pool._resume_dates` 同口径）。
+
+    早先这里要求 `end_date == 上一交易日` 严格相等：`end_date` 落在休市日时
+    （旧版本按自然日 −1 写下的遗留数据）就永远匹配不到，同一个概念在两个模块
+    里还有两套算法。
+    """
     env.conn.executemany(
         "INSERT INTO suspension_calendar(code, start_date, end_date) VALUES (?, ?, ?)",
-        [("sh600519", 20260901, 20261029), ("sz000001", 20260901, 20261028)],
+        [("sh600519", 20260901, 20261029),   # 1029 是上一交易日 → 今天(1030 不在日历)…
+         ("sz000001", 20260901, 20261028)],
     )
     env.conn.commit()
-    assert resume_dates(env.conn, TradingCalendar(env.conn), TODAY) == {"sh600519"}
+    cal = TradingCalendar(env.conn)
+    last_day = max(cal.days)
+
+    # 用日历里最后一天当"今天"：1029 的 end_date 不指向它，1028 的才指向
+    assert resume_dates(env.conn, cal, last_day) == {"sz000001"}
+
+    # 今天不是交易日 → 没人"今天复牌"
+    assert resume_dates(env.conn, cal, TODAY) == set()
 
 
 def test_refresh_actions_overwrites_snapshot_implied(env):
@@ -798,3 +812,31 @@ def test_cursor_handles_a_retired_start_code(env):
     row = env.conn.execute(
         "SELECT value FROM job_state WHERE name='refresh_actions.next'").fetchone()
     assert row[0] == "sh600004", f"应推进到 sh600004，实际 {row[0]}"
+
+
+def test_resume_dates_matches_pool_for_a_weekend_end_date(env):
+    """`end_date` 落在休市日时，两个消费者必须**认同一个复牌日**。
+
+    旧版本按自然日 −1 写下的遗留数据会出现 `end_date=20261115`（周六）。
+    `pool._resume_dates` 用 bisect 能容忍，`eod.resume_dates` 的严格相等
+    匹配不到——同一只票在两个地方"复牌日"不一致。
+    """
+    from core.strategy.pool import _resume_dates
+
+    cal = TradingCalendar(env.conn)
+    days = sorted(cal.days)
+    # 取一个"周六"（不在日历里）当 end_date：之后第一个交易日
+    weekend = next(d for d in range(days[-1] - 7, days[-1]) if d not in cal.days)
+    resume_day = next(d for d in days if d > weekend)
+
+    with env.conn:
+        env.conn.execute(
+            "INSERT INTO suspension_calendar(code, start_date, end_date) VALUES (?,?,?)",
+            ("sh600519", weekend - 20, weekend))
+
+    pool_set = _resume_dates([(weekend - 20, weekend)], cal, resume_day)
+    eod_set = resume_dates(env.conn, cal, resume_day)
+
+    assert resume_day in pool_set, "pool 侧没算出复牌日（测试前提就不成立）"
+    assert eod_set == {"sh600519"}, (
+        f"eod 侧认不出这只票的复牌日；pool 侧是 {pool_set}，两处口径不一致")

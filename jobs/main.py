@@ -285,8 +285,13 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
 
     def actions_refresh_job():
         """滚动推进除权/停牌刷新（每轮一小段，见 `make_refresh_hooks`）。"""
+        # **每轮留一行文件痕迹**：容器 stdout 在部分宿主机上不落 docker logs
+        # （实测连 `logger.info` 都进不去），只靠日志排障会瞎。
+        # 文件小、每轮一行、自动截断，排查"这次到底跑没跑"时直接 cat。
+        _trace("actions_refresh 开始")
         refine_actions, refine_susp = make_refresh_hooks(mcp, cfg, conn)
         if refine_actions is None:
+            _trace("actions_refresh 跳过：westock 客户端不具备取数能力")
             return
         try:
             # 取数在锁外、写库在锁内，见 `_actions` 的说明
@@ -296,8 +301,10 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
             if refine_susp is not None:
                 refine_susp(_write_lock(loops))
         except Exception as exc:                                  # noqa: BLE001
+            _trace(f"actions_refresh 异常：{type(exc).__name__}: {exc}")
             log.warning("除权/停牌滚动刷新异常：%s: %s", type(exc).__name__, exc)
             return
+        _trace(f"actions_refresh 结束：写入 {n} 行")
         if n is not None:
             log.info("除权滚动刷新：本段写入 %s 行", n)
 
@@ -477,6 +484,23 @@ def _llm_probe(cfg) -> bool:                       # pragma: no cover - 网络�
     # 4xx 一律不算健康：401/403 是密钥问题，404/400 是路径或参数问题，
     # 这些正是自检该报出来的；只有 2xx/3xx 才说明链路通。
     return resp.status_code < 400
+
+
+def _trace(msg: str) -> None:                       # pragma: no cover - 排障用
+    """往 `/tmp/actions_refresh.trace` 追加一行（保留最近 200 行）。
+
+    容器 stdout 在部分宿主机上不落 `docker logs`（实测 `logger.info` 也进不去），
+    定时任务"到底跑没跑"就只能靠这条文件痕迹，否则排障只能猜。
+    """
+    from datetime import datetime
+
+    path = Path("/tmp/actions_refresh.trace")
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()[-200:] if path.exists() else []
+        lines.append(f"{datetime.now(SH):%Y-%m-%d %H:%M:%S} {msg}")
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError:
+        pass
 
 
 def _call_with_lock(fn, lock):

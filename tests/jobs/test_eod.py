@@ -1109,3 +1109,38 @@ def test_old_gap_marker_survives_a_later_partial_fill(env):
     assert has_old_hole is None, "前提不成立：旧洞已经被补上了"
     assert env.count("gap_pending", code="sz000001") == 1, (
         "旧洞 20261029 还在，marker 却被删了——这只票再也不会被 backfill 补到")
+
+
+def test_legacy_gap_marker_is_upgraded_to_the_target_day(tmp_path):
+    """老库里的旧格式 marker（记的是 last_date）升级后要变成"缺口目标日"。
+
+    旧版本写 `missing_through=last_date`（缺口**之前**的最后一根），新逻辑按
+    "这一天没拿到"理解。不转换的话，升级后第一次补上新 T-1 就会把旧洞 marker
+    误删，旧洞失去默认续跑入口。
+    """
+    from core.db import connect, migrate
+
+    conn = connect(tmp_path / "legacy.db")
+    migrate(conn)
+    with conn:
+        # 日历
+        for d in (20261026, 20261027, 20261028, 20261029, 20261030):
+            conn.execute(
+                "INSERT OR REPLACE INTO daily_bars(code, date, open, high, low, close,"
+                " volume, amount, source) VALUES ('sh000300',?,3000,3000,3000,3000,0,0,'backfill')",
+                (d,))
+        # 该股缺 20261029，旧格式 marker 记的是 20261028
+        conn.execute(
+            "INSERT OR REPLACE INTO daily_bars(code, date, open, high, low, close,"
+            " volume, amount, source) VALUES ('sh600519',20261028,10,10,10,10,1,1,'backfill')")
+        conn.execute(
+            "INSERT INTO gap_pending(code, missing_through, first_seen, attempts)"
+            " VALUES ('sh600519', 20261028, '2026-10-30T15:05:00+08:00', 0)")
+        conn.execute("DELETE FROM schema_version WHERE name='006_gap_pending_target_day.sql'")
+
+    migrate(conn)      # 重跑迁移即模拟升级
+
+    row = conn.execute(
+        "SELECT missing_through FROM gap_pending WHERE code='sh600519'").fetchone()
+    assert row is not None, "旧 marker 被删了"
+    assert row[0] == 20261029, f"旧格式应升级为缺口目标日 20261029，实际 {row[0]}"

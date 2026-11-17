@@ -5,7 +5,7 @@
 -- 历史空洞就这样永久留在 raw/adj 里（实测：205 只里 5 只失败后两条续跑路径都补不回）。
 CREATE TABLE gap_pending(
   code TEXT PRIMARY KEY,
-  missing_through INTEGER NOT NULL,   -- 缺到哪一天（含）：该日之前有空洞
+  missing_through INTEGER NOT NULL,   -- 缺口**目标日**：这一天没拿到 bar（见 006 的语义修正）
   first_seen TEXT NOT NULL,           -- ISO 时间戳，便于排序与排障
   attempts INTEGER NOT NULL DEFAULT 0 -- 已尝试补拉次数（避免无限重试同一只）
 );

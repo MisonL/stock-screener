@@ -96,3 +96,34 @@ def test_backfill_picks_up_pending_gaps(tmp_env):
     assert rep.done == 1
     left = tmp_env.conn.execute("SELECT count(*) FROM gap_pending").fetchone()[0]
     assert left == 0, "补完没有清掉待补记录"
+
+
+def test_backfill_keeps_pending_when_target_day_still_missing(tmp_env, monkeypatch):
+    """人工 backfill 收到**非空但没覆盖目标日**的返回时，不能清掉 pending。
+
+    上游"成功"却只回更早的旧日线时，按 code 直接删会让缺口失去续跑入口；
+    这次又写了 `fetch_log(ok)`，下次续跑会直接跳过它。
+    """
+    env = tmp_env
+    code = "sh600519"
+
+    # 让上游只回一根旧日线（20261028），不含目标日 20261029
+    from core.models import Bar
+    original = env.transport._bars
+    monkeypatch.setattr(
+        env.transport, "_bars",
+        lambda c, n: [Bar(c, 20261028, 10, 10, 10, 10, 1000, 10000, "tencent")])
+
+    with env.conn:
+        env.conn.execute(
+            "INSERT INTO gap_pending(code, missing_through, first_seen, attempts)"
+            " VALUES (?, 20261029, '2026-10-30T15:05:00+08:00', 0)", (code,))
+
+    rep = backfill(env.cfg, env.http, env.conn, codes=[code], count=30,
+                   sleep_s=0.0, resume=True)
+
+    assert rep.bars_written > 0, "前提不成立：上游没返回任何 bar"
+    assert env.count("daily_bars", code=code, date=20261029) == 0, "前提不成立：目标日被补上了"
+    assert rep.gap_unfilled >= 1, "没走到「目标日未补齐」分支（测试前提不成立）"
+    assert env.count("gap_pending", code=code) == 1, (
+        "目标日 20261029 仍缺，pending 却被删了：这只票再也不会被补到")

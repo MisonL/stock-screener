@@ -41,6 +41,7 @@ class BackfillReport:
     failed: int = 0
     skipped: int = 0
     bars_written: int = 0
+    gap_unfilled: int = 0       # 有待补记录但目标日仍未补到（marker 保留，下次继续）
     aborted: bool = False       # 连续失败触发熔断，本轮提前结束
 
 
@@ -99,9 +100,18 @@ def backfill(cfg, http, conn, codes: list[str] | None = None, count: int = 1700,
         report.done += 1
         _log(conn, code, len(kept), "ok")
         if code in pending:
-            # 补齐了就把待补记录清掉，否则下次还会再拉一遍
-            conn.execute("DELETE FROM gap_pending WHERE code = ?", (code,))
-            conn.commit()
+            # **确认目标日真的补到了才清**：上游"成功"但只回更早的旧日线时，
+            # 按 code 直接删会让缺口失去续跑入口，而 `_log(ok)` 又让下次续跑跳过它。
+            target = conn.execute(
+                "SELECT missing_through FROM gap_pending WHERE code = ?", (code,)).fetchone()
+            filled = (target is None) or conn.execute(
+                "SELECT 1 FROM daily_bars WHERE code = ? AND date = ? LIMIT 1",
+                (code, int(target[0]))).fetchone() is not None
+            if filled:
+                conn.execute("DELETE FROM gap_pending WHERE code = ?", (code,))
+                conn.commit()
+            else:
+                report.gap_unfilled += 1
 
         if index % BATCH == 0:
             HEALTH_FILE.touch()

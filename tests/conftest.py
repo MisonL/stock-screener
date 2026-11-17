@@ -567,6 +567,25 @@ def db_with_12_hits(db):
     return db
 
 
+class OfflineChatLlm:
+    """测试用的离线 `ChatSession.llm`：**任何出站请求都直接失败**。
+
+    原来 api fixture 不注入 llm，`ChatSession` 会自建 `LlmClient(cfg)` 去连
+    `config/llm.yaml` 里的地址——测试里就是真实的网络尝试（本机无网络时表现为
+    DNS 失败，只是恰好没让用例红，却拖慢且污染边界）。
+    行为与"没配 key"一致：抛异常由 `ChatSession` 自己的降级路径处理。
+    """
+
+    def __init__(self):
+        self.calls = 0
+
+    async def chat(self, messages, tools=None, **kw):
+        self.calls += 1
+        from llm.client import RetriesExhausted
+
+        raise RetriesExhausted("测试环境不发起真实 LLM 请求", 1)
+
+
 @pytest.fixture
 def api(tmp_db, CFG):
     """返回一个「造好数据 → 取 AsyncClient」的工厂，避免每个用例重复装配。"""
@@ -575,7 +594,8 @@ def api(tmp_db, CFG):
     from api.routes import create_app
     from core.clock import FixedClock
 
-    app = create_app(CFG, lambda: tmp_db, FixedClock(_API_T0))
+    app = create_app(CFG, lambda: tmp_db, FixedClock(_API_T0),
+                     chat_llm=OfflineChatLlm())
     app.state.conn = tmp_db
 
     def make():
@@ -602,3 +622,29 @@ def _reset_auth_failures():
     yield
     auth._fails.clear()
     auth._last_sweep = 0.0
+
+
+@pytest.fixture(autouse=True)
+def _no_real_network(monkeypatch):
+    """**默认禁止真实出站连接**：测试必须是离线可复现的。
+
+    审查发现有些用例会真的发网络请求（api fixture 自建 `LlmClient`、自检用例
+    直接 `httpx.post`），表现是本机没网时 DNS 失败却不红、有网时又拖慢整套。
+    这类"边界"不会让用例失败，只会让结果依赖运行环境。
+
+    需要真实出站的地方应显式注入 `httpx.MockTransport`；确有不走 httpx 的
+    （比如 subprocess 跑 node），要么换成假 runner，要么用 `mock_transport` 挡掉。
+    """
+    import socket
+
+    real_connect = socket.socket.connect
+
+    def guard(self, address, *a, **kw):
+        host = address[0] if isinstance(address, tuple) else address
+        if isinstance(host, str) and host not in ("127.0.0.1", "::1", "localhost", ""):
+            raise RuntimeError(
+                f"测试发起了真实网络连接：{host}:{address[1] if isinstance(address, tuple) else ''}。"
+                "请注入 MockTransport / 假 runner，不要依赖外网。")
+        return real_connect(self, address, *a, **kw)
+
+    monkeypatch.setattr(socket.socket, "connect", guard, raising=False)

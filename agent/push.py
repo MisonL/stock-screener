@@ -192,36 +192,52 @@ class AgentPusher:
         today = self.clock.today()
         cap = int(self.cfg.agent.channel_b_daily_cap)
 
-        if channel_b_today(conn, today) >= cap:
-            # **超限时只写 agent_turn，不写 push_log**：写 suppressed 行会污染 seq 计数
-            self._audit_cap("通道 B 日上限")
-            return None
-        total_cap = int(self.cfg.notify.daily_cap)
-        used = pushed_today(conn, channel=None, exclude_segments=(2,),
-                            exclude_kinds=NON_PUSH_KINDS, day=today)
-        if used >= total_cap:
-            self._audit_cap("推送总日上限")
-            return None
+        # **额度检查、去重判断与 seq 认领必须在同一个写事务里。**
+        # 分两步做时，jobs 的通道 A 与 agent 的通道 B 会各自读到 59/60 然后都放行，
+        # 实际发到 61——SQLite 的写串行化救不了"事务外已经做出的额度决定"。
+        # `BEGIN IMMEDIATE` 先拿写锁再读，读到的就是别人已提交的最新值。
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if channel_b_today(conn, today) >= cap:
+                # **超限时只写 agent_turn，不写 push_log**：写 suppressed 行会污染 seq 计数
+                conn.rollback()
+                self._audit_cap("通道 B 日上限")
+                return None
+            total_cap = int(self.cfg.notify.daily_cap)
+            used = pushed_today(conn, channel=None, exclude_segments=(2,),
+                                exclude_kinds=NON_PUSH_KINDS, day=today)
+            if used >= total_cap:
+                conn.rollback()
+                self._audit_cap("推送总日上限")
+                return None
 
-        # 同 code 同 kind 的独立推送刚发过 → 改成对原条追加第二段（§7.2 去重表）
-        if code:
-            # **不传 kind**：§7.2 的去重是「同一 code 最近有没有推过」，跨 kind 才算
-            # 「刚说过这只票」。kind 过滤是批1 dispatcher 自己那条规则（避免
-            # 「先突破后跌破」被压掉），两者不是一回事。
-            prev = recent_independent_push(conn, code6_of(code),
-                                           minutes=int(self.cfg.notify.dedupe_min),
-                                           now=self.clock.now())
-            if prev is not None:
-                # **只对真实事件第一段追加**：event_id 为 NULL 的（开盘简报、通道 B
-                # 自己、alert）second_segment(None) 永不命中，会把这条提醒无声吞掉
-                if prev.event_id is not None and prev.segment == 1 and prev.status == "accepted":
-                    return self.second_segment(prev.event_id, decision, grounded)
+            # 同 code 同 kind 的独立推送刚发过 → 改成对原条追加第二段（§7.2 去重表）
+            if code:
+                # **不传 kind**：§7.2 的去重是「同一 code 最近有没有推过」，跨 kind 才算
+                # 「刚说过这只票」。kind 过滤是批1 dispatcher 自己那条规则（避免
+                # 「先突破后跌破」被压掉），两者不是一回事。
+                prev = recent_independent_push(conn, code6_of(code),
+                                               minutes=int(self.cfg.notify.dedupe_min),
+                                               now=self.clock.now())
+                if prev is not None:
+                    # **只对真实事件第一段追加**：event_id 为 NULL 的（开盘简报、通道 B
+                    # 自己、alert）second_segment(None) 永不命中，会把这条提醒无声吞掉
+                    if (prev.event_id is not None and prev.segment == 1
+                            and prev.status == "accepted"):
+                        conn.rollback()          # 额度不占：这条并入原条
+                        return self.second_segment(prev.event_id, decision, grounded)
 
-        text = getattr(grounded, "text", None) or getattr(decision, "body", "") or ""
-        seq_id = self._note_seq(code, target, today)
-        row_id = self._insert(code=code6_of(code) if code else None, kind=AGENT_NOTE_KIND,
-                              level="P2", seq_id=seq_id, segment=1, body=text,
-                              event_id=None, signal_id=None, trade_date=today)
+            text = getattr(grounded, "text", None) or getattr(decision, "body", "") or ""
+            seq_id = self._note_seq(code, target, today)
+            row_id = self._insert(code=code6_of(code) if code else None, kind=AGENT_NOTE_KIND,
+                                  level="P2", seq_id=seq_id, segment=1, body=text,
+                                  event_id=None, signal_id=None, trade_date=today)
+            conn.commit()                    # 先落 `pending` 占住额度
+        except BaseException:
+            conn.rollback()
+            raise
+
+        # **真正的发送放在事务外**：网络调用不该占着写锁
         msg = Message(title=_title(decision, _name_of(code6_of(code) if code else None)),
                       body=text, priority=_priority(decision), seq_id=seq_id)
         return self._send(row_id, msg)

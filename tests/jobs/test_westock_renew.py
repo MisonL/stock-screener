@@ -227,12 +227,18 @@ def test_import_job_writes_watch_stock(conn, CFG, tmp_path):
 
 def test_renew_job_uses_injected_runner(conn, CFG, tmp_path, runner):
     clock = FixedClock(T0)
+    # **必须传临时 env_path**：不传时脚本会写默认的 `/state/westock.env`
+    # （真实凭据文件）。可写环境里会把它覆盖掉，不可写环境里直接失败。
     sched, _state = make_scheduler(CFG, conn, clock, westock_runner=runner,
-                                  data_dir=str(tmp_path))
+                                  data_dir=str(tmp_path),
+                                  westock_env_path=tmp_path / "westock.env")
     job = {j.id: j for j in sched.get_jobs()}["westock_renew"]
     job.func()
     assert len(runner.calls) == 1
     assert _secret(conn, DAY_KEY) is not None
+    # 断言**真的续期成功**：只看 runner 调用次数的话，续期失败也照样绿
+    marker = _secret(conn, DAY_KEY) or ""
+    assert marker.startswith("ok:"), f"续期没成功（marker={marker}），但测试是绿的"
 
 
 def test_cache_paths_passed_from_env(monkeypatch, tmp_path, clock, conn):
@@ -390,7 +396,8 @@ def test_renew_runs_the_script_without_holding_the_write_lock(conn, CFG, tmp_pat
     globals()["_SEEN_LOCK"] = real_lock
 
     sched, _state = make_scheduler(CFG, conn, clock, loops=loops, westock_runner=runner,
-                                   data_dir=str(tmp_path))
+                                   data_dir=str(tmp_path),
+                                   westock_env_path=tmp_path / "westock.env")
     {j.id: j for j in sched.get_jobs()}["westock_renew"].func()
 
     assert seen.get("free") is True, (

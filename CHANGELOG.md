@@ -33,6 +33,26 @@
 
 ## [Unreleased]
 
+### 修复
+
+- **推送日额度检查与预留不原子**（D1）。`_capped()` 在 `BEGIN IMMEDIATE`
+  **之前**执行，jobs 的通道 A 与 agent 的通道 B 会各自读到 59/60 然后都放行，
+  实际发到 61——SQLite 的写串行化救不了"事务外已经做出的额度决定"。
+  现在额度判断移进认领事务（写锁到手后再读）；超限仍写 `suppressed` 审计行，
+  P0 豁免通过 `enforce_cap=False` 透传。agent 侧 `agent_note` 同样处理，
+  发送动作移到事务提交之后（网络调用不该占写锁）。
+  注：`attention.shadow_mode: true` 期间通道 B 不推送，所以此前不会触发；
+  这是启用 agent 正式模式前必须解决的前置问题。
+
+- **测试没有隔离外部依赖**（T1）。api fixture 不注入 `llm` 时 `ChatSession`
+  会自建 `LlmClient` 去连真实地址；自检与续期用例也存在真实出站/默认路径写入。
+  - `create_app` 增加 `chat_llm` 注入口，api fixture 改用 `OfflineChatLlm`
+  - 续期用例显式传临时 `westock_env_path`（原来会写默认的 `/state/westock.env`）
+  - `test_renew_job_uses_injected_runner` 增加"真的续期成功"断言
+    （原来续期失败也照样绿）
+  - 新增 autouse 的 `_no_real_network` 守卫：默认禁止非本机地址的 socket 连接，
+    以后新引入的真实出站会直接报错而不是悄悄拖慢整套
+
 ## [0.2.68] - 2026-11-18
 
 ### 修复

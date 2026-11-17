@@ -60,9 +60,10 @@ class Dispatcher:
             self._log(sig, "suppressed")
             return
         pinned = sig.level == "P0"
-        if not pinned and self._capped():
-            self._log(sig, "suppressed")
-            return
+        # **额度不再在这里判**：事务外读到的是过期快照，会和另一个服务一起超限。
+        # 真正的判定在 `_push_rows` 的 `BEGIN IMMEDIATE` 里（写锁到手后再读）。
+        # 这里只负责把"超限"表达成 suppressed 日志——代价是合并缓冲也要走一遍，
+        # 但额度检查本来就是廉价查询。
         now = self.clock.now()
         if not pinned and self._pool_overflowing():
             self._overflow.append((now, sig))
@@ -208,12 +209,17 @@ class Dispatcher:
         # **必须带 kind**：同一只票同一天首次突破与首次跌破都是 seq=1，
         # 只按 code+date+seq 生成会让第二条撞上认领键，被静默吞掉
         seq_id = _seq_id(sig)
-        self._push_log(row=self._row(sig, sig.kind, level, seq_id=seq_id), msg=msg, claim=True)
+        # **P0 豁免额度**（原来是 `_route` 里 `not pinned` 挡住检查）：
+        # 判定移进事务后，豁免要跟着传下去，否则 P0 会被额度挡掉。
+        self._push_log(row=self._row(sig, sig.kind, level, seq_id=seq_id), msg=msg,
+                       claim=True, enforce_cap=sig.level != "P0")
 
-    def _push_log(self, row: dict, msg: Message, claim: bool = False) -> None:
-        self._push_rows([row], msg, claim=claim)
+    def _push_log(self, row: dict, msg: Message, claim: bool = False,
+                  enforce_cap: bool = True) -> None:
+        self._push_rows([row], msg, claim=claim, enforce_cap=enforce_cap)
 
-    def _push_rows(self, rows: list[dict], msg: Message, claim: bool = False) -> bool:
+    def _push_rows(self, rows: list[dict], msg: Message, claim: bool = False,
+                   enforce_cap: bool = True) -> bool:
         """一次写事务认领这批待发行 + 一次发布 + 同状态回写。
 
         认领键是 `seq_id`：api 与 jobs 各自持一个 `Dispatcher`、共用一个 SQLite 库，
@@ -226,6 +232,24 @@ class Dispatcher:
         # IMMEDIATE 在语句开始时就拿写锁，把「查 + 插」变成真正的跨进程原子操作。
         self.conn.execute("BEGIN IMMEDIATE")
         try:
+            # **额度判断也放进这个事务**：原来 `_route` 在事务外先查一次
+            # `_capped()`，等真正写 `pending` 时额度可能已经被另一个服务
+            # （agent 的通道 B）用掉——两边各自读到 59/60 然后都放行，实际发到 61。
+            # `BEGIN IMMEDIATE` 已经拿到写锁，这里读到的就是最新已提交值。
+            if enforce_cap and self._capped():
+                # 超限：不写 `pending`（不占位），但**要留 suppressed 审计行**——
+                # 事后要能回答「今天为什么没推这条」，没有这行就等于静默丢弃。
+                self.conn.rollback()
+                for row in rows:
+                    self.conn.execute(
+                        "INSERT INTO push_log(ts, code, kind, level, seq_id, segment, body,"
+                        " event_id, signal_id, trade_date, status)"
+                        " VALUES (?,?,?,?,?,?,?,?,?,?,'suppressed')",
+                        (now, row["code"], row["kind"], row["level"], row["seq_id"],
+                         row["segment"], msg.body, row["event_id"], row["signal_id"],
+                         row["trade_date"]))
+                self.conn.commit()
+                return False
             if claim:
                 claimed = self.conn.execute(
                     "SELECT 1 FROM push_log WHERE seq_id = ? AND status IN ('pending','accepted')"

@@ -44,11 +44,15 @@ def _json_or_none(raw):
         return None
 
 
-def create_app(cfg, conn_factory, clock, dispatcher=None, mcp=None) -> FastAPI:
+def create_app(cfg, conn_factory, clock, dispatcher=None, mcp=None, chat_llm=None) -> FastAPI:
     """`dispatcher` 只给 watchdog 用（告警由 api 直接发，不经过 jobs/agent，§7.6.4）。
 
     `mcp` 是 `mcp.westock.WestockMcp`（确认卡回调执行写操作时用）；None 时按
     `/state/westock.env` 惰性建一个——api 进程不共享 agent 的 `Deps`（Task 14）。
+
+    `chat_llm` 只给测试注入用：不传时 `ChatSession` 会自建 `LlmClient(cfg)`，
+    测试里就是**真的发网络请求**（本机没有 key/网络时表现为超时或 DNS 失败，
+    但仍是真实的出站尝试）。生产不传，走默认路径。
     """
 
     @asynccontextmanager
@@ -100,7 +104,7 @@ def create_app(cfg, conn_factory, clock, dispatcher=None, mcp=None) -> FastAPI:
 
     register_agent_log(app, conn_factory, clock, cfg)
     # **单例**：ChatSession 在 api 进程启动时构造一次，路由不每次新建（D18）
-    chat_session = ChatSession(conn_factory(), cfg, clock)
+    chat_session = ChatSession(conn_factory(), cfg, clock, llm=chat_llm)
     # 传 public_host 才会启用同源校验（它花 LLM 预算，和 /api/watch 同级）
     register_chat(app, chat_session, str(cfg.notify.public_host).strip())
     snap = SnapshotCache(conn_factory)

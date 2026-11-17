@@ -610,3 +610,41 @@ def test_pool_alerts_is_pushed(env):
     rows = env.conn.execute(
         "SELECT kind, level FROM push_log WHERE kind LIKE '%pool%'").fetchall()
     assert rows, "调用后 push_log 里没有任何池子告警记录"
+
+
+def test_cap_is_enforced_inside_the_claim_transaction(env):
+    """**额度判断必须在认领事务里**，否则两个服务会一起超限。
+
+    原来 `_route` 在 `BEGIN IMMEDIATE` **之前**就查了一次 `_capped()`：
+    jobs 的通道 A 与 agent 的通道 B 各自读到 59/60 然后都放行，实际发到 61。
+    SQLite 的写串行化救不了"事务外已经做出的额度决定"。
+
+    这里直接把额度填到 `cap - 1`，再在同一连接上模拟"另一个人刚提交了一条"，
+    然后走真实的认领路径——事务里重新读到的额度必须是满的。
+    """
+    env.conn.execute("UPDATE signals SET level='P1'")
+    env.conn.commit()
+    cap = int(CFG.notify.daily_cap)
+    for i in range(cap - 1):
+        write_push_log(env.conn, code=f"8{i:05d}", kind="alert", ts=T0.isoformat(), level="P2")
+    env.conn.commit()
+
+    # 另一个人（另一个服务）抢在判断之前提交了第 cap 条
+    write_push_log(env.conn, code="899999", kind="alert", ts=T0.isoformat(), level="P2")
+    env.conn.commit()
+
+    # 直接走 ： 前面还有去重/合并等分支，会掩盖额度这条路
+    from notify.dispatcher import load_sig as _ls
+
+    sig = _ls(env.conn, env.ids["sh600519"])
+
+    from notify.policy import NON_PUSH_KINDS, pushed_today as _pt
+
+    n = _pt(env.conn, exclude_segments=(2,), exclude_kinds=NON_PUSH_KINDS, day=20261030)
+    assert n >= cap, f"前提不成立：额度只用到 {n}/{cap}"
+    assert env.disp._capped() is True, "前提不成立：_capped() 没判超限"
+
+    env.disp._route(sig)
+
+    assert statuses(env.conn)[-1] == "suppressed", (
+        "额度已经满了却仍然放行：说明额度是在写事务之外判断的")

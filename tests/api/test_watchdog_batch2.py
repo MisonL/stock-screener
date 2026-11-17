@@ -190,3 +190,42 @@ def test_llm_down_not_fired_without_failures(env):
     _turn(env.conn, decision="speak", ts=T0 - timedelta(minutes=span + 1))
     _turn(env.conn, decision="silent", ts=T0 - timedelta(minutes=1))
     assert _llm_down(env.conn, env.cfg, T0) is False
+
+
+def test_llm_down_stays_true_when_the_first_failure_slides_out_of_the_window(env):
+    """**一直失败时告警不能自己消失**。
+
+    旧实现每轮从"最近 `minutes` 的移动窗口"里挑最早的那次失败当基线：
+    随着时间推移最早的失败滑出窗口，基线跳到更新的失败、门槛重新计时，
+    于是 `10:10` 判 true、`10:10:01` 就变回 false——真故障里告警自己消失。
+    这里没有任何成功回合，正是最该持续报警的情形。
+    """
+    span = int(CFG.agent.llm_down.minutes)
+    _turn(env.conn, decision="timeout", ts=T0 - timedelta(minutes=span))       # 10:00
+    _turn(env.conn, decision="timeout", ts=T0 - timedelta(minutes=span - 5))   # 10:05
+
+    assert _llm_down(env.conn, env.cfg, T0) is True, "满 10 分钟时没报"
+    # 再过 1 秒、再过 2 分钟：故障仍在持续，判定必须保持 true
+    assert _llm_down(env.conn, env.cfg, T0 + timedelta(seconds=1)) is True, (
+        "跨过 10 分钟线一秒后告警就消失了：基线跟着移动窗口漂了")
+    assert _llm_down(env.conn, env.cfg, T0 + timedelta(minutes=2)) is True, (
+        "故障持续中，最早那次失败滑出窗口后告警消失")
+
+
+def test_api_status_age_matches_watchdog_after_lunch_break(env):
+    """`/api/status` 的活动年龄必须和 watchdog 同一口径。
+
+    只按最后一回合算的话，午休正常休眠后 13:00 开盘、第一条下午回合完成前，
+    首页会算出 100 分钟并把**正常**状态标红。两边都要用
+    `max(最后一回合, 本时段起点)`。
+    """
+    from api.watchdog import _last_turn_age
+
+    # 上午最后一回合 11:20，现在是 13:00 开盘
+    _turn(env.conn, decision="speak",
+          ts=datetime(2026, 11, 17, 11, 20, tzinfo=SH))
+    now = datetime(2026, 11, 17, 13, 0, tzinfo=SH)
+
+    age = _last_turn_age(env.conn, now, first_check=None)
+    assert age is not None
+    assert age < 60, f"午休后的年龄应按本时段起点算（<60s），实际 {age/60:.0f} 分钟"

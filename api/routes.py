@@ -525,8 +525,14 @@ def create_app(cfg, conn_factory, clock, dispatcher=None, mcp=None) -> FastAPI:
                 from core.clock import SH as _SH
 
                 ts = ts.replace(tzinfo=_SH)
+            # **基线要跟 watchdog 一样取 `max(最后一回合, 本时段起点)`**。
+            # 只按最后一回合算，午休 11:30–13:00 正常休眠后，13:00 开盘
+            # 第一条下午回合完成前会算出 100 分钟，首页把正常状态标红。
+            from api.watchdog import _session_start as _sess
+
             agent_turn_stale_min = round(
-                (clock.now() - ts.astimezone(clock.now().tzinfo)).total_seconds() / 60, 1)
+                (clock.now() - max(ts.astimezone(clock.now().tzinfo), _sess(clock.now()))
+                 ).total_seconds() / 60, 1)
         else:
             first = one("SELECT value FROM job_state WHERE name = 'watchdog.first_check'")
             if first and first[0]:

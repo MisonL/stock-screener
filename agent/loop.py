@@ -42,6 +42,11 @@ class Trigger:
     rounds_budget: int = 6
     deadline_s: float = 60
     alarm_id: int | None = None
+    # **闹钟的上下文**（`agent/main.py` 的 `_trigger` 一直往实例上挂，但渲染器没读过）。
+    # 不声明成正式字段，模型就永远拿不到"要回访哪只票、为什么回访"——
+    # 不同闹钟会渲染出完全相同的请求。
+    target: str | None = None
+    note: str = ""
 
 
 @dataclass
@@ -103,6 +108,15 @@ def _messages(trigger: Trigger, rendered: Rendered) -> list[dict]:
     what = f"唤醒类型：{trigger.wake_kind}"
     if trigger.wake_kind == "event":
         what += f"（{len(trigger.events or [])} 条事件，通道 {trigger.channel}）"
+    # **闹钟的标的与备注必须进请求**：它们是这次唤醒的唯一理由，
+    # 只挂在 Trigger 上等于没说——模型会按普通心跳处理，不知道要回访谁。
+    if trigger.wake_kind == "alarm":
+        if trigger.target:
+            what += f"\n回访标的：{trigger.target}"
+        if trigger.note:
+            what += f"\n回访原因：{trigger.note}"
+        if trigger.alarm_id is not None:
+            what += f"\n闹钟记录：#{trigger.alarm_id}"
     return [{"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": rendered.text + "\n\n" + what}]
 

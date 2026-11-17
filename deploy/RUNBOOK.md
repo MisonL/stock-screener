@@ -122,7 +122,13 @@ VM 侧要到第 6 节 `up` 之后再验：`$DC ps cloudflared` 显示 running，
   票据有效期 30 天（`SS_SESSION_DAYS` 可改，**同时作用于 Cookie 与推送链接**）。
   **本地 http 调试时 Secure Cookie 不会持久化**：浏览器与 httpx 都不回传，
   每次请求仍要 Basic。这是 `Secure` 属性的应有行为，别为了本地方便去掉它。**要让所有在飞链接立刻失效**：
-  删掉 `sqlite3 data/market.db "DELETE FROM app_secret WHERE name='hmac_key'"` 再重启 api。
+  删掉 `sqlite3 data/market.db "DELETE FROM app_secret WHERE name='hmac_key'"`
+  再重启 **api / jobs / agent 三个服务**（`docker compose restart api jobs agent`）。
+
+  **只重启 api 是不够的**：`Dispatcher` 在构造时就把密钥缓存进实例，而 jobs 与
+  agent 各自长期持有一个 `Dispatcher`（`jobs/main.py`、`agent/main.py`）。只重启 api
+  的话，api 用新密钥验签，而 jobs/agent 仍用**旧密钥**渲染新通知——那些通知点开
+  一律验签失败，直到签名方重新加载密钥。
   访问日志里的 `t`/`exp` 会自动打码成 `***`，不会把凭据写进 `docker logs`。
 - 口令比较用 `hmac.compare_digest`（常量时间），避免前缀时序泄露
 
@@ -155,7 +161,10 @@ Zero Trust → Access → Applications 新建 **Self-hosted** 应用：
 - **坑**：经 cloudflared 隧道进来的请求，`request.client.host` 是**隧道容器 IP**，不是 `127.0.0.1`——
   所以「127.0.0.1 白名单」在生产会静默失效，**绝不能依赖它**，生产必须走一次性 token。
 
-验证：留到第 6 节（浏览器访问 `https://stock.<域名>/healthz`，先出现 Access 邮箱验证）。
+验证：留到第 6 节（浏览器访问 `https://stock.<域名>/healthz`，**应当直接返回 JSON**）。
+
+**注意**：当前默认方案是应用内置 Basic，`/healthz` 在免鉴权清单里，浏览器不会弹任何
+登录框；出现 Access 邮箱验证只在你**额外启用**了第 3 节末尾那个可选方案时才成立。
 
 ---
 
@@ -236,13 +245,18 @@ curl -si -N --http1.1 \
 # 期望：HTTP/1.1 101 Switching Protocols
 ```
 
-`https://stock.<域名>/healthz`：**用浏览器打开**（curl 没有 Access 会话，会拿到登录重定向而不是 200）。
-期望：先出现 Access 邮箱验证 → 验完 200、正文 `{"ok":true,"version":"x.y.z"}`。
+`https://stock.<域名>/healthz`：**默认方案下直接 curl 就行**——它在免鉴权清单里，
+不弹口令、也不要 Access。期望 200、正文 `{"ok":true,"version":"x.y.z"}`。
 （**带 `version`**：这是确认「线上跑的是哪一版」的唯一权威出口。）
-要用命令行验证，就在**你自己的电脑**上：
 
 ```bash
-cloudflared access curl https://stock.<域名>/healthz    # Access 登录后输出 {"ok":true,"version":"x.y.z"}
+curl -s https://stock.<域名>/healthz    # {"ok":true,"version":"x.y.z"}
+```
+
+**只有在你额外启用了 Cloudflare Access 那个可选方案时**，才需要走浏览器登录或：
+
+```bash
+cloudflared access curl https://stock.<域名>/healthz    # Access 登录后输出同样内容
 ```
 
 ### 跨容器连通性

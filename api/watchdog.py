@@ -182,13 +182,28 @@ def _llm_down(conn, cfg, now: datetime) -> bool:
         # **基线取窗口内最早的那次失败，且窗口起点本身也算边界**：只用
         # 「now - span」做判据时，正好 10 分钟为 true、10.01 分钟又变 false
         # （两次查询之间基线漂移）。把基线钉在固定的时间点上就没有这个问题。
-        since = (now - timedelta(minutes=span_min)).isoformat()
-        first_fail = conn.execute(
+        #
+        # **基线必须是"这一轮故障的起点"，不能每轮从移动窗口里重挑。**
+        # 旧实现取「窗口内最早的那次失败」：随着时间推移，最早的失败滑出窗口，
+        # 基线就跳到更新的那条失败、门槛重新计时。结果「一直失败」反而
+        # 永远凑不满 10 分钟——实测 10:00/10:05 两次失败、无成功记录时，
+        # 10:10 判 true，10:10:01 就变回 false，告警在真故障里自己消失。
+        #
+        # 现在的取法：最近一次成功之后的第一条失败（没有成功记录时，
+        # 就是全部历史里的第一条失败）。窗口只用来挡住"陈年旧失败"——
+        # 用 idle 起点（`now - minutes`）与故障起点取较大者，
+        # 故障持续得越久，`now - base` 越大，门槛只会更容易满足，不会反转。
+        fault_start = conn.execute(
             "SELECT min(ts) FROM agent_turn WHERE decision IN ('timeout','error')"
-            " AND ts >= ?", (since,)).fetchone()
-        base = _aware(first_fail[0]) if first_fail and first_fail[0] else None
+            " AND ts >= ?", (last_ok_at.isoformat() if last_ok_at else "",)).fetchone()
+        base = _aware(fault_start[0]) if fault_start and fault_start[0] else None
         if base is None:
-            return False                     # 窗口内没有失败：不判 llm_down
+            return False                     # 从没有过失败：不判 llm_down
+        # 故障起点早于窗口（= 陈年旧账，新部署刚起来）：按窗口起点算
+        window_start = now - timedelta(minutes=span_min)
+        if base < window_start - timedelta(minutes=span_min):
+            return False                     # 太久以前的事，本轮不据此报警
+        base = max(base, window_start)
     if base is not None and (now - base).total_seconds() >= span_min * 60:
         failed_since = conn.execute(
             "SELECT count(*) FROM agent_turn WHERE decision IN ('timeout','error') AND ts >= ?",

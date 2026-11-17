@@ -281,3 +281,27 @@ def test_main_round_charges_real_usage():
     assert "def _charge(deps" not in src, "旧的 result 版 helper 不能留（会被误用）"
 
 
+
+
+def test_alarm_context_reaches_the_model_messages():
+    """闹钟的标的与备注必须**真的进到模型请求**里。
+
+    原来的守卫只检查 `agent/main.py` 里有没有 `trig.target = ...` 这几行源码，
+    绿着也证明不了模型收到了字段——实测 Trigger 上有 `sh601318` 和唯一备注，
+    渲染出的 messages 里两者都不存在，不同闹钟产生完全相同的请求。
+    """
+    from agent.loop import Trigger, _messages
+    from agent.loop import render_trigger  # noqa: F401  （确保能 import）
+
+    t = Trigger(wake_kind="alarm", alarm_id=7, target="sh601318",
+                note="AUDIT_ALARM_NOTE_77")
+    msgs = _messages(t, type("R", (), {"text": "基准段落"})())
+
+    joined = "\n".join(m["content"] for m in msgs)
+    assert "sh601318" in joined, f"闹钟标的没进请求：{joined!r}"
+    assert "AUDIT_ALARM_NOTE_77" in joined, "闹钟备注没进请求"
+
+    # 另一个闹钟必须产生**不同**的请求
+    other = _messages(Trigger(wake_kind="alarm", alarm_id=8, target="sz000001",
+                              note="OTHER_NOTE"), type("R", (), {"text": "基准段落"})())
+    assert "\n".join(m["content"] for m in other) != joined, "两个不同闹钟的请求完全一样"

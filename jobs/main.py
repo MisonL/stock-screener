@@ -280,8 +280,12 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
         # 写 `app_secret`（每天至多一次的落点 + 到期时间）：同进程每秒的 tick
         # 共用同一个 conn，不串行就会交错。启动补跑是 DateTrigger(+60s)，
         # 可能落在盘中任何时刻，所以不能只按「08:40 不在盘中」推断安全。
-        with _write_lock(loops):
-            return renew_if_needed(conn, clock, runner, dispatcher=dispatcher, **kwargs)
+        #
+        # **锁只包住写库那几句，不包脚本**：`_run` 会等扫码，最长 600 秒。
+        # 原来整段都在锁里，续期期间每秒的 tick、心跳、快照缓存全部停摆，
+        # watchdog 会判死，而独立健康文件照常刷新——Docker 绿着，业务已经停了。
+        return renew_if_needed(conn, clock, runner, dispatcher=dispatcher,
+                               write_lock=_write_lock(loops), **kwargs)
 
     def actions_refresh_job():
         """滚动推进除权/停牌刷新（每轮一小段，见 `make_refresh_hooks`）。"""
@@ -477,9 +481,16 @@ def _llm_probe(cfg) -> bool:                       # pragma: no cover - 网络�
     key_env = str(getattr(getattr(cfg, "llm", None), "api_key_env", "") or "LLM_API_KEY")
     api_key = os.environ.get("LLM_API_KEY") or os.environ.get(key_env, "")
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    # **必须用配置里的真实模型名**：写死 "probe" 时，凡是"正常调用可用、
+    # 但不存在叫 probe 的模型"的端点（很常见）都会被自检判成故障，
+    # 08:55 那次自检就会推一条假告警。
+    model = (os.environ.get("LLM_MODEL")
+             or getattr(getattr(cfg, "llm", None), "model", None) or "").strip()
+    if not model:
+        return False
     resp = httpx.post(f"{url.rstrip('/')}/chat/completions", timeout=10, trust_env=False,
                       headers=headers,
-                      json={"model": "probe", "messages": [{"role": "user", "content": "ping"}],
+                      json={"model": model, "messages": [{"role": "user", "content": "ping"}],
                             "max_tokens": 1})
     # 4xx 一律不算健康：401/403 是密钥问题，404/400 是路径或参数问题，
     # 这些正是自检该报出来的；只有 2xx/3xx 才说明链路通。

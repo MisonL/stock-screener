@@ -355,3 +355,43 @@ def test_renew_decisions_are_logged(conn, clock, runner, caplog):
         assert renew_if_needed(conn, clock, runner) == "renewed"
     msgs = [r.message for r in caplog.records if r.name == "westock_renew"]
     assert any("renew" in m.lower() for m in msgs), f"续期成功没有日志：{msgs}"
+
+
+def test_renew_runs_the_script_without_holding_the_write_lock(conn, CFG, tmp_path):
+    """**脚本必须在锁外跑**：它等扫码，最长 600 秒。
+
+    原来 `westock_renew_job` 把整段包在 `with write_lock` 里，续期期间每秒的
+    tick、心跳、快照缓存全部停摆，watchdog 判死——而独立健康文件照常刷新，
+    Docker 看着是绿的，业务其实已经停了。
+    """
+    import threading
+
+    clock = FixedClock(T0)
+    seen = {}
+    _seen = {}
+
+    def runner(cmd, **kw):
+        # 脚本执行期间，tick 用的那把锁必须是**空闲的**
+        lk = globals()["_SEEN_LOCK"]
+        got = lk.acquire(blocking=False)
+        seen["free"] = got
+        if got:
+            lk.release()
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    # 显式给一把真锁：`loops=None` 时 `_write_lock()` 退化成空锁，测不出任何东西
+    real_lock = threading.Lock()
+    loops = SimpleNamespace(lock=real_lock)
+    _seen["lock"] = real_lock
+    globals()["_SEEN_LOCK"] = real_lock
+
+    sched, _state = make_scheduler(CFG, conn, clock, loops=loops, westock_runner=runner,
+                                   data_dir=str(tmp_path))
+    {j.id: j for j in sched.get_jobs()}["westock_renew"].func()
+
+    assert seen.get("free") is True, (
+        "脚本执行期间写锁仍被持有：续期会卡住心跳和快照")

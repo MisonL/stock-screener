@@ -45,18 +45,30 @@ def kv_get(conn, name: str) -> str | None:
     return None if row is None else str(row[0])
 
 
-def kv_set(conn, name: str, value: str) -> None:
-    with conn:
+def kv_set(conn, name: str, value: str, lock=None) -> None:
+    """写一条 app_secret。`lock` 是进程内写锁，传入时**只在写这一句时持有**。"""
+    if lock is None:
+        with conn:
+            conn.execute("INSERT OR REPLACE INTO app_secret(name, value) VALUES (?, ?)",
+                         (name, str(value)))
+        return
+    with lock, conn:
         conn.execute("INSERT OR REPLACE INTO app_secret(name, value) VALUES (?, ?)",
                      (name, str(value)))
 
 
 def renew_if_needed(conn, clock, runner=subprocess.run, *, dispatcher=None,
-                    env_path=ENV_PATH, script=SCRIPT, node="node") -> str:
+                    env_path=ENV_PATH, script=SCRIPT, node="node",
+                    write_lock=None) -> str:
     """返回 `"skip"` / `"renewed"` / `"failed"`。
 
     `runner` 的契约与 `subprocess.run` 一致（`runner(cmd, capture_output=True,
     text=True, timeout=…)` → 有 `returncode` 的对象），测试注入假体。
+
+    `write_lock` 是进程内写锁（`jobs/main.py` 的 `loops.lock`）。**本函数调用时
+    不能让调用方持着这把锁**：`_run` 会等扫码，最长 600 秒，在锁里等会让每秒的
+    tick、心跳、快照缓存全部停摆（watchdog 判死，而独立健康文件照常刷新，
+    Docker 看着是绿的）。锁只包住写 `app_secret` 的那几句。
     """
     now_ts = int(clock.now().timestamp())
     day = clock.today()
@@ -86,18 +98,22 @@ def renew_if_needed(conn, clock, runner=subprocess.run, *, dispatcher=None,
     retrying = marker is not None
     import os
 
+    # **脚本在任何锁之外跑**：`_run` 会等扫码，最长 `TIMEOUT_S`（600 秒）。
+    # 若调用方握着同进程 tick 共用的写锁，这十分钟里心跳和快照缓存全都停摆，
+    # watchdog 会判死，而独立健康文件还在刷新——Docker 看着是绿的，业务已经停了。
+    # 所以 `write_lock` 只作用于下面的 `kv_set`，不包这一段。
     ok = _run(runner, node, script, env_path,
               client_cache=Path(os.environ[CLIENT_CACHE_ENV]) if os.environ.get(CLIENT_CACHE_ENV) else None,
               session_cache=Path(os.environ[SESSION_CACHE_ENV]) if os.environ.get(SESSION_CACHE_ENV) else None)
     if not retrying:
         # 无论成败都写：这是「每天至多一次」的唯一落点
-        kv_set(conn, day_key, f"{'ok' if ok else 'fail'}:{now_ts}")
+        kv_set(conn, day_key, f"{'ok' if ok else 'fail'}:{now_ts}", lock=write_lock)
     if ok:
         if retrying:
-            kv_set(conn, retry_key, str(now_ts))
+            kv_set(conn, retry_key, str(now_ts), lock=write_lock)
         exp = _read_expires(env_path)
         if exp is not None:
-            kv_set(conn, EXPIRES_KEY, str(exp))
+            kv_set(conn, EXPIRES_KEY, str(exp), lock=write_lock)
         log.info("续期 renew 成功%s：新到期时间 %s",
                  "（重试）" if retrying else "",
                  "未知" if exp is None else f"epoch={exp}")
@@ -105,7 +121,7 @@ def renew_if_needed(conn, clock, runner=subprocess.run, *, dispatcher=None,
     if not retrying:
         log.warning("续期失败（第一次）：%d 秒后还有一次重试机会", RETRY_AFTER_S)
         return "failed"                    # 第一次失败不告警：5 分钟后还有一次机会
-    kv_set(conn, retry_key, str(now_ts))
+    kv_set(conn, retry_key, str(now_ts), lock=write_lock)
     log.error("续期失败（重试也用掉）：需要人工扫码")
     if dispatcher is not None:
         dispatcher.alert("westock_renew", "腾讯自选股授权需要扫码", "P1")

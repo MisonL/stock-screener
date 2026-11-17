@@ -839,6 +839,18 @@ def test_every_db_writing_job_holds_the_shared_write_lock():
             return getattr(expr.value, "id", None) in {"tick", "loops"}
         return False
 
+    def _passes_write_lock(call) -> bool:
+        """调用点把写锁**作为实参**传进去（`write_lock=_write_lock(loops)`）。
+
+        等价于「在锁内执行」：被调函数自己用这把锁包住写库的那几句。
+        只认实参本身就是写锁表达式的情形，不做名字豁免——否则就成了
+        「只要写了这个关键字就放过」的空洞。
+        """
+        for kw in call.keywords:
+            if kw.arg in {"write_lock", "lock"} and _is_write_lock_expr(kw.value):
+                return True
+        return False
+
     def _guarded_call_ids(node) -> set[int]:
         """收集所有位于写锁 `with` 体内（含多上下文写法）的节点 id。"""
         inside: set[int] = set()
@@ -879,7 +891,7 @@ def test_every_db_writing_job_holds_the_shared_write_lock():
                 and name not in NOT_SOURCE_WRITERS
             if not (named or _writes_sql(call)):
                 continue
-            if id(call) not in inside:
+            if id(call) not in inside and not _passes_write_lock(call):
                 label = f"{name}()" if named else f"SQL {ast.unparse(call)[:40]}"
                 offenders.append(f"{node.name}:{call.lineno} {label}")
 
@@ -1679,3 +1691,35 @@ def test_eod_connection_waits_longer_than_the_shared_one(tmp_path):
     assert own is not conn
     timeout = own.execute("PRAGMA busy_timeout").fetchone()[0]
     assert timeout >= 60000, f"EOD 连接的 busy_timeout 只有 {timeout}ms，撑不过自己的长事务"
+
+
+def test_llm_probe_uses_the_configured_model(monkeypatch):
+    """自检必须用**配置里的真实模型名**发探测。
+
+    写死 `"probe"` 时，凡是"正常调用可用、但不存在叫 probe 的模型"的端点
+    （OpenAI 兼容网关很常见）都会被自检判成故障，08:55 自检推假告警。
+    """
+    import httpx
+    from pathlib import Path
+
+    import jobs.main as J
+    from core.config import load_config
+
+    cfg = load_config(Path("config"))
+    monkeypatch.setenv("LLM_BASE_URL", "https://example.invalid/v1")
+    monkeypatch.setenv(cfg.llm.api_key_env, "sk-test")
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+
+    seen = {}
+
+    def fake_post(url, **kw):
+        seen["json"] = kw.get("json") or {}
+        return httpx.Response(200, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", fake_post, raising=False)
+    assert J._llm_probe(cfg) is True
+
+    assert seen["json"].get("model") == cfg.llm.model, (
+        f"探测发的是 model={seen['json'].get('model')!r}，"
+        f"配置里是 {cfg.llm.model!r}：正常端点会被判成故障")

@@ -213,8 +213,14 @@ def run_eod(cfg, reg, conn, clock) -> EodReport:
                         _log(conn, code, 0, "error", now, purpose="gap_backfill")
                         if _defer_gap(conn, code, last_date, now):
                             report.gaps_deferred += 1
-                    elif _write_gap_bars(conn, bars) and _has_bar_on(conn, code, prev_day):
-                        gapped = True
+                    elif _write_gap_bars(conn, bars):
+                        if _has_bar_on(conn, code, prev_day):
+                            gapped = True
+                        else:
+                            # 写进去了 bar 但 T-1 仍缺（上游只回了更早的旧日线）。
+                            # bar 已经落库，**必须进 `filled` 让 adj 跟着重建**，
+                            # 否则 raw 比 adj 多一根，`_evaluate` 会以 no_adj 整只淘汰。
+                            filled.add(code)
                     else:
                         # 上游"成功"但 T-1 仍缺：可能给了空数组，也可能只回了更早的
                         # 旧日线（限频时上游常这样）。两种情况都不能算补齐、不能清标记。
@@ -300,7 +306,15 @@ def run_eod(cfg, reg, conn, clock) -> EodReport:
                     if _defer_gap(conn, code, last_date, now):
                         report.gaps_deferred += 1
                     continue
-                if not (_write_gap_bars(conn, bars) and _has_bar_on(conn, code, prev_day)):
+                if _write_gap_bars(conn, bars) and not _has_bar_on(conn, code, prev_day):
+                    # 部分补数：bar 已落库但 T-1 仍缺 → 记 error/留 pending，
+                    # 同时进 `filled` 让 adj 重建（否则 raw/adj 长度不等）。
+                    _log(conn, code, 0, "error", now, purpose="gap_backfill")
+                    if _defer_gap(conn, code, last_date, now):
+                        report.gaps_deferred += 1
+                    filled.add(code)
+                    continue
+                if not _has_bar_on(conn, code, prev_day):
                     _log(conn, code, 0, "error", now, purpose="gap_backfill")
                     if _defer_gap(conn, code, last_date, now):
                         report.gaps_deferred += 1
@@ -762,6 +776,22 @@ def _defer_gap(conn, code: str, missing_through: int, now: datetime) -> bool:
 
 
 def _clear_gap(conn, code: str) -> None:
+    """补到缺口目标之后才删 marker；旧范围仍有洞就保留。"""
+    row = conn.execute(
+        "SELECT missing_through FROM gap_pending WHERE code = ?", (code,)).fetchone()
+    if row is not None:
+        through = int(row[0])
+        # `missing_through` 记的是"缺到哪一天（含）"。检查该日**当天**有没有 bar：
+        # 有就说明这段旧洞已经补上，可以删 marker。
+        #
+        # 不能拿"该股 bar 数 vs 全市场交易日数"来比：长期停牌、上市较晚的票
+        # 天然少于全市场，那样会永远保留 marker、每轮重试。
+        # 判不了（该日不在日历上、或本来就不是它该有 bar 的日子）时保守保留。
+        has_bar = conn.execute(
+            "SELECT 1 FROM daily_bars WHERE code = ? AND date = ? LIMIT 1",
+            (code, through)).fetchone()
+        if has_bar is None:
+            return                      # 旧洞还在，保留 marker 给 backfill
     conn.execute("DELETE FROM gap_pending WHERE code = ?", (code,))
 
 

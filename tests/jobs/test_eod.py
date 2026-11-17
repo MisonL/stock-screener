@@ -1002,3 +1002,75 @@ def test_second_pass_does_not_leave_an_open_transaction(env):
     finally:
         other.close()
     assert seen >= 1, "别的连接看不到待补记录：这条记录还没提交"
+
+
+def test_clear_gap_keeps_marker_when_the_old_hole_remains(env):
+    """补上了**新的** T-1，不能顺手把**旧的**缺口 marker 删掉。
+
+    `gap_pending.missing_through` 记的是"旧洞缺到哪一天"。若只按 code 整条删除，
+    旧洞就失去默认续跑的入口——后续正常 EOD 只看最新一根，旧洞再也不会被建回来。
+    """
+    from jobs.eod import _clear_gap, _defer_gap
+
+    code = "sz000001"
+    with env.conn:
+        # 该股缺了 20261015（旧洞），后续 bar 都有
+        for d in (20261013, 20261014, 20261016, 20261017):
+            env.conn.execute(
+                "INSERT OR REPLACE INTO daily_bars(code, date, open, high, low, close,"
+                " volume, amount, source) VALUES (?,?,10,10,10,10,1000,10000,'backfill')",
+                (code, d))
+    _defer_gap(env.conn, code, 20261015, dt(2026, 10, 30, 15, 5))
+    env.conn.commit()
+
+    _clear_gap(env.conn, code)
+
+    assert env.count("gap_pending", code=code) == 1, (
+        "旧洞（20261015）还在，marker 却被删了：这只票再也不会被 backfill 补到")
+
+
+def test_clear_gap_removes_marker_once_the_range_is_filled(env):
+    """旧洞真的补齐了，marker 该删就删（否则会永远重试同一只票）。"""
+    from jobs.eod import _clear_gap, _defer_gap
+
+    code = "sz000001"
+    with env.conn:
+        for d in (20261013, 20261014, 20261015, 20261016, 20261017):
+            env.conn.execute(
+                "INSERT OR REPLACE INTO daily_bars(code, date, open, high, low, close,"
+                " volume, amount, source) VALUES (?,?,10,10,10,10,1000,10000,'backfill')",
+                (code, d))
+    _defer_gap(env.conn, code, 20261015, dt(2026, 10, 30, 15, 5))
+    env.conn.commit()
+
+    _clear_gap(env.conn, code)
+
+    assert env.count("gap_pending", code=code) == 0, "补齐后 marker 没删，会反复重试"
+
+
+def test_partial_gap_write_still_rebuilds_adj(env):
+    """补数只补到更早的日期（T-1 仍缺）时，**已落库的 bar 必须触发 adj 重建**。
+
+    否则 raw 比 adj 多一根，`_evaluate` 会以 `no_adj` 把这只票整只淘汰——
+    补了个寂寞还附赠一次误杀。
+    """
+    with env.conn:
+        env.conn.execute("DELETE FROM stock_meta WHERE code <> 'sz000001'")
+        env.conn.executemany(
+            "INSERT OR REPLACE INTO daily_bars VALUES (?, ?, 10, 10, 10, 10, 1000, 10000, 'backfill')",
+            [("sz000001", d) for d in (20261026, 20261028)],     # 缺 20261027
+        )
+    env.conn.commit()
+    env.reg_today.primary.set("sz000001", ts=dt(2026, 10, 30, 14, 56))   # 陈旧 → 第二遍
+    # 只补到 20261027，**没给**目标 T-1（20261029）
+    env.reg_today.primary.gap_bars = [
+        ("sz000001", 20261027, 10, 10, 10, 10, 1000, 10000),
+    ]
+
+    _run(env, env.reg_today, dt(2026, 10, 30, 15, 5))
+
+    raw = env.conn.execute(
+        "SELECT count(*) FROM daily_bars WHERE code='sz000001'").fetchone()[0]
+    adj = env.conn.execute(
+        "SELECT count(*) FROM daily_bars_adj WHERE code='sz000001'").fetchone()[0]
+    assert raw == adj, f"raw={raw} 但 adj={adj}：部分补数的 bar 没进 adj，会被 no_adj 淘汰"

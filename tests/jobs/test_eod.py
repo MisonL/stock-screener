@@ -935,3 +935,70 @@ def test_prefetched_gap_is_not_blocked_by_write_stage_quota(env, monkeypatch):
         assert env.count("daily_bars", code=code, date=20261029) == 1, (
             f"{code} 被请求了但 T-1 没落库：预取结果被写入阶段的配额挡掉了"
             f"（gaps={rep.gaps}, deferred={rep.gaps_deferred}）")
+
+
+def test_gap_success_requires_the_T1_bar_to_actually_exist(env):
+    """**上游回了 bar 不等于 T-1 补上了**。
+
+    限频时上游常只回更早的旧日线；`_write_gap_bars` 写了东西就返回 True，
+    于是 T-1 仍缺、待补标记却被清掉，默认 backfill 见旧 ok 记录就跳过——
+    缺口永久丢失。
+    """
+    env.conn.executemany(
+        "INSERT INTO daily_bars VALUES (?, 20261028, 10, 10, 10, 10, 1000, 10000, 'backfill')",
+        [("sz000001",)],
+    )
+    env.conn.commit()
+    env.reg_today.primary.pop("sz000001")           # 快照缺行 = 真缺口（缺 20261029）
+    # 上游"成功"但只回了 T-2，没给 T-1
+    env.reg_today.primary.gap_bars = [
+        ("sz000001", 20261028, 10, 10, 10, 10, 1000, 10000),
+    ]
+
+    rep = _run(env, env.reg_today, dt(2026, 10, 30, 15, 5))
+
+    assert rep.gaps == 0, f"T-1 没补上却计成补成功了：gaps={rep.gaps}"
+    assert env.count("gap_pending", code="sz000001") == 1, "待补标记被误清"
+    assert env.count("daily_bars", code="sz000001", date=20261029) == 0
+
+
+def test_second_pass_does_not_leave_an_open_transaction(env):
+    """第二遍的失败分支**不能留下未提交的隐式事务**。
+
+    第二遍不在第一遍的 `with conn` 里；失败分支要 `_log` / `_defer_gap`（写库），
+    不开事务就会留下一个隐式打开的写事务。它只在后面 `rebuild_adj` 恰好也写库时
+    才被顺带提交——没有 append、没有成功补拉的轮次里就一直悬着。
+    启动恢复时 EOD 用独立连接，这个悬空事务会让它自己后面的 marker 写入撞锁
+    （database is locked），记录在别的连接看来也根本不存在。
+    """
+    from pathlib import Path as _Path
+
+    from core.db import connect as _connect
+
+    # 只留一只票：该票陈旧快照 + 历史缺口 + 补数空 → 无 append、无 rebuild，
+    # 没有任何"顺带提交"的机会。这正是 Codex 复现的那个形态。
+    with env.conn:
+        env.conn.execute("DELETE FROM stock_meta WHERE code <> 'sz000001'")
+    env.conn.executemany(
+        "INSERT OR REPLACE INTO daily_bars VALUES (?, 20261028, 10, 10, 10, 10, 1000, 10000, 'backfill')",
+        [("sz000001",)],
+    )
+    env.conn.commit()
+    env.reg_today.primary.set("sz000001", ts=dt(2026, 10, 30, 10, 0))   # 陈旧 → 第二遍
+    env.reg_today.primary.gap_bars = []                                  # 空结果
+
+    rep = _run(env, env.reg_today, dt(2026, 10, 30, 15, 5))
+
+    assert rep.gaps_deferred >= 1, "没走到第二遍的失败分支（测试前提不成立）"
+    assert not env.conn.in_transaction, (
+        "run_eod 返回时连接仍停在未提交的事务里："
+        "EOD 自己后续的写入会被自己锁住")
+
+    # 更硬的证据：别的连接必须能看见这条记录（未提交就看不见）
+    row = env.conn.execute("PRAGMA database_list").fetchone()
+    other = _connect(_Path(row[2]))
+    try:
+        seen = other.execute("SELECT count(*) FROM gap_pending").fetchone()[0]
+    finally:
+        other.close()
+    assert seen >= 1, "别的连接看不到待补记录：这条记录还没提交"

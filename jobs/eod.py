@@ -213,10 +213,11 @@ def run_eod(cfg, reg, conn, clock) -> EodReport:
                         _log(conn, code, 0, "error", now, purpose="gap_backfill")
                         if _defer_gap(conn, code, last_date, now):
                             report.gaps_deferred += 1
-                    elif _write_gap_bars(conn, bars):
+                    elif _write_gap_bars(conn, bars) and _has_bar_on(conn, code, prev_day):
                         gapped = True
                     else:
-                        # 上游成功但没给任何 bar：等同于没补上
+                        # 上游"成功"但 T-1 仍缺：可能给了空数组，也可能只回了更早的
+                        # 旧日线（限频时上游常这样）。两种情况都不能算补齐、不能清标记。
                         _log(conn, code, 0, "error", now, purpose="gap_backfill")
                         if _defer_gap(conn, code, last_date, now):
                             report.gaps_deferred += 1
@@ -271,37 +272,42 @@ def run_eod(cfg, reg, conn, clock) -> EodReport:
     # 判据是「有没有**昨天**那根」（上一交易日），不是「有没有今天之前某一根」：
     # 后者会从 9 月一直补到 10 月，把每只票的 30 根重拉一遍。
     if prev_day is not None:
-        for code in codes:
-            if code in suspended:
-                continue
-            # **`filled` 也要排除**：它只可能在第一遍被加进来，但万一以后控制流
-            # 改成多遍，缺这一条就会对同一只票反复补拉。
-            # **`attempted` 是两遍共用的配额**：第一遍试过的（无论成败）不再试
-            if code in reported or code in filled or code in attempted:
-                continue
-            last_date = last_dates.get(code)
-            if last_date == prev_day:
-                continue
-            if code not in gap_plan:
+        # **第二遍也要有事务边界**：它不在第一遍的 `with conn` 里。失败分支要
+        # `_log` / `_defer_gap`（写库），不开事务就留下一个隐式打开的写事务，
+        # 直到下一次 `with conn` 才提交——启动恢复时会把 EOD 自己后面的 marker
+        # 写入挡在锁外（database is locked）。
+        with conn:
+            for code in codes:
+                if code in suspended:
+                    continue
+                # **`filled` 也要排除**：它只可能在第一遍被加进来，但万一以后控制流
+                # 改成多遍，缺这一条就会对同一只票反复补拉。
+                # **`attempted` 是两遍共用的配额**：第一遍试过的（无论成败）不再试
+                if code in reported or code in filled or code in attempted:
+                    continue
+                last_date = last_dates.get(code)
+                if last_date == prev_day:
+                    continue
+                if code not in gap_plan:
+                    attempted.add(code)
+                    if _defer_gap(conn, code, last_date, now):
+                        report.gaps_deferred += 1
+                    continue
                 attempted.add(code)
-                if _defer_gap(conn, code, last_date, now):
-                    report.gaps_deferred += 1
-                continue
-            attempted.add(code)
-            bars = gap_plan[code]
-            if bars is None:
-                _log(conn, code, 0, "error", now, purpose="gap_backfill")
-                if _defer_gap(conn, code, last_date, now):
-                    report.gaps_deferred += 1
-                continue
-            if not _write_gap_bars(conn, bars):
-                _log(conn, code, 0, "error", now, purpose="gap_backfill")
-                if _defer_gap(conn, code, last_date, now):
-                    report.gaps_deferred += 1
-                continue
-            report.gaps += 1
-            _clear_gap(conn, code)
-            filled.add(code)
+                bars = gap_plan[code]
+                if bars is None:
+                    _log(conn, code, 0, "error", now, purpose="gap_backfill")
+                    if _defer_gap(conn, code, last_date, now):
+                        report.gaps_deferred += 1
+                    continue
+                if not (_write_gap_bars(conn, bars) and _has_bar_on(conn, code, prev_day)):
+                    _log(conn, code, 0, "error", now, purpose="gap_backfill")
+                    if _defer_gap(conn, code, last_date, now):
+                        report.gaps_deferred += 1
+                    continue
+                report.gaps += 1
+                _clear_gap(conn, code)
+                filled.add(code)
 
     for code in sorted(changed | filled):
         rebuild_adj(conn, code)               # Task 10：新增 bar 必须立刻进 adj
@@ -875,6 +881,14 @@ def _fetch_gap_bars(reg, code: str, now: datetime):
     # 只写今天之前的 bar（kline_daily 会带今天盘中那根，会把刚验收的收盘覆盖成 14:00 的值）；
     # 只写主源的 bar（新浪日线只用于校验，不落 daily_bars）。
     return [b for b in bars if b.date < today and (used == "tencent" or b.source == "tencent")]
+
+
+def _has_bar_on(conn, code: str, day: int) -> bool:
+    """该股在 `day` 这一天是否已有 bar。"""
+    row = conn.execute(
+        "SELECT 1 FROM daily_bars WHERE code = ? AND date = ? LIMIT 1",
+        (code, day)).fetchone()
+    return row is not None
 
 
 def _write_gap_bars(conn, bars) -> bool:

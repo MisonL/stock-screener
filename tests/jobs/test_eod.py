@@ -1074,3 +1074,38 @@ def test_partial_gap_write_still_rebuilds_adj(env):
     adj = env.conn.execute(
         "SELECT count(*) FROM daily_bars_adj WHERE code='sz000001'").fetchone()[0]
     assert raw == adj, f"raw={raw} 但 adj={adj}：部分补数的 bar 没进 adj，会被 no_adj 淘汰"
+
+
+def test_old_gap_marker_survives_a_later_partial_fill(env):
+    """**两轮真实 run_eod**：后一轮补上新的 T-1，不能把前一轮旧洞的 marker 删掉。
+
+    这是之前测试没覆盖的组合——前面的 `_clear_gap` 测试是手工 `_defer_gap`
+    塞了"确实缺失的那天"，而生产路径传的是 `prev_day`。这里完全走
+    `run_eod`，用生产的 marker 生成与清除组合来验证。
+    """
+    with env.conn:
+        env.conn.execute("DELETE FROM stock_meta WHERE code <> 'sz000001'")
+        env.conn.executemany(
+            "INSERT OR REPLACE INTO daily_bars VALUES (?, ?, 10, 10, 10, 10, 1000, 10000, 'backfill')",
+            [("sz000001", 20261028)])
+
+    # 第一轮：20261030 的补数为空 → T-1(20261029) 没补上，建 marker
+    env.reg_today.primary.gap_bars = []
+    rep1 = _run(env, env.reg_today, dt(2026, 10, 30, 15, 5))
+    assert rep1.gaps_deferred >= 1
+    marker = env.conn.execute(
+        "SELECT missing_through FROM gap_pending WHERE code='sz000001'").fetchone()
+    assert marker is not None, "第一轮没建 marker"
+    assert marker[0] == 20261029, f"marker 应记缺口目标日 20261029，实际 {marker[0]}"
+
+    # 第二轮（11-03）：只补 20261102，补上新的 T-1，但旧洞 20261029 仍在
+    env.reg_today.primary.gap_bars = [
+        ("sz000001", 20261102, 10, 10, 10, 10, 1000, 10000),
+    ]
+    _run(env, env.reg_today, dt(2026, 11, 3, 15, 5))
+
+    has_old_hole = env.conn.execute(
+        "SELECT 1 FROM daily_bars WHERE code='sz000001' AND date=20261029").fetchone()
+    assert has_old_hole is None, "前提不成立：旧洞已经被补上了"
+    assert env.count("gap_pending", code="sz000001") == 1, (
+        "旧洞 20261029 还在，marker 却被删了——这只票再也不会被 backfill 补到")

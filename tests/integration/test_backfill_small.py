@@ -127,3 +127,30 @@ def test_backfill_keeps_pending_when_target_day_still_missing(tmp_env, monkeypat
     assert rep.gap_unfilled >= 1, "没走到「目标日未补齐」分支（测试前提不成立）"
     assert env.count("gap_pending", code=code) == 1, (
         "目标日 20261029 仍缺，pending 却被删了：这只票再也不会被补到")
+
+
+def test_cli_summary_reports_gap_unfilled(tmp_env, monkeypatch, capsys, tmp_path):
+    """回填 CLI 的汇总行必须带上 `gap_unfilled`。
+
+    这个计数非零表示「有待补记录、但这次上游没补到目标日」（marker 被保留）。
+    不打印的话，运维看到 `done` 涨了会以为缺口补上了，其实还差那几天。
+    """
+    from pathlib import Path
+
+    from jobs import backfill as backfill_mod
+
+    # `main()` 里的 import 在函数体内，patch 模块属性够不着，
+    # 所以直接替换 `backfill()` 并让它走真实的汇总打印
+    monkeypatch.setattr(
+        backfill_mod, "backfill",
+        lambda *a, **kw: backfill_mod.BackfillReport(
+            done=3, bars_written=90, gap_unfilled=2))
+    monkeypatch.chdir(tmp_path)                      # load_config(Path("config"))
+    (tmp_path / "config").symlink_to(
+        Path(__file__).resolve().parents[2] / "config", target_is_directory=True)
+    monkeypatch.setenv("SS_DB_PATH", str(tmp_path / "b.db"))
+
+    backfill_mod.main([])
+
+    out = capsys.readouterr().out
+    assert "gap_unfilled=2" in out, f"汇总行没带 gap_unfilled：{out!r}"

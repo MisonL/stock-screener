@@ -212,7 +212,11 @@ def main(argv: list[str] | None = None) -> int:
     report = backfill(cfg, http, conn, codes=codes, count=args.count, resume=not args.no_resume)
     print(
         f"done={report.done} empty={report.empty} failed={report.failed} "
-        f"skipped={report.skipped} bars={report.bars_written} at {SystemClock().now().isoformat()}",
+        f"skipped={report.skipped} bars={report.bars_written} "
+        # `gap_unfilled` 非零表示「有待补记录、但这次上游没补到目标日」：
+        # marker 被保留（下次还会来补）。不打印的话，运维看到 done 涨了
+        # 会以为缺口已经补上，其实还差那几天。
+        f"gap_unfilled={report.gap_unfilled} at {SystemClock().now().isoformat()}",
         flush=True,
     )
     return 0 if report.failed == 0 else 1

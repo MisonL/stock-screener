@@ -33,6 +33,8 @@
 
 ## [Unreleased]
 
+## [0.2.65] - 2026-11-17
+
 ### 修复
 
 - **`gap_pending.missing_through` 的语义与消费方式不一致**（既有问题）。

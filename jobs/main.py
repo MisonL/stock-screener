@@ -163,7 +163,10 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
         quotes = _cached_quotes(conn, "market") or _cached_quotes(conn, "pool")
         if not quotes:
             return
-        tick.capture_auction(quotes, _auction_baselines(conn, clock.today(), cfg), tick.focus_of())
+        # **竞价要用 auction_scope_of，不能用 focus_of**：后者只认候选池，
+        # 单独自选、没进池的票会被判 outside，高开 +5% 也不产生事件（v0.2.70 回归）。
+        scope = tick.auction_scope_of() if hasattr(tick, "auction_scope_of") else tick.focus_of()
+        tick.capture_auction(quotes, _auction_baselines(conn, clock.today(), cfg), scope)
 
     def close_digest_job():
         """15:10：当日推送/信号统计。与其它写库线程共用 `tick.lock`。"""

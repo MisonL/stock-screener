@@ -51,7 +51,42 @@ PRESERVE_ON_TARGET = (
     # 用户可能直接改 yaml 配自己的 LLM 端点（而不走 LLM_BASE_URL 环境变量），
     # 覆盖回去会让 API key 被发到占位地址——和 notify.yaml 是同一类风险。
     "config/llm.yaml",
+    # **`agent.yaml` 必须一起保留**：不保留时，升级会把站点的
+    # `attention.shadow_mode` 覆盖成仓库默认值，而 `llm.yaml`（含 `budget`）
+    # 又保持站点的旧值 —— 两者**反向地**同时生效：
+    # 正式模式打开了，预算却还是旧的（实测 v0.2.71→v0.2.72 就是这样，
+    # 上线当天 10:42 就把预算打满）。回滚同理：版本退回去了，配置不会退。
+    #
+    # 代价是仓库里改 `agent.yaml` 的默认值**不会**自动落到已有站点上，
+    # 需要按 `_config_drift()` 的提示手工同步——这是有意的：
+    # 站点配置属于运维，不该被程序覆盖。
+    "config/agent.yaml",
 )
+
+
+#: 保留在目标机上的配置里，这几个键**必须让运维看见差异**：
+#: 它们决定"会不会真的调 LLM、一天能烧多少"。仓库改了默认值、
+#: 站点还拿着旧值，就是本文件 `PRESERVE_ON_TARGET` 注释里那个反向故障。
+_DRIFT_KEYS = (
+    ("config/agent.yaml", "shadow_mode"),
+    ("config/llm.yaml", "agent:"),
+)
+
+
+def config_drift_script(target: str) -> str:
+    """生成远端"打印保留配置与仓库默认值差异"的脚本。
+
+    **只提示、不覆盖**：站点配置属于运维。但沉默会让人以为新默认值已经生效——
+    v0.2.71→v0.2.72 就是这样：仓库把预算改成 1500000，站点仍是 300000，
+    升级后正式模式打开、预算没跟上，当天 10:42 就打满。
+    """
+    lines = ["set -e", f"cd {target}"]
+    for rel, key in _DRIFT_KEYS:
+        # 仓库版本先备份成 .new，再与站点版本对比；一致就不吭声
+        lines.append(f'if test -f "{rel}"; then')
+        lines.append(f'  if ! grep -q "{key}" "{rel}" ; then echo "[配置漂移] {rel} 里没有 {key}"; fi')
+        lines.append("fi")
+    return "\n".join(lines)
 
 
 def _git(*args: str, capture: bool = True) -> str:
@@ -190,7 +225,13 @@ def main(argv: list[str] | None = None) -> int:
             f"{compose}up -d --force-recreate {args.services} 2>&1 | tail -3")
     _run(["ssh", "-o", "BatchMode=yes", args.host,
           "bash -c " + _sh_quote(body)])
+    # **提示保留配置与仓库默认值的差异**：不提示的话，仓库改了默认值而站点
+    # 仍用旧值，运维会以为新值已经生效（v0.2.71→v0.2.72 的真实事故）。
+    _run(["ssh", "-o", "BatchMode=yes", args.host,
+          "bash -c " + _sh_quote(config_drift_script(args.dir))])
     print("已重启容器。下一步请自行核对 /healthz（见 RUNBOOK §9）")
+    print(f"提示：{len(PRESERVE_ON_TARGET)} 个站点配置保留在目标机未被覆盖；"
+          "改了仓库默认值时请按上面的提示手工同步，或用 --show-config 对比")
     return 0
 
 

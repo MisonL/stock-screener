@@ -269,3 +269,27 @@ def test_auction_gap_only_reports_for_pool_stocks(env):
         "池外的票高低开被记成了竞价异动：这会把全市场噪声灌进事件流")
     assert env.conn.execute("SELECT count(*) FROM auction_daily").fetchone()[0] == 1, (
         "池外票仍要写 auction_daily（竞价均量基线靠它攒）")
+
+
+def test_auction_gap_reports_for_watchlist_outside_pool(env):
+    """**只加自选、没进候选池的票，高低开照样要报**（v0.2.70 回归）。
+
+    原来 `jobs/main.py` 把 `tick.focus_of()` 传给竞价，而它只查 `_pool_rows()`：
+    自选票被判 outside，高开 +5% 也不产生任何事件。
+    """
+    code = "sz000001"                               # 不在 env 的候选池里
+    env.conn.execute("INSERT INTO watch_stock(code, added_at) VALUES (?, 'x')", (code,))
+    env.conn.commit()
+    # 该票不在候选池里
+    assert code not in set(env.tick._pool_rows())
+
+    q = quote(code, 10.5, volume=123400.0)          # 相对 prev_close 明显高开
+    assert q.prev_close and q.price / q.prev_close - 1 >= 0.02, "前提不成立：不算高开"
+    scope = env.tick.auction_scope_of()
+    assert scope(code) == "pool", (
+        "自选票被判成了池外：高低开会被静音")
+
+    env.tick.capture_auction({code: q}, {code: [1e5] * 20}, scope)
+    assert env.conn.execute(
+        "SELECT count(*) FROM event_log WHERE kind='auction_anomaly'").fetchone()[0] == 1, (
+        "自选票的高开没有产生事件")

@@ -1144,3 +1144,53 @@ def test_legacy_gap_marker_is_upgraded_to_the_target_day(tmp_path):
         "SELECT missing_through FROM gap_pending WHERE code='sh600519'").fetchone()
     assert row is not None, "旧 marker 被删了"
     assert row[0] == 20261029, f"旧格式应升级为缺口目标日 20261029，实际 {row[0]}"
+
+
+def test_cursor_does_not_stick_when_the_head_code_never_returns(tmp_env):
+    """**首只永远缺失时游标必须能继续走**。
+
+    原实现 `if idx == begin: nxt = codes[begin]`：每轮都返回 39/40、
+    缺的永远是起点那只，游标就原地不动 —— 后面 5500 多只票一次都不会被请求。
+    实测生产游标走到 1213/5583 就几乎不动了。
+    """
+    from jobs.eod import STUCK_ROUNDS, advance_actions_cursor, actions_cursor
+
+    conn = tmp_env.conn
+    codes = ["sh600000", "sh600001", "sh600002", "sh600003"]
+
+    # 连续几轮：起点 sh600000 永远不在 pulled 里
+    seen_starts = []
+    for _ in range(STUCK_ROUNDS):
+        tail = actions_cursor(conn, codes)
+        seen_starts.append(tail[0])
+        advance_actions_cursor(conn, codes, [c for c in tail if c != tail[0]],
+                               start=tail[0])
+
+    assert seen_starts[0] == "sh600000"
+    # 到上限后必须顺延，不能永远停在第一只
+    tail = actions_cursor(conn, codes)
+    assert tail[0] != "sh600000", (
+        f"连续 {STUCK_ROUNDS} 轮都拿不到 sh600000，游标仍停在它上面："
+        "后面的票永远不会被请求")
+
+
+def test_cursor_still_retries_a_missing_code_later(tmp_env):
+    """顺延之后，被跳过的那只**还会再被请求**（不是静默记成完成）。"""
+    from jobs.eod import STUCK_ROUNDS, advance_actions_cursor, actions_cursor
+
+    conn = tmp_env.conn
+    codes = ["sh600000", "sh600001", "sh600002"]
+
+    for _ in range(STUCK_ROUNDS):
+        tail = actions_cursor(conn, codes)
+        advance_actions_cursor(conn, codes, [c for c in tail if c != tail[0]],
+                               start=tail[0])
+
+    # 继续一圈（其余都成功），最终必须重新回到 sh600000
+    starts = []
+    for _ in range(len(codes) + 2):
+        tail = actions_cursor(conn, codes)
+        starts.append(tail[0])
+        advance_actions_cursor(conn, codes, list(tail), start=tail[0])
+
+    assert "sh600000" in starts, f"被跳过的票再也没被请求过：{starts}"

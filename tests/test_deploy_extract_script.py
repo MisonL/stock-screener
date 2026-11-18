@@ -120,3 +120,24 @@ def test_script_has_no_comma_list_for_loop():
     for rel in deploy.PRESERVE_ON_TARGET:
         assert f'cp -p "{rel}" "$bak/{rel}"' in script, f"{rel} 没有备份"
         assert f'cp -p "$bak/{rel}" "{rel}"' in script, f"{rel} 没有恢复"
+
+
+def test_agent_yaml_is_preserved_on_target():
+    """`agent.yaml` 必须在保留名单里，否则升级会把站点配置覆盖成仓库值。
+
+    真实事故（v0.2.71→v0.2.72）：`llm.yaml` 保留、`agent.yaml` 不保留，
+    升级后**正式模式打开、预算还是旧的 300000**，上线当天 10:42 就打满。
+    """
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import deploy
+    assert "config/agent.yaml" in deploy.PRESERVE_ON_TARGET, (
+        "agent.yaml 不在保留名单：升级会覆盖站点的 shadow_mode 等设置")
+
+
+def test_script_warns_when_preserved_config_lacks_expected_keys():
+    """保留配置缺失关键键时要提示（沉默会让人以为新默认值已生效）。"""
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import deploy
+    script = deploy.config_drift_script("/srv/app")
+    assert "config/agent.yaml" in script and "shadow_mode" in script
+    assert "config/llm.yaml" in script and "agent:" in script

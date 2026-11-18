@@ -422,6 +422,34 @@ def actions_cursor(conn, codes) -> list:
     return codes[lo:]
 
 
+#: 同一只票在游标起点**连续**拿不到响应多少轮后，游标顺延一位。
+#: 太小会把偶发的限频残缺当成"这只票没有数据"；太大则滑向原来"整个卡死"的形态。
+#: 取 3：连续三轮 40 只里只缺它一只，基本可以排除偶发抖动。
+STUCK_ROUNDS = 3
+
+_STUCK_KEY = "refresh_actions.stuck"
+
+
+def _bump_stuck(conn, code: str) -> int:
+    """记一次「这只票在起点位又没拿到」，返回累计次数。"""
+    raw = conn.execute("SELECT value FROM job_state WHERE name = ?", (_STUCK_KEY,)).fetchone()
+    cur_code, n = (raw[0].split(":", 1) if raw and raw[0] and ":" in raw[0] else (None, "0"))
+    n = int(n) if n.isdigit() else 0
+    n = n + 1 if cur_code == code else 1
+    with conn:
+        conn.execute("INSERT OR REPLACE INTO job_state(name, value) VALUES (?, ?)",
+                     (_STUCK_KEY, f"{code}:{n}"))
+    return n
+
+
+def _clear_stuck(conn, code: str) -> None:
+    """游标顺利前进时清掉计数（换到别的票时也清）。"""
+    raw = conn.execute("SELECT value FROM job_state WHERE name = ?", (_STUCK_KEY,)).fetchone()
+    if raw and raw[0] and str(raw[0]).split(":", 1)[0] in (code, ""):
+        with conn:
+            conn.execute("DELETE FROM job_state WHERE name = ?", (_STUCK_KEY,))
+
+
 def advance_actions_cursor(conn, codes, pulled, start=None) -> None:
     """把游标推进到"本轮**连续**确认过的最后一只之后"。
 
@@ -478,15 +506,32 @@ def advance_actions_cursor(conn, codes, pulled, start=None) -> None:
                 (codes[begin],))
         return
 
-    # 从 begin 往后找最长连续命中，遇到第一个断点就停
+    # **从 begin 往后找最长连续命中，遇到第一个断点就停**——但不能让单只
+    # 长期拿不到数据的票把整条游标钉死。
+    #
+    # 原实现 `if idx == begin: nxt = codes[begin]`（原地不动）只覆盖了
+    # "整轮空确认"的情况；实际故障是**首只永远缺失**（限频伪装成空数据、
+    # 或该票在上游没有分红数据）：每轮返回 39/40，起点那只始终不在 `pulled` 里，
+    # 游标就永远停在那里，后面 5500 多只票一次都不会被请求。
+    #
+    # 现在按「这只票在起点位连续失败了几次」决定：前 `STUCK_ROUNDS - 1` 轮
+    # 原地重试，到第 `STUCK_ROUNDS` 轮让它顺延一位——漏掉的票仍然留在
+    # 待重试集合里（下面持久化），下一次滚动到它时还会再来，不会被静默记成完成。
     idx = begin
     while idx < len(codes) and codes[idx] in pulled:
         idx += 1
     if idx == begin:
-        nxt = codes[begin]                   # 起点本身没拿到：不动
+        stuck = _bump_stuck(conn, codes[begin])
+        if stuck < STUCK_ROUNDS:
+            nxt = codes[begin]               # 还没到上限：本轮原地重试
+        else:
+            _clear_stuck(conn, codes[begin])
+            nxt = codes[(begin + 1) % len(codes)]   # 卡太久了：顺延一位，别钉死
     elif idx < len(codes):
+        _clear_stuck(conn, codes[begin])
         nxt = codes[idx]                     # 停在断点
     else:
+        _clear_stuck(conn, codes[begin])
         nxt = codes[0]                       # 整段连续确认到底：回到起点
     with conn:
         conn.execute(

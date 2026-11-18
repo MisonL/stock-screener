@@ -287,13 +287,35 @@ class IntradayTick:
         return self._focus_of()
 
     def _focus_of(self):
-        """code → focus 档位：池内 1.0；池外 0.5（自选由 `det.watch` 直接决定，不走这里）。"""
+        """code → focus 档位：池内 `"pool"`，其余 `"outside"`。
+
+        **这里刻意不含自选**：`detector._focus()` 判权重时先看 `det.watch`
+        直接返回 `focus.watch`，自选的加权不走这个函数。
+
+        **但竞价判定要用它**，而竞价的"值不值得报"与"salience 权重"是两回事：
+        用户只加自选、没进候选池的票，照样是他最关心的。所以竞价那边不能用
+        这个函数，要用 `auction_scope_of()`（见下）。
+        """
         codes = set(self._pool_rows())
 
         def focus(code: str) -> str:
             return "pool" if code in codes else "outside"
 
         return focus
+
+    def auction_scope_of(self):
+        """竞价专用：池内 **或自选** 都算"重点"，恒返回 `"pool"` / `"outside"`。
+
+        原先把 `focus_of()` 直接传给 `capture_auction`，而它只查候选池——
+        单独自选、没进池的票被判 `outside`，高开 +5% 也不产生事件（v0.2.70 回归）。
+        """
+        pool = set(self._pool_rows())
+        watch = {r[0] for r in self.conn.execute("SELECT code FROM watch_stock")}
+
+        def scope(code: str) -> str:
+            return "pool" if (code in pool or code in watch) else "outside"
+
+        return scope
 
     def _ingest(self, dets: list, now: datetime, *, rearm: bool = True) -> None:
         """喂检测器。**空列表也要喂**：`ingest` 的重新武装就靠「本 tick 没再出现」实现。

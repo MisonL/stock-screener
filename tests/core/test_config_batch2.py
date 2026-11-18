@@ -16,7 +16,8 @@ def test_agent_values():
     assert CFG.agent.heartbeat.tight[0][0] == "09:15"
     assert CFG.agent.context.max_chars == 6000
     assert CFG.agent.channel_b_daily_cap == 15
-    assert CFG.agent.attention.shadow_mode is True
+    # v0.2.71：shadow 观测期结束（11-10~11-18 共 7 个交易日），已切正式模式
+    assert CFG.agent.attention.shadow_mode is False
 
 
 def test_llm_and_retry_are_root_level_siblings():

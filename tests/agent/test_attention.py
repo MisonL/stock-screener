@@ -187,8 +187,8 @@ def test_pending_retry_events_not_in_groups(env):
 def test_shadow_mode_records_without_escalating(env):
     """默认 shadow：写 decision='shadow' 的行，但不改 agent_status、不跑回合。"""
     ids = seed(env, kind="breakdown", n=1)
-    assert CFG.agent.attention.shadow_mode is True     # 生产默认就是 shadow
-    assert AttentionLayer(env.conn, mkcfg(), env.clock).poll() == []
+    # 显式给 shadow=True：本用例测的是**机制**，不该跟着生产配置的阶段走
+    assert AttentionLayer(env.conn, mkcfg(shadow=True), env.clock).poll() == []
     row = env.conn.execute(
         "SELECT agent_status, escalated FROM event_log WHERE id=?", (ids[0],)).fetchone()
     assert (row[0], row[1]) == ("new", 0)      # shadow 不改状态

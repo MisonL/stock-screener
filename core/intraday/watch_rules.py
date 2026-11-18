@@ -142,11 +142,17 @@ def _members(row) -> int:
     return len(getattr(row, "codes", ()) or ())
 
 
-def eval_auction(q, baseline_20d: list[float] | None, p) -> list[Detection]:
+def eval_auction(q, baseline_20d: list[float] | None, p, in_focus: bool = True) -> list[Detection]:
     """集合竞价：高低开 ±`gap`，或竞价量 ≥ 20 日竞价均量 × `vol_mult`。
 
     **基线不足 `baseline_days` 时仍然报高低开**，只是不做量能异常判定——早盘最值得知道的
     就是高开/低开，因为撮合基线没攒够就把整条规则关掉是过度保守。
+
+    **池外的票只报竞价量异常，不报高低开**（`in_focus=False`）：
+    全市场 5000 多只票里每天天然有几百只涨跌超过 2%，把它们全都算作"竞价异动"
+    等于制造噪声——实测一天 860 条，其中**没有一条**是量能异常，全是单纯高低开，
+    且没有一条属于自选。这类事件把 `salience` 分布整个压死（97.6% 被抑制），
+    阈值怎么调都调不出来。池内的票照常报高低开：那才是你会关心的。
     """
     if q.prev_close is None or q.price is None or q.prev_close <= 0:
         return []
@@ -154,7 +160,7 @@ def eval_auction(q, baseline_20d: list[float] | None, p) -> list[Detection]:
     chg = q.price / q.prev_close - 1
     days = len(baseline_20d or ())
     reasons = []
-    if abs(chg) >= cfg.gap:
+    if in_focus and abs(chg) >= cfg.gap:
         reasons.append("high_open" if chg > 0 else "low_open")
     if days >= cfg.baseline_days and q.volume is not None:
         mean = sum(baseline_20d) / days

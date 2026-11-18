@@ -1723,3 +1723,23 @@ def test_llm_probe_uses_the_configured_model(monkeypatch):
     assert seen["json"].get("model") == cfg.llm.model, (
         f"探测发的是 model={seen['json'].get('model')!r}，"
         f"配置里是 {cfg.llm.model!r}：正常端点会被判成故障")
+
+
+def test_actions_refresh_runs_every_two_minutes(env):
+    """滚动刷新**每 2 分钟一轮**，不能退回 20 分钟。
+
+    全市场 5583 只、每轮 4 批 × 10 只 = 40 只。20 分钟一轮 → 一天 31 轮 →
+    跑完一圈 4.5 天，覆盖率长期停在低位。实测单轮只花 1.2 秒，
+    而**加大每轮批数会适得其反**（批数 6/8/10 都触发 90 秒退避，吞吐反而慢 40 倍），
+    所以提速只能靠提高频率。
+    """
+    from jobs.main import make_scheduler
+
+    sched, _ = make_scheduler(env.cfg, env.conn, env.clock, mcp=None)
+    for job_id in ("actions_refresh", "actions_refresh_weekend"):
+        job = sched.get_job(job_id)
+        assert job is not None, f"{job_id} 没注册"
+        fields = {f.name: str(f) for f in job.trigger.fields}
+        assert fields["minute"] == "*/2", (
+            f"{job_id} 的分钟字段是 {fields['minute']!r}，应为 '*/2'"
+            "（退回 */20 会让全市场刷新一圈要 4.5 天）")

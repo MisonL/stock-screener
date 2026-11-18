@@ -17,6 +17,25 @@ from core.clock import snapshot_is_today
 from core.intraday.detector import _PRICE_KINDS, EventDetector
 from core.intraday.rules import TickState, eval_pool_stock
 from core.intraday.watch_rules import MoveRing, eval_auction, eval_index, eval_sector, eval_watch
+
+
+def _is_pool(focus_value) -> bool:
+    """`focus_of(code)` 的返回值是不是"池内"。
+
+    它可能是档位名（`"pool"` / `"outside"`），也可能是数值权重（测试里常用 `"1.0"`）。
+    两种都要认——只比字符串会让数值形式全被判成池外，竞价高低开被整批静音。
+    """
+    if isinstance(focus_value, (int, float)):
+        return float(focus_value) >= 1.0
+    raw = str(focus_value).strip()
+    if raw == "pool":
+        return True
+    if raw in ("outside", "market", "sector", ""):
+        return False
+    try:
+        return float(raw) >= 1.0
+    except (TypeError, ValueError):
+        return False
 from core.market import classify_market
 from notify.templates import BriefRow
 
@@ -98,6 +117,10 @@ class IntradayTick:
             today = int(now.strftime("%Y%m%d"))
             today_date = now.date()
             dets: list = []
+            # **池外票只报竞价量异常**：全市场每天几百只高低开 2%，那不是异动是常态。
+            # 把池内（含自选）以外的都算进来，`auction_anomaly` 一天 860 条，
+            # 把 salience 分布压死、阈值失效（实测 97.6% 被抑制）。
+            focus = focus_of      # 它本身就是 `focus(code) -> 档位` 这个函数
             with self.conn:
                 for code, q in quotes.items():
                     if q.volume is None:
@@ -109,7 +132,9 @@ class IntradayTick:
                         "VALUES (?,?,?,?)",
                         (code, today, q.volume, q.amount or 0.0),
                     )
-                    dets += eval_auction(q, baselines.get(code), self.cfg.strategy.intraday)
+                    in_focus = True if focus is None else _is_pool(focus(code))
+                    dets += eval_auction(q, baselines.get(code), self.cfg.strategy.intraday,
+                                         in_focus=in_focus)
             self.detector.ingest(dets, focus_of)
             rows, overflow, pool_date = self._brief_rows(quotes, today)
             baseline_days = max((len(v or ()) for v in baselines.values()), default=0)

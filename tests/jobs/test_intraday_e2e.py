@@ -252,3 +252,20 @@ def test_implied_factor_uses_prev_close_not_intraday_price(env):
         "SELECT implied_factor FROM corporate_actions WHERE source='snapshot_implied'").fetchone()[0]
     assert factor == pytest.approx(10.04 / 5.675)                # 与现价 6.02 无关
     assert factor != pytest.approx(6.02 / 5.675)
+
+
+def test_auction_gap_only_reports_for_pool_stocks(env):
+    """**池外的票不报高低开**：全市场每天几百只涨跌 2%，那是常态不是异动。
+
+    实测 11-17 一天 `auction_anomaly` 860 条，全是单纯高低开、没有一条是量能异常、
+    也没有一条属于自选——把 salience 分布整个压死（97.6% 被抑制），阈值怎么调都不行。
+    """
+    q = quote("sh600519", 10.5, volume=123400.0)      # 相对 prev_close 明显高开
+    # 池外（"outside"）：只写 auction_daily / 简报，不产生 auction_anomaly
+    env.tick.capture_auction({"sh600519": q}, {"sh600519": [1e5] * 20},
+                             lambda c: "outside")
+    assert env.conn.execute(
+        "SELECT count(*) FROM event_log WHERE kind='auction_anomaly'").fetchone()[0] == 0, (
+        "池外的票高低开被记成了竞价异动：这会把全市场噪声灌进事件流")
+    assert env.conn.execute("SELECT count(*) FROM auction_daily").fetchone()[0] == 1, (
+        "池外票仍要写 auction_daily（竞价均量基线靠它攒）")

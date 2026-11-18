@@ -398,9 +398,16 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
     # 非交易时段（开盘前 + 收盘后 + 全天周末）推进，把白天的限频额度留给行情。
     # **盘中禁区 09:15–15:10**：`minute="*/20"` 会把 15:00 也算进去（落在禁区内
     # 且紧贴 15:05 的 eod），所以小时段只留 6–8 点与 16–23 点。
+    #
+    # **间隔从 20 分钟压到 2 分钟**（v0.2.70）：实测单轮只花 1.2 秒（4 批 × 10 只），
+    # 而 20 分钟一轮意味着一天只有 31 轮、全市场 5583 只要跑 4.5 天。
+    # 逐级加压实测（同一轮里连发不同批数）：
+    #   批数 4 → 1.2 秒收到 24 只；批数 6/8/10 → 触发限频、退避 90 秒后只收到 13/46/30 只
+    # 也就是说**加大每轮批数反而慢 40 倍**，真正的瓶颈是"多久跑一次"。
+    # 2 分钟一轮 = 一天约 310 轮，全市场约 7 小时跑完一圈（单轮 1.2 秒，占用极低）。
     # 开盘前（09:00、09:10）与收盘后（15:20、15:40）用独立的分钟级触发补上。
     sched.add_job(actions_refresh_job,
-                  CronTrigger(hour="6-8,16-23", minute="*/20", day_of_week="mon-fri",
+                  CronTrigger(hour="6-8,16-23", minute="*/2", day_of_week="mon-fri",
                               timezone=SH),
                   id="actions_refresh", **JOB_DEFAULTS)
     sched.add_job(actions_refresh_job,
@@ -411,7 +418,7 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
                   id="actions_refresh_postclose", **JOB_DEFAULTS)
     # 周末同样避开 09:20–15:00（虽然没行情，但保持同一套口径、也少打扰用户）
     sched.add_job(actions_refresh_job,
-                  CronTrigger(hour="6-8,16-23", minute="*/20", day_of_week="sat,sun",
+                  CronTrigger(hour="6-8,16-23", minute="*/2", day_of_week="sat,sun",
                               timezone=SH),
                   id="actions_refresh_weekend", **JOB_DEFAULTS)
     sched.add_job(actions_refresh_job,

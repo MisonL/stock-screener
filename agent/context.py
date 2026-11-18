@@ -157,6 +157,44 @@ def _history_block(conn, now: datetime, limit: int) -> tuple[str, list[dict]]:
     return "\n".join(lines), [{"id": r[0], "ts": r[1], "why": r[2]} for r in rows]
 
 
+def _confirm_block(conn, now: datetime) -> tuple[str, list[dict]]:
+    """我提过的写操作里，**已被用户确认执行**的那几条。
+
+    原来确认之后就断了：`api/routes.py::hook_agent_confirm` 把 `pending_status`
+    置 `confirmed`、写一条 `confirm_result` 审计行就结束，agent 侧没有任何读取方
+    （`agent/loop.py`、`agent/journal.py`、`agent/context.py` 全都不看这个状态），
+    也不再产生可唤醒的事件。
+
+    后果是三件事：用户点了「确认执行」手机端只有一个 toast、模型下一轮仍以为
+    "还没办"，很可能**再提一次同样的 `pending_action`**（又是一张新卡），
+    而且无法在自己的叙述里收尾（"加进自选后我盯着它"）。
+
+    这里补上"状态回流"这一半：把当日已确认的操作渲染进上下文，模型就能
+    **不再重复提议、并能接着把话说完**。不新增 LLM 调用、不改回合模型。
+    """
+    day = now.date().isoformat()
+    rows = conn.execute(
+        "SELECT id, ts, pending_action FROM agent_turn"
+        " WHERE pending_status = 'confirmed' AND ts >= ? ORDER BY id DESC LIMIT 5",
+        (day,)).fetchall()
+    if not rows:
+        return "", []
+    lines = ["【已确认执行】（用户已点过确认，不要重复提议）"]
+    out = []
+    for r in rows:
+        tool, args = "?", {}
+        try:
+            action = json.loads(r[2] or "")
+            tool = str(action.get("tool") or "?")
+            args = action.get("args") or {}
+        except (TypeError, ValueError):
+            pass
+        code = args.get("code") if isinstance(args, dict) else None
+        lines.append(f"- {_rel(r[1], now)}：{tool}" + (f"（{code}）" if code else ""))
+        out.append({"id": r[0], "ts": r[1], "tool": tool, "code": code})
+    return "\n".join(lines), out
+
+
 def render_event(group, conn, clock, cfg) -> Rendered:
     now = clock.now()
     anchor = clock.today()
@@ -169,16 +207,17 @@ def render_event(group, conn, clock, cfg) -> Rendered:
     mem_block, mem_rows = _memory_block(conn, group, now)
     hist_block, hist_rows = _history_block(conn, now, OWN_HISTORY)
 
-    rest = "\n\n".join(b for b in (sec_block, mem_block, hist_block) if b)
+    conf_block, conf_rows = _confirm_block(conn, now)
+    rest = "\n\n".join(b for b in (conf_block, sec_block, mem_block, hist_block) if b)
     text = first_two + ("\n\n" + rest if rest else "")
     truncated = False
     if len(text) > _budget(cfg):
         # 超预算：只留前两段（丢板块事件/记忆/历史），**绝不裁第一段**
         text = first_two
         truncated = True
-        sec_rows, mem_rows, hist_rows = [], [], []
+        sec_rows, mem_rows, hist_rows, conf_rows = [], [], [], []
     ctx = {"event": e_rows, "stock": bars_ctx, "sector_events": sec_rows,
-           "memory": mem_rows, "own_history": hist_rows}
+           "memory": mem_rows, "own_history": hist_rows, "confirmed": conf_rows}
     return Rendered(text=text, chars=len(text), truncated=truncated, ctx=ctx)
 
 
@@ -210,6 +249,9 @@ def render_heartbeat(window_start, conn, clock, cfg) -> Rendered:
         parts.append("【贴顶尖】" + "、".join(f"{n['code']}({n['pos_in_box']:.2f})" for n in near))
     if retry:
         parts.append("【待重试】" + "、".join(f"{r['code']} {r['kind']}" for r in retry))
+    conf_block, conf_rows = _confirm_block(conn, now)
+    if conf_block:
+        parts.append(conf_block)
     hist_block, hist_rows = _history_block(conn, now, OWN_HISTORY)
     if hist_block:
         parts.append(hist_block)
@@ -219,7 +261,7 @@ def render_heartbeat(window_start, conn, clock, cfg) -> Rendered:
     if len(text) > _budget(cfg):
         text = "\n".join(parts[:1])           # 只留摘要行
         truncated = True
-        hist_rows = []
+        hist_rows, conf_rows = [], []
     ctx = {"events": rows, "near_breakout": near, "pending_retry": retry,
-           "own_history": hist_rows}
+           "own_history": hist_rows, "confirmed": conf_rows}
     return Rendered(text=text, chars=len(text), truncated=truncated, ctx=ctx)

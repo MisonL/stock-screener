@@ -9,7 +9,7 @@ from core.config import load_config
 from core.intraday.detector import NewEvent
 from core.intraday.rules import Detection
 from notify.dispatcher import Dispatcher, load_sig
-from notify.templates import BriefRow
+from notify.templates import BriefRow, render_alert
 from tests.helpers import SH, FakeNtfy, seed_sig_context
 
 CFG = load_config(Path("config"))
@@ -648,3 +648,31 @@ def test_cap_is_enforced_inside_the_claim_transaction(env):
 
     assert statuses(env.conn)[-1] == "suppressed", (
         "额度已经满了却仍然放行：说明额度是在写事务之外判断的")
+
+
+def test_p0_alert_is_not_blocked_by_the_daily_cap(env):
+    """**日额度打满时 P0 运维告警仍必须发出去**。
+
+    v0.2.69 把额度判定从 `_route` 移进 `_push_rows` 事务时，默认值取成了 True，
+    于是 `alert()` 这条从未被 `_route` 管过的路径也开始受额度限制——
+    日额度一满，通道故障/磁盘告警会被静默 suppressed，用户永远收不到。
+    v0.2.68 的 `_push_rows` 里压根没有额度检查。
+    """
+    cap = env.cfg.notify.daily_cap
+    # 先把当日额度打满（用真实的信号推送路径）
+    for i in range(cap):
+        env.disp._push_log(row={"code": None, "kind": "breakout", "level": "P2",
+                                "seq_id": f"fill-{i}", "event_id": None,
+                                "signal_id": None, "segment": 1,
+                                "trade_date": clock_at().today()},
+                           msg=render_alert("fill", f"占位 {i}", env.cfg, level="P2"),
+                           enforce_cap=True)
+    assert env.disp._capped() is True, "前提不成立：额度没打满"
+
+    before = len(env.ntfy.published)
+    env.disp.alert("disk", "磁盘快满了", "P0")
+    assert len(env.ntfy.published) > before, (
+        "额度打满后 P0 告警被挡掉了：运维告警不该受行情推送额度约束")
+    row = env.conn.execute(
+        "SELECT status FROM push_log WHERE kind='disk' ORDER BY id DESC LIMIT 1").fetchone()
+    assert row and row[0] == "accepted", f"P0 告警被抑制成 {row[0] if row else '无行'}"

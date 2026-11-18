@@ -33,6 +33,46 @@
 
 ## [Unreleased]
 
+### 修复
+
+下面四条来自对 Anthropic《Building always-on agents》常驻 Agent 五部件模型的
+独立评审（Codex + 子代理各评一遍，结论一致）。
+
+- **P0 运维告警被日额度挡住**（v0.2.69 引入的回归）。把额度判定从 `_route`
+  移进 `_push_rows` 事务时，`enforce_cap` 默认值取成了 `True`，于是 `alert()`
+  这条**从未被 `_route` 管过**的路径开始受 `notify.daily_cap` 限制：
+  日额度一满，通道故障/磁盘告警会被静默 `suppressed`，用户永远收不到。
+  v0.2.68 的 `_push_rows` 里压根没有额度检查。
+
+  现在只有行情信号（含合并批次）受额度约束，告警/开盘简报/收盘摘要不受。
+
+- **agent 侧推送失败是黑洞**。`api/routes.py` 只认 `kind='push_channel_down'`
+  这一种行，而它只有 `Dispatcher._channel_down()` 会写。agent 走的是
+  `AgentPusher` 这条独立路径（通道 B 便签、事件第二段、确认卡），失败时只把行标
+  `failed`——于是 agent 整天发不出去，首页仍显示"推送正常"，用户只能靠
+  手机没响自己猜。现在 `AgentPusher` 也有失败计数与留痕。
+
+- **确认执行之后模型不知道**。`hook_agent_confirm` 把 `pending_status` 置
+  `confirmed`、写一条 `confirm_result` 审计行就结束，agent 侧**零个读取方**，
+  也不产生可唤醒事件。后果：手机端只有一个 toast；模型下一轮仍以为"还没办"，
+  很可能**再提一次同样的 `pending_action`**（又多一张确认卡）；也无法收尾
+  （"加进自选后我盯着它"）。
+
+  现在已确认的操作会渲染进上下文（`【已确认执行】`段），`get_own_history`
+  也带上了 `pending_status`/`pending_action`。不新增 LLM 调用、不改回合模型。
+
+- **闹钟回合失败即永久丢失**。`after_alarm` 在跑回合**之前**就把状态认领成
+  `fired`（防止重复回合），而 `_run` 失败时没有任何回滚：LLM 挂掉、预算耗尽、
+  甚至协程被取消，模型说的"我 30 分钟后回来看"就静默作废，连一行日志都没有。
+  清理任务只处理 3 天前的 pending，不会补跑。
+
+  现在 `error`/`invalid` 判定与**抛异常**两条路径都会把闹钟退回 `pending`。
+
+- **`config/agent.yaml` 的 `memory` 三键是死配置**。`judgment_days`/`per_target`/
+  `ignored_focus` 全仓无读取点，`ignored_focus: 0.7` 尤其误导——看着像
+  "按记忆抑制焦点"，实际没有。保留键名（改动会破坏必填键契约），
+  但标注"未生效"并说明记忆的真实覆盖范围。
+
 ## [0.2.74] - 2026-11-18
 
 ### 修复

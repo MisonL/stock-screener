@@ -228,6 +228,7 @@ _REQUIRED_AGENT = {
                 "own_history_trim": None},
     "channel_b_daily_cap": None,
     "fatigue": {"free": None, "step": None, "raise": None},
+    # memory 三键已移除（全仓无读取点），保留允许列表条目仅为兼容旧配置文件
     "memory": {"judgment_days": None, "per_target": None, "ignored_focus": None},
     "pending_action_ttl_h": None,
     "llm_down": {"consecutive": None, "minutes": None},

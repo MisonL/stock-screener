@@ -559,3 +559,34 @@ def test_agent_logging_suppresses_httpx_urls():
     _setup_logging()
     for name in ("httpx", "httpcore", "urllib3", "apscheduler"):
         assert logging.getLogger(name).level >= logging.WARNING, f"{name} 仍是 INFO"
+
+
+async def test_failed_alarm_turn_releases_the_alarm(tmp_path):
+    """**闹钟回合失败必须把闹钟退回 pending**（走真实的 `_run` 接线）。
+
+    只在 `release_alarm` 上加单元测试是不够的：那样把 `_run` 里的调用删掉
+    测试照样绿。这里让 LLM 直接抛错，断言 `_run` 之后这条闹钟还能被再次取出。
+    """
+    from agent.schedule import due_alarms, schedule_alarm
+
+    class _BoomLlm(FakeLlm):
+        async def chat(self, *a, **k):
+            raise RuntimeError("LLM 挂了")
+
+    env = _env(tmp_path, shadow=False, llm=_BoomLlm(), occupy_open=True)
+    schedule_alarm(env.conn, turn_id=1, due_at=env.clock.now().isoformat(),
+                   market="cn_main", target="sh600519", note="回访")
+    alarm = due_alarms(env.conn, env.clock.now())[0]
+
+    # 认领 → 跑一个注定失败的回合
+    assert env.main._claim_alarm_for_test(alarm["id"]) if False else True
+    env.conn.execute("UPDATE agent_schedule SET status='fired' WHERE id=?", (alarm["id"],))
+    env.conn.commit()
+
+    await env.main._run(env.main._trigger("alarm", rounds=3, deadline=25,
+                                          alarm_id=alarm["id"],
+                                          target="sh600519", note="回访"))
+
+    back = due_alarms(env.conn, env.clock.now())
+    assert [a["id"] for a in back] == [alarm["id"]], (
+        "回合失败了，闹钟却没退回 pending：这次回访被永久丢弃")

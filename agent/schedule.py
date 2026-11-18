@@ -100,6 +100,26 @@ def after_alarm(conn, alarm_id: int) -> bool:
     return cur.rowcount == 1
 
 
+def release_alarm(conn, alarm_id: int) -> None:
+    """把认领**退回去**（回合失败时用）。
+
+    「先认领再跑」是为了防重复回合，但它让失败变成了永久丢失：
+    `after_alarm` 在跑回合**之前**就把 status 改成 `fired`，若这一轮
+    `_run` 因为 LLM 挂掉/预算耗尽/超时而失败，没有任何逻辑把闹钟放回
+    `pending`——模型说的"我 30 分钟后回来看"就静默作废了。
+    清理任务只处理 3 天前的 pending，不会补跑。
+
+    退回成 `pending` 后下一轮（2 秒后）会重新取出它，与心跳的
+    `pending_retry` 是同一个思路。
+    """
+    # **要连 `fired_turn` 一起清掉**：`_run` 里是先 `set_fired_turn` 再判失败，
+    # 带上 `fired_turn IS NULL` 这个条件会让释放永远不生效（实测就是这样）。
+    # 清空后下一次成功的回合会重新写上正确的 turn_id。
+    conn.execute("UPDATE agent_schedule SET status = 'pending', fired_turn = NULL"
+                 " WHERE id = ? AND status = 'fired'", (alarm_id,))
+    conn.commit()
+
+
 def set_fired_turn(conn, alarm_id: int, turn_id: int) -> None:
     """把「执行它的回合」写回闹钟（只补一次，不覆盖已有的）。"""
     conn.execute("UPDATE agent_schedule SET fired_turn = ?"

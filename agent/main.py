@@ -18,7 +18,7 @@ from agent.attention import AttentionLayer
 from agent.heartbeat import Heartbeat
 from agent.journal import record as journal_record
 from agent.loop import Deps, Trigger, render_trigger, run_with_deadline
-from agent.schedule import (after_alarm, due_alarms, next_heartbeat, schedule_alarm,
+from agent.schedule import (after_alarm, due_alarms, next_heartbeat, release_alarm, schedule_alarm,
                             set_fired_turn)
 from core.clock import SH, SystemClock, TradingCalendar
 
@@ -156,10 +156,26 @@ class AgentMain:
         return trig
 
     async def _run(self, trigger):
-        result = await run_with_deadline(trigger, self.deps)
+        try:
+            result = await run_with_deadline(trigger, self.deps)
+        except BaseException:
+            # **抛异常时也要把闹钟退回去**。`run_with_deadline` 只把
+            # `asyncio.TimeoutError` 转成结果，其它异常（LLM 客户端炸了、
+            # 磁盘写满、协程被取消）会直接往上抛——那条路径上 `journal_record`
+            # 与 `release_alarm` 都不会执行，而闹钟在 `after_alarm` 里已经被
+            # 认领成 `fired` 了，于是这次回访永久丢失，连一行日志都没有。
+            if trigger.alarm_id is not None:
+                release_alarm(self.deps.conn, trigger.alarm_id)
+            raise
         turn_id = journal_record(self.deps.conn, trigger, result, self.clock)
         if trigger.alarm_id is not None:
             set_fired_turn(self.deps.conn, trigger.alarm_id, turn_id)
+            # **回合失败要把闹钟退回去**：`after_alarm` 在跑之前就认领成 `fired`，
+            # 而 LLM 挂掉/预算耗尽/超时都会让这一轮白跑。不放回 `pending` 的话，
+            # 模型说的"我 30 分钟后回来看"就静默作废（清理任务只处理 3 天前的
+            # pending，不会补跑）。超时不算失败——它已经花掉预算跑过了。
+            if result.decision.kind in ("error", "invalid"):
+                release_alarm(self.deps.conn, trigger.alarm_id)
         if result.decision.pending_action and self.deps.pusher is not None:
             self.deps.pusher.confirm_card(turn_id, result.decision.pending_action,
                                           result.grounded)

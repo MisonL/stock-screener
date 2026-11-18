@@ -366,3 +366,111 @@ def test_budget_exhaustion_mid_turn_is_recorded_as_error_not_timeout():
     assert result.decision.kind == "error", (
         f"预算中途耗尽被记成了 {result.decision.kind!r}：会把超时率统计搞脏")
     assert result.why == "agent 日预算已用完"
+
+
+def test_agent_push_failures_flip_the_channel_flag(tmp_path):
+    """**agent 侧推送失败也要被 `notify_ok` 看见**。
+
+    `api/routes.py` 只认 `kind='push_channel_down'` 这一种行，而它原来只有
+    `Dispatcher._channel_down()` 会写。agent 走的是 `AgentPusher` 这条独立路径
+    （通道 B 便签、事件第二段、确认卡），失败时只把行标 `failed`——
+    于是 agent 整天发不出去，首页仍显示"推送正常"。
+    """
+    from agent.push import AgentPusher
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from pathlib import Path
+    from tests.helpers import SH
+    from datetime import datetime
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "p.db")
+    migrate(conn)
+    clock = FixedClock(datetime(2026, 10, 30, 10, 30, tzinfo=SH))
+
+    class _BoomNtfy:
+        def publish(self, msg):
+            raise RuntimeError("通道挂了")
+
+    pusher = AgentPusher(conn, _BoomNtfy(), cfg, clock)
+    for i in range(3):
+        pusher._fail_streak = i          # 模拟已连续失败 i 次
+        try:
+            pusher._send(row_id=None, msg=SimpleNamespace(seq_id=f"x{i}", body="b"))
+        except Exception:                                  # noqa: BLE001
+            pass
+
+    n = conn.execute(
+        "SELECT count(*) FROM push_log WHERE kind='push_channel_down'").fetchone()[0]
+    assert n >= 1, (
+        "agent 连续 3 次发送失败后没有写 push_channel_down："
+        "首页会一直显示推送正常，用户只能靠手机没响自己猜")
+
+
+def test_confirmed_action_is_rendered_so_the_model_stops_reproposing(tmp_path):
+    """**用户点过确认之后，模型下一轮必须知道"这件事已经办了"**。
+
+    原来确认链路是断的：hook 把 `pending_status` 置 `confirmed`、写一条
+    `confirm_result` 审计行就结束，agent 侧没有任何读取方，也不再产生可唤醒事件。
+    于是模型会再提一次同样的 `pending_action`——用户被反复追问同一件事。
+    """
+    from agent.context import render_heartbeat
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from pathlib import Path
+    from tests.helpers import SH
+    from datetime import datetime
+    import json as _json
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "c.db")
+    migrate(conn)
+    clock = FixedClock(datetime(2026, 10, 30, 10, 30, tzinfo=SH))
+
+    conn.execute(
+        "INSERT INTO agent_turn(ts, wake_kind, context_digest, rounds, decision, fallback,"
+        " pending_action, pending_status, market) VALUES (?,?,?,?,?,?,?,?,?)",
+        (clock.now().isoformat(), "event", "x", 1, "speak", 0,
+         _json.dumps({"tool": "mcp_add_watch", "args": {"code": "sh600519"}}),
+         "confirmed", "cn_main"))
+    conn.commit()
+
+    rendered = render_heartbeat(clock.now(), conn, clock, cfg)
+    assert "已确认执行" in rendered.text, (
+        f"确认结果没有回流到上下文：模型会重复提议同一件事。实际渲染：{rendered.text!r}")
+    assert "mcp_add_watch" in rendered.text
+
+
+async def test_failed_alarm_turn_is_released_for_retry(tmp_path):
+    """**闹钟回合失败必须把闹钟放回 `pending`**，否则"我 30 分钟后回来看"静默作废。
+
+    `after_alarm` 在跑回合**之前**就把状态改成 `fired`（防重复回合），
+    而 `_run` 失败时原来没有任何回滚逻辑；清理任务只处理 3 天前的 pending，
+    不会补跑。
+    """
+    from agent.schedule import due_alarms, release_alarm, schedule_alarm
+    from core.clock import FixedClock
+    from core.db import connect, migrate
+    from tests.helpers import SH
+    from datetime import datetime
+
+    conn = connect(tmp_path / "a.db")
+    migrate(conn)
+    clock = FixedClock(datetime(2026, 10, 30, 10, 30, tzinfo=SH))
+
+    schedule_alarm(conn, turn_id=1, due_at=clock.now().isoformat(), market="cn_main",
+                   target="sh600519", note="回访")
+    alarm = due_alarms(conn, clock.now())[0]
+
+    # 认领（模拟 after_alarm）
+    conn.execute("UPDATE agent_schedule SET status='fired' WHERE id=?", (alarm["id"],))
+    conn.commit()
+    assert due_alarms(conn, clock.now()) == [], "前提不成立：认领后不该再取到"
+
+    # 回合失败 → 退回
+    release_alarm(conn, alarm["id"])
+    again = due_alarms(conn, clock.now())
+    assert [a["id"] for a in again] == [alarm["id"]], (
+        "闹钟回合失败后没有放回 pending：这次回访被永久丢弃了")

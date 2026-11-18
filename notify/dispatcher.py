@@ -145,7 +145,8 @@ class Dispatcher:
         # 对它们失效（同批第二只 `_deduped` 为 False，窗口内会再推一次）。
         # 同一 seq_id、同一 body、segment=1，第二段仍按 event_id 取到代表行。
         rows = [self._row(sig, kind=sig.kind, level=level, seq_id=seq_id) for sig in batch]
-        self._push_rows(rows, msg, claim=True)
+        # 合并批次也是**行情信号**（通道 A），照旧受日额度约束
+        self._push_rows(rows, msg, claim=True, enforce_cap=True)
 
     # ---- 规则判定 --------------------------------------------------------
 
@@ -215,7 +216,18 @@ class Dispatcher:
                        claim=True, enforce_cap=sig.level != "P0")
 
     def _push_log(self, row: dict, msg: Message, claim: bool = False,
-                  enforce_cap: bool = True) -> None:
+                  enforce_cap: bool = False) -> None:
+        """默认**不**受日额度约束。
+
+        额度（`notify.daily_cap`）是给**行情信号**用的：防止「一只票一个异动推一条」
+        把手机淹掉。运维告警（`alert`）、开盘简报、收盘摘要、确认结果都不是这东西——
+        它们要么一天只有一两条，要么本来就不该被压。
+
+        **这是 v0.2.69 引入的回归**：把额度判定从 `_route` 移进 `_push_rows` 事务时，
+        默认值取成了 `True`，于是 `alert()` 这条根本没被 `_route` 管过的路径
+        开始受额度限制——日额度打满后，P0 通道故障告警会被静默 `suppressed`。
+        v0.2.68 的 `_push_rows` 里压根没有额度检查，这里恢复成那个语义。
+        """
         self._push_rows([row], msg, claim=claim, enforce_cap=enforce_cap)
 
     def _push_rows(self, rows: list[dict], msg: Message, claim: bool = False,

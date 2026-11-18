@@ -519,8 +519,12 @@ class ToolRegistry:
     def _tool_get_own_history(self, args, now):
         day = int(args.get("date") or self.clock.today())
         prefix = f"{day // 10000:04d}-{day // 100 % 100:02d}-{day % 100:02d}"
+        # `pending_status`/`pending_action` **必须一起查**：只给 `why` 的话，
+        # 模型查自己的历史也看不到"我提过的那件写操作到底被确认了没有"，
+        # 于是会重复提议同一件事（又多一张确认卡）。
         turns = self.conn.execute(
-            "SELECT id, ts, wake_kind, decision, why, level, push_seq, schedule_next"
+            "SELECT id, ts, wake_kind, decision, why, level, push_seq, schedule_next,"
+            " pending_status, pending_action"
             " FROM agent_turn WHERE substr(ts, 1, 10) = ? ORDER BY ts", (prefix,)).fetchall()
         schedules = self.conn.execute(
             "SELECT id, created_at, due_at, target, note, status FROM agent_schedule"
@@ -529,7 +533,10 @@ class ToolRegistry:
         data = {
             "date": prefix,
             "turns": [{"id": r[0], "ts": r[1], "wake_kind": r[2], "decision": r[3], "why": r[4],
-                       "level": r[5], "push_seq": r[6], "schedule_next": r[7]} for r in turns],
+                       "level": r[5], "push_seq": r[6], "schedule_next": r[7],
+                       "pending_status": r[8],
+                       "pending_action": (json.loads(r[9]) if r[9] else None)}
+                      for r in turns],
             "schedules": [{"id": r[0], "created_at": r[1], "due_at": r[2], "target": r[3],
                            "note": r[4], "status": r[5]} for r in schedules],
         }

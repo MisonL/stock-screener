@@ -132,6 +132,25 @@ class AgentPusher:
         self.conn.commit()
         return cur.lastrowid
 
+    _fail_streak = 0
+
+    def _channel_down(self) -> None:
+        """连续 3 次发送失败 → 写一条 `push_channel_down` 留痕，api 据此报 `notify_ok=false`。
+
+        与 `notify/dispatcher.py::_channel_down` 同一口径：**只写本地留痕行，不发推送**
+        （发不出去的时候再"发一条说发不出去"没有意义）。`seq_id` 用时间戳，
+        每条故障独立成行，便于在网页上看到"故障持续了多久"。
+        """
+        now = self.clock.now()
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO push_log(ts, code, kind, level, seq_id, segment, trade_date, status, error)"
+                " VALUES (?, NULL, 'push_channel_down', 'P2', ?, 1, ?, 'failed', ?)",
+                (now.isoformat(), f"pcd-agent-{int(now.timestamp())}", self.clock.today(),
+                 f"agent 连续 {self._fail_streak} 次发布失败"),
+            )
+        self._fail_streak = 0
+
     def _send(self, row_id: int, msg: Message) -> str | None:
         """发出去并把 `ntfy_id`/status 回写。失败返回 None（清掉这条腾出 seq）。"""
         if self._drill_skip("_send", row_id=row_id, seq_id=msg.seq_id):
@@ -143,7 +162,16 @@ class AgentPusher:
             with self.conn:
                 self.conn.execute("UPDATE push_log SET status = 'failed', error = ? WHERE id = ?",
                                   (str(exc)[:200], row_id))
+            self._fail_streak += 1
+            # **agent 侧失败也要能被 `notify_ok` 看见**：`api/routes.py` 只认
+            # `kind='push_channel_down'` 这一种行，而这个行原来只有
+            # `Dispatcher._channel_down()` 会写。agent 走的 `AgentPusher` 是另一条
+            # 发送路径（通道 B 便签、事件第二段、确认卡），它失败时只把行标 failed——
+            # 结果：agent 整天发不出去，首页仍显示"推送正常"，用户只能靠手机没响自己猜。
+            if self._fail_streak >= 3:
+                self._channel_down()
             return None
+        self._fail_streak = 0
         with self.conn:
             self.conn.execute("UPDATE push_log SET status = 'accepted', ntfy_id = ? WHERE id = ?",
                               (ntfy_id, row_id))

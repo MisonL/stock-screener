@@ -33,6 +33,8 @@
 
 ## [Unreleased]
 
+## [0.2.75] - 2026-11-18
+
 ### 修复
 
 下面四条来自对 Anthropic《Building always-on agents》常驻 Agent 五部件模型的

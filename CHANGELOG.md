@@ -33,6 +33,8 @@
 
 ## [Unreleased]
 
+## [0.2.71] - 2026-11-18
+
 ### 变更
 
 - **agent 切到正式模式**（`config/agent.yaml` 的 `attention.shadow_mode: false`）。

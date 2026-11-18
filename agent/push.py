@@ -49,7 +49,7 @@ def code6_of(code: str | None) -> str:
     return text[2:] if text[:2] in ("sh", "sz", "bj") else text
 
 
-def action_desc(pending_action) -> str:
+def action_desc(pending_action, reason: str = "") -> str:
     """把 `{"tool", "args"}` 变成一句人话。未知工具**不抛**——确认卡照样要发出去。"""
     if isinstance(pending_action, str):
         try:
@@ -64,7 +64,14 @@ def action_desc(pending_action) -> str:
     if label is None:
         return f"{tool} {json.dumps(args, ensure_ascii=False)}"
     target = args.get("code") or args.get("symbol") or json.dumps(args, ensure_ascii=False)
-    return f"{label} {target}"
+    line = f"{label} {target}"
+    # **附上模型给的理由**：沉默回合（`speak=false`）的确认卡原来只有一行
+    # "加入自选 sh600519"，用户完全不知道为什么要加——卡是要人做决定的，
+    # 没有理由的卡只能被无脑点"忽略"。
+    reason = str(reason or "").strip()
+    if reason:
+        line += f"\n理由：{reason}"
+    return line
 
 
 def drill_enabled() -> bool:
@@ -292,7 +299,8 @@ class AgentPusher:
 
     # ---- 确认卡 ----------------------------------------------------------
 
-    def confirm_card(self, turn_id: int, pending_action, grounded=None) -> str | None:
+    def confirm_card(self, turn_id: int, pending_action, grounded=None,
+                     reason: str = "") -> str | None:
         from notify.hmac_sign import ensure_secret
 
         if self._drill_skip("confirm_card", turn_id=turn_id):
@@ -302,7 +310,7 @@ class AgentPusher:
         ttl_h = getattr(getattr(self.cfg.agent, "pending_action_ttl_h", None), "__int__", None)
         ttl = int(getattr(self.cfg.agent, "pending_action_ttl_h", 24) or 24)
         exp_ts = int(self.clock.now().timestamp()) + ttl * 3600
-        desc = action_desc(pending_action)
+        desc = action_desc(pending_action, reason)
         secret = ensure_secret(self.conn)
         msg = render_confirm_card(turn_id, desc, host, secret, self.cfg, exp_ts)
         payload = pending_action if isinstance(pending_action, str) else json.dumps(
@@ -315,7 +323,18 @@ class AgentPusher:
         self.conn.execute("UPDATE agent_turn SET pending_action = COALESCE(pending_action, ?)"
                           " WHERE id = ?", (payload, turn_id))
         self.conn.commit()
-        return self._send(row_id, msg)
+        sent = self._send(row_id, msg)
+        if sent is None:
+            # **卡没发出去就别留着 pending**：`api/routes.py` 的确认入口只校验
+            # "`confirm-{turn_id}` 这行存在"，不看它的 status——留着一个用户根本
+            # 没看到的 pending，24 小时内理论上仍可被执行，也一直占着"待确认"，
+            # 让模型以为自己在等一个不会来的答复。
+            # 与 `chat/session.py` 的同类路径同一语义（那边发送失败立刻置 expired）。
+            self.conn.execute(
+                "UPDATE agent_turn SET pending_status = 'expired'"
+                " WHERE id = ? AND pending_status = 'pending'", (turn_id,))
+            self.conn.commit()
+        return sent
 
 
 # ---------------------------------------------------------------- 小工具

@@ -474,3 +474,85 @@ async def test_failed_alarm_turn_is_released_for_retry(tmp_path):
     again = due_alarms(conn, clock.now())
     assert [a["id"] for a in again] == [alarm["id"]], (
         "闹钟回合失败后没有放回 pending：这次回访被永久丢弃了")
+
+
+def test_scheduled_alarm_uses_the_injected_clock(tmp_path):
+    """闹钟的 `created_at` 必须来自注入的时钟，不能用系统时间。
+
+    `due_at` 一直取 `clock.now()`，而 `created_at` 原来是 `datetime.now(SH)`——
+    生产用 `SystemClock` 无碍，但 `FixedClock`（测试/回放）下两个字段会差出真实
+    日期，`get_own_history` 按 `created_at` 筛当日就查不到刚排的闹钟。
+    """
+    from agent.schedule import schedule_alarm
+    from core.clock import FixedClock
+    from core.db import connect, migrate
+    from tests.helpers import SH
+    from datetime import datetime
+
+    clock = FixedClock(datetime(2026, 10, 30, 10, 30, tzinfo=SH))
+    conn = connect(tmp_path / "s.db")
+    migrate(conn)
+
+    schedule_alarm(conn, turn_id=1, due_at=clock.now().isoformat(), market="cn_main",
+                   target="sh600519", note="回访", now=clock.now())
+    created = conn.execute("SELECT created_at FROM agent_schedule").fetchone()[0]
+    assert created.startswith("2026-10-30"), (
+        f"created_at={created} 不是注入时钟的日期：模型按当日查不到这条闹钟")
+
+
+def test_undelivered_confirm_card_does_not_leave_a_pending_action(tmp_path):
+    """确认卡**没发出去**时不能留着 `pending`。
+
+    `api/routes.py` 的确认入口只校验 `confirm-{turn_id}` 这行存在，不看它的
+    status——留着一个用户根本没看到的 pending，24 小时内仍可被执行，
+    而且一直占着"待确认"，模型会以为自己在等一个不会来的答复。
+    """
+    from agent.push import AgentPusher
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from pathlib import Path
+    from tests.helpers import SH
+    from datetime import datetime
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "cc.db")
+    migrate(conn)
+    clock = FixedClock(datetime(2026, 10, 30, 10, 30, tzinfo=SH))
+
+    class _BoomNtfy:
+        def publish(self, msg):
+            raise RuntimeError("通道挂了")
+
+    conn.execute(
+        "INSERT INTO agent_turn(ts, wake_kind, context_digest, rounds, decision, fallback,"
+        " market) VALUES (?,?,?,?,?,?,?)",
+        (clock.now().isoformat(), "event", "x", 1, "speak", 0, "cn_main"))
+    conn.commit()
+    turn_id = conn.execute("SELECT max(id) FROM agent_turn").fetchone()[0]
+
+    pusher = AgentPusher(conn, _BoomNtfy(), cfg, clock)
+    out = pusher.confirm_card(turn_id, {"tool": "mcp_add_watch", "args": {"code": "sh600519"}})
+    assert out is None, "前提不成立：发送应当失败"
+
+    status = conn.execute("SELECT pending_status FROM agent_turn WHERE id=?",
+                          (turn_id,)).fetchone()[0]
+    assert status != "pending", (
+        "确认卡没发出去，却把回合标成 pending：用户看不到这张卡，24 小时内它仍可被执行")
+
+
+def test_silent_turn_confirm_card_explains_why(tmp_path):
+    """**沉默回合的确认卡必须带上理由**。
+
+    `speak=false` 时不推正文，确认卡就是用户唯一看到的东西。原来卡上只有一行
+    "加入自选 sh600519"，没有任何理由——用户不知道该不该点，只能无脑"忽略"。
+    """
+    from agent.push import action_desc
+
+    desc = action_desc({"tool": "mcp_add_watch", "args": {"code": "sh600519"}},
+                       "这只票连续三天贴顶尖但一直没进池")
+    assert "理由" in desc, f"确认卡没有带理由：{desc!r}"
+    assert "连续三天贴顶尖" in desc
+    # 没有理由时不能凭空造一个"理由："
+    assert "理由" not in action_desc({"tool": "mcp_add_watch",
+                                      "args": {"code": "sh600519"}}, "")

@@ -97,6 +97,26 @@ function statusBody(
   };
 }
 
+/** 推送历史：**必须带失败行**——"今天那条为什么没收到"就靠它。
+ *  这个接口原来不存在，失败/被抑制/审计行全都不可见。 */
+function pushLogBody() {
+  return {
+    date: 20261119,
+    counts: { accepted: 2, suppressed: 1, failed: 1 },
+    rows: [
+      { ts: "2026-11-19T10:30:00+08:00", code: null, kind: "llm_down", level: "P0",
+        seq_id: "s1", segment: 1, status: "accepted", body: "LLM 连续失败", error: null,
+        ntfy_id: "n1" },
+      { ts: "2026-11-19T10:20:00+08:00", code: "sh600519", kind: "breakout", level: "P2",
+        seq_id: "s2", segment: 1, status: "failed", body: "放量突破", error: "通道 503",
+        ntfy_id: null },
+      { ts: "2026-11-19T10:10:00+08:00", code: "sh600000", kind: "breakdown", level: "P2",
+        seq_id: "s3", segment: 1, status: "suppressed", body: "跌破", error: null,
+        ntfy_id: null },
+    ],
+  };
+}
+
 function stubFetch(
   overrides: { turn_stale_min?: number | null; last_turn_at?: string | null;
                budget_exhausted?: boolean; in_session?: boolean } = {},
@@ -104,6 +124,7 @@ function stubFetch(
   const body = (path: string) => {
     if (path.startsWith("/api/status")) return statusBody(overrides);
     if (path.startsWith("/api/agent-log")) return agentLogBody();
+    if (path.startsWith("/api/push-log")) return pushLogBody();
     if (path.startsWith("/api/settings")) return { strategy: {}, markets: {} };
     return { as_of: null, trade_date: null, rows: [] };
   };
@@ -169,10 +190,23 @@ describe("工作日志页", () => {
     expect(host.querySelector("input[type=date]")).not.toBeNull();
   });
 
+  test("推送历史显示失败原因（这条故障原来完全不可见）", async () => {
+    stubFetch();
+    await mount("/agent-log");
+    expect(host.textContent).toContain("推送历史");
+    const pushRows = Array.from(host.querySelectorAll(".pushlist li.logturn"));
+    expect(pushRows.length).toBeGreaterThan(0);
+    // 失败的那条必须让人看见原因
+    expect(host.textContent).toContain("发送失败");
+    expect(host.textContent).toContain("通道 503");
+    expect(host.textContent).toContain("被抑制");
+    expect(host.textContent).toContain("已送达");
+  });
+
   test("沉默的回合也在列表里（这是这张表的灵魂）", async () => {
     stubFetch();
     await mount("/agent-log");
-    const rows = Array.from(host.querySelectorAll(".list li.logturn"));
+    const rows = Array.from(host.querySelectorAll(".list:not(.pushlist) li.logturn"));
     expect(rows).toHaveLength(3);
     const silent = rows.filter((r) => (r.textContent ?? "").includes("沉默"));
     // 两条 silent 回合都必须渲染出来，且带回自己的 why

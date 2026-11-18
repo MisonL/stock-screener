@@ -676,3 +676,56 @@ def test_p0_alert_is_not_blocked_by_the_daily_cap(env):
     row = env.conn.execute(
         "SELECT status FROM push_log WHERE kind='disk' ORDER BY id DESC LIMIT 1").fetchone()
     assert row and row[0] == "accepted", f"P0 告警被抑制成 {row[0] if row else '无行'}"
+
+
+def test_close_digest_does_not_count_audit_rows_as_pushed(env):
+    """收盘摘要的"已推送 N 条"不能把 `confirm_result` 审计行算进去。
+
+    `confirm_result` 是确认回调里**直接以 accepted 插入、从未发送**的行
+    （`api/routes.py`），`confirm_card` 是交互卡。它们都不占额度——
+    `_capped()` 用 `NON_PUSH_KINDS` 排除掉了，收盘摘要却只按 `status='accepted'`
+    数，两处口径不一致，摘要会把"没发出去的审计行"算成已推送。
+    """
+    from notify.policy import NON_PUSH_KINDS
+
+    day = clock_at().today()
+    # 一条真实推送
+    env.disp._push_log(row={"code": None, "kind": "breakout", "level": "P2",
+                            "seq_id": "real-1", "event_id": None, "signal_id": None,
+                            "segment": 1, "trade_date": day},
+                       msg=render_alert("x", "真实推送", env.cfg, level="P2"))
+    # 两条审计/交互行，都由确认链路直接以 accepted 插入、没有真正发送
+    for i, kind in enumerate(NON_PUSH_KINDS):
+        env.conn.execute(
+            "INSERT INTO push_log(ts, code, kind, level, seq_id, segment, body,"
+            " trade_date, status) VALUES (?,?,?,?,?,?,?,?,'accepted')",
+            (clock_at().now().isoformat(), None, kind, "P2", f"{kind}-{i}", 1, "审计行", day))
+    env.conn.commit()
+
+    stats = env.disp.build_close_stats()
+    assert stats.pushed == 1, (
+        f"收盘摘要把 {stats.pushed} 条算成已推送，其中混进了从未发送的审计行")
+
+
+def test_repeated_alert_is_cooled_down(env):
+    """**同一 kind 的告警 30 分钟内只发一次**。
+
+    `agent/main.py` 的主循环约 2 秒一轮，`except Exception` 里调 `alert`；
+    异常持续时每个周期都推一条 P1，几分钟就把日额度烧穿——额度一满，
+    真正的告警也被压掉。watchdog 早就有 30 分钟冷却，这条路径没有。
+    """
+    before = len(env.ntfy.published)
+    env.disp.alert("agent_main_crash", "主循环炸了", "P1")
+    after_first = len(env.ntfy.published)
+    assert after_first > before, "前提不成立：第一条告警没发出去"
+
+    # 模拟主循环连续重试
+    for _ in range(5):
+        env.disp.alert("agent_main_crash", "主循环炸了", "P1")
+    assert len(env.ntfy.published) == after_first, (
+        f"告警没有冷却：5 次重试又发了 {len(env.ntfy.published) - after_first} 条，"
+        "会把日额度烧穿")
+
+    # 不同 kind 不受影响
+    env.disp.alert("disk_full", "磁盘满了", "P0")
+    assert len(env.ntfy.published) > after_first, "不同 kind 被错误地一起冷却了"

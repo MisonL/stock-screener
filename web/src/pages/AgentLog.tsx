@@ -33,6 +33,25 @@ type Summary = {
 
 type AgentLogBody = { summary: Summary; turns: Turn[] };
 
+/** 后端契约（`GET /api/push-log?date=YYYYMMDD`）：推送历史明细。
+ *
+ *  **这个接口原来不存在**，于是"今天那条为什么没收到"只能 SSH 进库查——
+ *  失败、被抑制、审计行全都不可见，页面只能看到一枚通道级徽标。 */
+type PushRow = {
+  ts: string;
+  code: string | null;
+  kind: string;
+  level: string | null;
+  seq_id: string | null;
+  segment: number | null;
+  status: string;
+  body: string | null;
+  error: string | null;
+  ntfy_id: string | null;
+};
+
+type PushLogBody = { date: number; counts: Record<string, number>; rows: PushRow[] };
+
 /** 日期选择器用 YYYY-MM-DD，接口收 YYYYMMDD。 */
 function toApiDate(isoDay: string): string {
   return isoDay.replace(/-/g, "");
@@ -130,12 +149,55 @@ export function TurnRow({ turn }: { turn: Turn }) {
   );
 }
 
+/** 推送状态：`accepted` 才算真的到了手机。 */
+const PUSH_STATUS: Record<string, { label: string; kind: string }> = {
+  accepted: { label: "已送达", kind: "ok" },
+  suppressed: { label: "被抑制", kind: "quiet" },
+  failed: { label: "发送失败", kind: "bad" },
+  pending: { label: "发送中", kind: "quiet" },
+};
+
+const PUSH_KIND: Record<string, string> = {
+  breakout: "突破",
+  breakdown: "跌破",
+  agent_note: "agent 便签",
+  open_brief: "开盘简报",
+  close_digest: "收盘摘要",
+  confirm_card: "确认卡",
+  confirm_result: "确认结果",
+  push_channel_down: "通道故障",
+  llm_down: "LLM 故障",
+};
+
+function PushRowItem({ row }: { row: PushRow }) {
+  const info = PUSH_STATUS[row.status] ?? { label: row.status, kind: "quiet" };
+  return (
+    <li className="logturn">
+      <div className="loghead">
+        <span className="muted">{row.ts.slice(5, 16).replace("T", " ")}</span>
+        <span className={`badge logbadge-${info.kind}`}>{info.label}</span>
+        <span className="muted">{PUSH_KIND[row.kind] ?? row.kind}</span>
+        {row.code && <span className="muted">{row.code}</span>}
+        {row.level && <span className="muted">{row.level}</span>}
+        {row.segment === 2 && <span className="muted">第二段</span>}
+      </div>
+      <div className="logbody">
+        {row.body && <div>{row.body}</div>}
+        {row.error && <div className="bad">原因：{row.error}</div>}
+      </div>
+    </li>
+  );
+}
+
 export function AgentLog() {
   // 日期选择器默认今天；页面上「按时间倒序，一天一屏」（§7.6.2）
   const [date, setDate] = useState<string>(() => todayLocal());
   const { data, error } = usePoll<AgentLogBody>(`/api/agent-log?date=${toApiDate(date)}`, 30_000);
+  const { data: pushData } = usePoll<PushLogBody>(`/api/push-log?date=${toApiDate(date)}`, 30_000);
   const summary = data?.summary;
   const turns = useMemo(() => (data?.turns ?? []).slice().reverse(), [data]);
+  const pushes = pushData?.rows ?? [];
+  const pushCounts = pushData?.counts ?? {};
 
   return (
     <section>
@@ -169,6 +231,29 @@ export function AgentLog() {
           <li className="muted">
             {error ? "日志读取失败" : data ? `这一天没有回合（${date}）` : "加载中…"}
           </li>
+        )}
+      </ul>
+
+      {/* 推送历史：**每一条的最终状态与失败原因**。原来这一块完全不可见，
+          "今天那条为什么没收到"只能进库查。 */}
+      <div className="logfilter">
+        <h2>推送历史</h2>
+      </div>
+      {pushData && (
+        <div className="statusbar">
+          <span className="badge">已送达 {pushCounts.accepted ?? 0}</span>
+          <span className="badge">被抑制 {pushCounts.suppressed ?? 0}</span>
+          <span className={`badge${(pushCounts.failed ?? 0) > 0 ? " bad" : ""}`}>
+            失败 {pushCounts.failed ?? 0}
+          </span>
+        </div>
+      )}
+      {/* **独立的 class**：回合列表的 `.list li.logturn` 是"沉默也在"那条断言的
+          选择器，混进来会把回合数算错（实测 3 条回合被算成 6 条）。 */}
+      <ul className="list pushlist">
+        {pushes.map((r, i) => <PushRowItem key={`${r.ts}-${i}`} row={r} />)}
+        {pushes.length === 0 && (
+          <li className="muted">{pushData ? `这一天没有推送记录（${date}）` : "加载中…"}</li>
         )}
       </ul>
     </section>

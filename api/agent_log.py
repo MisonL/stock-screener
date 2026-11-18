@@ -64,9 +64,49 @@ def turns_for(conn, day: int) -> list[dict]:
     return out
 
 
+#: 推送历史最多返回多少行（一天正常几十条，给足余量但不至于把页面拖垮）
+PUSH_LOG_LIMIT = 500
+
+
+def push_rows_for(conn, day: int, limit: int = PUSH_LOG_LIMIT) -> list[dict]:
+    """当日 `push_log` 明细。
+
+    **这个接口原来不存在**，于是"今天那条为什么没收到"只能 SSH 进库查：
+    失败、被抑制、审计行全都不可见，用户在网页上只能看到一枚通道级徽标。
+    """
+    rows = conn.execute(
+        "SELECT ts, code, kind, level, seq_id, segment, status, body, error, ntfy_id"
+        " FROM push_log WHERE trade_date = ? ORDER BY id DESC LIMIT ?",
+        (day, int(limit))).fetchall()
+    return [{"ts": r[0], "code": r[1], "kind": r[2], "level": r[3], "seq_id": r[4],
+             "segment": r[5], "status": r[6],
+             # **正文要截断**：合并批的 body 可能上千字，整页拉下来没有意义
+             "body": (r[7] or "")[:500], "error": r[8], "ntfy_id": r[9]}
+            for r in rows]
+
+
+def push_counts(conn, day: int) -> dict:
+    """按状态汇总，页面顶部显示一行。"""
+    rows = conn.execute(
+        "SELECT status, count(*) FROM push_log WHERE trade_date = ? GROUP BY status",
+        (day,)).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
 def register(app, conn_factory, clock, cfg) -> None:
     @app.get("/api/agent-log")
     def agent_log(date: str | None = Query(None)):
         day = int(date) if date and str(date).isdigit() and len(str(date)) == 8 else clock.today()
         conn = conn_factory()
         return {"summary": _summary(conn, day, cfg), "turns": turns_for(conn, day)}
+
+    @app.get("/api/push-log")
+    def push_log(date: str | None = Query(None)):
+        """推送历史：**每一条的最终状态与失败原因**。
+
+        查询串里的 `date` 用 `YYYYMMDD`（与 `/api/agent-log` 同口径）。
+        """
+        day = int(date) if date and str(date).isdigit() and len(str(date)) == 8 else clock.today()
+        conn = conn_factory()
+        return {"date": day, "counts": push_counts(conn, day),
+                "rows": push_rows_for(conn, day)}

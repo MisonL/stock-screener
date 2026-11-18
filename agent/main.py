@@ -177,15 +177,22 @@ class AgentMain:
             if result.decision.kind in ("error", "invalid"):
                 release_alarm(self.deps.conn, trigger.alarm_id)
         if result.decision.pending_action and self.deps.pusher is not None:
+            # **把理由带进卡里**：沉默回合（`speak=false`）不推正文，确认卡是用户
+            # 唯一看到的东西。只给一行"加入自选 sh600519"的话，用户不知道该不该点。
+            # `why_silent` 是沉默回合的必填理由（见 `agent/decision.py`），
+            # `body`/`grounded.text` 覆盖说话回合。
+            reason = (result.decision.why_silent or result.decision.body
+                      or getattr(result.grounded, "text", "") or "")
             self.deps.pusher.confirm_card(turn_id, result.decision.pending_action,
-                                          result.grounded)
+                                          result.grounded, reason=reason)
         if result.decision.schedule_next:
             due = self.clock.now() + timedelta(minutes=result.decision.schedule_next)
             # **标的必须传**：target 为 NULL 的闹钟醒来后无从知道要回访哪只票
             schedule_alarm(self.deps.conn, turn_id, due.isoformat(),
                            trigger.market or "cn_main",
                            getattr(trigger, "target", None) or _first_target(trigger),
-                           result.decision.schedule_note or "")
+                           result.decision.schedule_note or "",
+                           now=self.clock.now())
         if getattr(result, "why", None) == "agent 日预算已用完":
             self.budget_exhausted = True
         # 预算写库失败也要进「预算不可用」：否则下一唤醒继续请求、继续花

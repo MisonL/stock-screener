@@ -65,12 +65,20 @@ def next_heartbeat(now: datetime) -> datetime:
 
 
 def schedule_alarm(conn, turn_id: int, due_at: str, market: str,
-                   target: str | None = None, note: str = "") -> int:
-    """插一条闹钟；`due_at` 是 Asia/Shanghai ISO 串。"""
+                   target: str | None = None, note: str = "",
+                   now: datetime | None = None) -> int:
+    """插一条闹钟；`due_at` 是 Asia/Shanghai ISO 串。
+
+    `now` **必须能从外部传**：原来 `created_at` 直接取 `datetime.now(SH)`，
+    而 `due_at` 来自注入的 `clock.now()`。生产用 `SystemClock` 无碍，
+    但测试/回放用 `FixedClock` 时两个字段会差出真实日期——
+    `get_own_history` 按 `created_at` 筛当日，模型就查不到自己刚排的闹钟了。
+    """
+    created = (now or datetime.now(SH)).isoformat()
     cur = conn.execute(
         "INSERT INTO agent_schedule(created_at, due_at, market, target, note, status)"
         " VALUES (?,?,?,?,?,'pending')",
-        (datetime.now(SH).isoformat(), due_at, market, target, note))
+        (created, due_at, market, target, note))
     conn.commit()
     return cur.lastrowid
 

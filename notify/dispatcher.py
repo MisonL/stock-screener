@@ -358,13 +358,32 @@ class Dispatcher:
                 level,
             )
 
+    #: 同一 `kind` 的告警多久内不重复发（秒）。`api/watchdog.py` 的 `REPEAT_S` 是同一量级。
+    ALERT_REPEAT_S = 1800
+
     def alert(self, kind: str, text: str, level: str = "P1") -> None:
+        """运维告警。**同 kind 30 分钟内只发一次**。
+
+        起因：`agent/main.py` 的主循环 `except Exception` 里会调 `alert`，
+        而主循环约 2 秒一轮——异常持续时（比如库锁死）每个周期都推一条 P1，
+        几分钟就能把 `notify.daily_cap` 烧穿；额度一满，**真正的告警也被压掉**。
+        watchdog 自己早就有 30 分钟冷却（`api/watchdog.py::_alert`），
+        这条路径没有，属于同一个问题只修了一半。
+        """
         # 维护模式（备份/回填/演练）期间不告警：那段时间的失败是预期的
         flag = self.conn.execute(
             "SELECT value FROM job_state WHERE name = 'maintenance.flag'").fetchone()
         if flag is not None and str(flag[0]) == "1":
             return
         now = self.clock.now()
+        # 冷却判据用 **`status='accepted'` 或 `suppressed`**：发成功要冷却，
+        # 被额度压掉的也算"已经尝试过"——否则额度满时反而每 2 秒重试一次。
+        cutoff = (now - timedelta(seconds=self.ALERT_REPEAT_S)).isoformat()
+        recent = self.conn.execute(
+            "SELECT 1 FROM push_log WHERE kind = ? AND status IN ('accepted','suppressed')"
+            " AND ts > ? LIMIT 1", (kind, cutoff)).fetchone()
+        if recent is not None:
+            return
         seq_id = f"alert-{kind}-{int(now.timestamp())}"
         n = self.conn.execute("SELECT count(*) FROM push_log WHERE seq_id LIKE ?",
                               (f"{seq_id}%",)).fetchone()[0]
@@ -385,20 +404,31 @@ class Dispatcher:
                             "seq_id": msg.seq_id, "event_id": None, "signal_id": None,
                             "segment": 1, "trade_date": self.clock.today()}, msg=msg)
 
-    def close_digest(self) -> None:
+    def build_close_stats(self) -> CloseStats:
+        """当日推送统计（**纯读，不发送**，便于单测与网页复用）。
+
+        「已推送」必须与 `_capped()` 同一口径：只算**真正发出去的新通知**。
+        原来只按 `status='accepted'` 数，于是 `confirm_result`（确认回调里
+        直接以 accepted 插入、从未发送的审计行）也被算成了已推送——
+        同一份语义两处口径不一致，摘要会虚高。
+        """
         day = self.clock.today()
-        # 同样按 seq_id：合并批的成员行是同一「条」，不能把 1 条算成 N 条
-        pushed = self.conn.execute(
-            "SELECT count(DISTINCT seq_id) FROM push_log WHERE trade_date=? AND status='accepted'",
-            (day,)).fetchone()[0]
+        # 按 seq_id 去重：合并批的成员行是同一「条」，按行数算等于把 1 条算成 N 条
+        pushed = pushed_today(self.conn, exclude_segments=(2,),
+                              exclude_kinds=NON_PUSH_KINDS, day=day)
         suppressed = self.conn.execute(
             "SELECT count(*) FROM push_log WHERE trade_date=? AND status='suppressed'", (day,)).fetchone()[0]
         by_kind = {r[0]: r[1] for r in self.conn.execute(
             "SELECT kind, count(*) FROM signals WHERE trade_date=? GROUP BY kind", (day,))}
         by_level = {r[0]: r[1] for r in self.conn.execute(
             "SELECT level, count(*) FROM signals WHERE trade_date=? GROUP BY level", (day,))}
-        stats = CloseStats(pushed=pushed, suppressed=suppressed, signals_n=sum(by_kind.values()),
-                           by_kind=by_kind, by_level=by_level, pool_sizes=self._pool_sizes())
+        return CloseStats(pushed=pushed, suppressed=suppressed,
+                          signals_n=sum(by_kind.values()),
+                          by_kind=by_kind, by_level=by_level, pool_sizes=self._pool_sizes())
+
+    def close_digest(self) -> None:
+        day = self.clock.today()
+        stats = self.build_close_stats()
         msg = render_close_digest(stats, self.cfg, trade_date=day,
                                       secret=self.secret)
         self._push_log(row={"code": None, "kind": "close_digest", "level": "P2",

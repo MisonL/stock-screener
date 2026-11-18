@@ -212,3 +212,32 @@ def test_archive_keeps_row_that_was_not_fully_archived(env):
     kept = env.conn.execute("SELECT why FROM agent_turn WHERE id = ?", (turn_id,)).fetchall()
     assert [r[0] for r in kept] == ["这条没被归档过"], "没归档的行被删了"
     assert out["leftover"] == 1
+
+
+def test_push_log_endpoint_lists_failures_with_reasons(env):
+    """`GET /api/push-log` 必须能列出**失败记录与原因**。
+
+    这条接口原来不存在："今天那条为什么没收到"只能 SSH 进库查，
+    失败/被抑制/审计行在网页上完全不可见，只有一枚通道级徽标。
+    """
+    conn = env.conn
+    day = env.clock.today()
+    conn.execute(
+        "INSERT INTO push_log(ts, code, kind, level, seq_id, segment, body, trade_date,"
+        " status, error) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (env.clock.now().isoformat(), "sh600519", "breakout", "P2", "s-1", 1,
+         "放量突破", day, "failed", "通道 503"))
+    conn.execute(
+        "INSERT INTO push_log(ts, code, kind, level, seq_id, segment, body, trade_date, status)"
+        " VALUES (?,?,?,?,?,?,?,?,?)",
+        (env.clock.now().isoformat(), "sh600000", "breakdown", "P2", "s-2", 1,
+         "跌破", day, "suppressed"))
+    conn.commit()
+
+    body = env.client.get(f"/api/push-log?date={day}").json()
+    assert body["counts"]["failed"] == 1
+    assert body["counts"]["suppressed"] == 1
+    failed = [r for r in body["rows"] if r["status"] == "failed"]
+    assert len(failed) == 1
+    assert failed[0]["error"] == "通道 503", "失败原因没有返回"
+    assert failed[0]["code"] == "sh600519"

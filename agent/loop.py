@@ -268,7 +268,13 @@ async def run_turn(trigger: Trigger, deps: Deps, rendered: Rendered,
         if not deps.budget.allow(est_in=_est_in(msgs, tools), est_out=MAX_TOKENS):
             # **这里不加轮数**：一次 LLM 都没发出去，记成 1 轮会把 F-34 的
             # 「一轮收场」占比虚高到 1.0。
-            return _result(TurnDecision.timeout("agent 日预算已用完"), rounds, tool_calls,
+            # **必须记 `error` 而不是 `timeout`**：预算耗尽不是"慢"，
+            # 它是配置/额度问题。记成 timeout 会让「回合超时率」这个告警口径
+            # 失真——实测 2026-11-18 上午 11 条 timeout 里有 10 条其实是预算耗尽，
+            # 真实超时率被虚报成 51%（实际约 5%）。
+            # 入口层（`run_with_deadline` 前面的预检）一直记的是 `error`，
+            # 这里跟它统一。
+            return _result(TurnDecision.error("agent 日预算已用完"), rounds, tool_calls,
                            rendered, state, started, deps)
         # **`rounds` 在 `chat` 真正发出后才加**（见下）：`deduct` 扣不动时
         # `LlmClient` 会在发请求前抛 `BudgetExceeded`，那次不算一轮。

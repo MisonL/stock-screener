@@ -305,3 +305,64 @@ def test_alarm_context_reaches_the_model_messages():
     other = _messages(Trigger(wake_kind="alarm", alarm_id=8, target="sz000001",
                               note="OTHER_NOTE"), type("R", (), {"text": "基准段落"})())
     assert "\n".join(m["content"] for m in other) != joined, "两个不同闹钟的请求完全一样"
+
+
+def test_budget_exhaustion_mid_turn_is_recorded_as_error_not_timeout():
+    """轮次**中途**预算耗尽要记 `error`，不能记 `timeout`。
+
+    实测 2026-11-18 上午 11 条 timeout 里有 10 条其实是预算耗尽，真实超时率
+    被虚报成 51%（实际约 5%）。入口层的预检一直记 error，这里必须一致。
+
+    真跑 `run_turn`：让预算在首轮之后耗尽（allow 第一次 True、之后 False），
+    断言产出的 decision 是 error 而不是 timeout。
+    """
+    import asyncio
+    from types import SimpleNamespace as NS
+
+    from agent.context import Rendered
+    from agent.decision import TurnDecision
+    from agent.loop import Deps, Trigger, run_turn
+    from tests.helpers import SH
+    from datetime import datetime
+
+    t0 = datetime(2026, 10, 30, 10, 30, tzinfo=SH)
+
+    class _Budget:
+        """首轮放行、之后一律拒绝——模拟"轮次中途额度用完"。"""
+
+        def __init__(self):
+            self.calls = 0
+
+        def allow(self, est_in=0, est_out=0):
+            self.calls += 1
+            return self.calls == 1
+
+        def deduct(self, est_in=0, est_out=0):
+            return True
+
+        def audit(self, *a, **k):
+            return None
+
+    class _Llm:
+        async def chat(self, messages, tools=None, **kw):
+            return NS(tool_calls=[NS(id="c1", name="get_quote", arguments='{"code":"sh600519"}')],
+                      content="", usage=NS(prompt_tokens=10, completion_tokens=5))
+
+    class _Tools:
+        def schema(self, scope):
+            return []
+
+        def run(self, *a, **k):
+            return {"ok": True, "data": {"price": 10.0}}, []
+
+    deps = Deps(conn=None, cfg=NS(llm=NS(timeouts=NS(agent_call_s=20),
+                                        budget=NS(agent=1))),
+                clock=NS(now=lambda: t0, today=lambda: 20261030),
+                llm=_Llm(), budget=_Budget(), tools=_Tools(),
+                render=lambda t: Rendered("x", 1, False, {}), pusher=None)
+    trig = Trigger(wake_kind="heartbeat", rounds_budget=3, deadline_s=30)
+
+    result = asyncio.run(run_turn(trig, deps, Rendered("x", 1, False, {}), {"rounds": 0}))
+    assert result.decision.kind == "error", (
+        f"预算中途耗尽被记成了 {result.decision.kind!r}：会把超时率统计搞脏")
+    assert result.why == "agent 日预算已用完"

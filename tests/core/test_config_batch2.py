@@ -52,16 +52,15 @@ def test_config_without_batch2_files_still_loads(tmp_path):
 
 
 def test_agent_budget_covers_a_full_trading_day():
-    """预算必须够跑完**一个真实交易日**，按实测回合数算而不是凭直觉。
+    """预算必须够跑完**一个真实交易日**，口径全部来自生产实测。
 
-    历史：300000 只够 7 回合（当天 10:42 打满）；1500000 只够 75 回合，
-    而全天光心跳就有 68 次，没有余量。这里用实测口径把它钉死。
-
-    几个数都是**量出来的**：每回合约 20000（15 个真实回合计扣 299968）、
-    全天心跳 67–68 次（`agent/schedule.py` 实测）、事件与闹钟保守取 35。
+    这是第三次修正同一件事，前两次都栽在"凭直觉估回合数"：
+    300000（10 分钟打满）、1500000（4 小时打满）、3000000（14:20 打满）。
+    实测 2026-11-18：127 次 attempt 预扣 2,924,888，外推全天约 145 次
+    ≈ 3,340,000。所以这里钉住的是**attempt 真实均值 23031**，不是猜的数。
     """
     from agent.schedule import next_heartbeat
-    from datetime import date, datetime
+    from datetime import datetime
     from zoneinfo import ZoneInfo
 
     tz = ZoneInfo("Asia/Shanghai")
@@ -74,13 +73,17 @@ def test_agent_budget_covers_a_full_trading_day():
         seen.add(key)
         beats += 1
         t = next_heartbeat(t)
-
     assert 60 <= beats <= 80, f"心跳次数与实测不符：{beats}"
 
-    per_turn = 20000          # 实测：15 个真实回合计扣 299968
-    need = (beats + 35) * per_turn       # 心跳 + 事件/闹钟
+    # 实测：当日 60 个回合产生 127 次 attempt（每回合 2–4 轮 + 重写/重试）
+    attempts_per_turn = 127 / 60
+    per_attempt = 23031                      # 实测：2,924,888 / 127
+    total_attempts = (beats + 35) * attempts_per_turn
+    need = total_attempts * per_attempt
+
     limit_in, limit_out = CFG.llm.budget.agent
-    assert limit_in >= need * 1.3, (
-        f"输入额度 {limit_in:,} 只够 {limit_in/per_turn:.0f} 回合，"
-        f"而一天需要约 {(beats+35)} 回合（至少 {need:,}）")
-    assert limit_out > 0
+    assert limit_in >= need, (
+        f"输入额度 {limit_in:,} 只够约 {limit_in/per_attempt:.0f} 次 attempt，"
+        f"而一天需要约 {total_attempts:.0f} 次（约 {need:,.0f}）")
+    assert limit_out >= total_attempts * CFG.llm.max_tokens.tools, (
+        f"输出额度 {limit_out:,} 不够 {total_attempts:.0f} 次 attempt 的预留")

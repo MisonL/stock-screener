@@ -26,7 +26,8 @@ def test_llm_and_retry_are_root_level_siblings():
     assert CFG.retry.max_attempts == 3
     assert tuple(CFG.retry.backoff) == (0.5, 1.0)
     assert "502" in [str(x) for x in CFG.retry.retry_on] or 502 in CFG.retry.retry_on
-    assert tuple(CFG.llm.budget.agent) == (300000, 40000)
+    # 预算是保守预扣（实测约 3.2 倍），值会随标定调整——这里只钉住结构
+    assert len(tuple(CFG.llm.budget.agent)) == 2 and CFG.llm.budget.agent[0] > 0
     assert CFG.llm.pricing.is_estimate is True
 
 

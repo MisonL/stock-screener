@@ -156,6 +156,10 @@ def _bump_rounds(state: dict) -> None:
     state["rewrites"] = int(state.get("rewrites") or 0) + 1
 
 
+#: 预算耗尽的统一措辞。`agent/main.py` 用它判断"今天不可能再跑了"，
+#: 从而跳过闹钟——避免"每 2 秒重跑一次必败回合"的死循环（生产实测一天 17885 行）。
+BUDGET_EXHAUSTED_WHY = "agent 日预算已用完"
+
 #: 兜底硬上限（秒）。只在"上游彻底不回包"时才会撞上，不是正常的时长约束。
 #: 取 10 分钟，**刻意小于 `api/watchdog.py` 的 `AGENT_TURN_STALE_S`（15 分钟）**：
 #: 让回合自己收尾并记一行 `timeout`，比"被外部判定为卡死"留下更好的证据。
@@ -307,7 +311,7 @@ async def run_turn(trigger: Trigger, deps: Deps, rendered: Rendered,
             # （耗时 0–5 秒，根本没等），真实超时率被虚报成 51%（实际约 5%）。
             # 入口层（`run_with_deadline` 前面的预检）一直记的是 `error`，
             # 这里跟它统一。
-            return _result(TurnDecision.error("agent 日预算已用完"), rounds, tool_calls,
+            return _result(TurnDecision.error(BUDGET_EXHAUSTED_WHY), rounds, tool_calls,
                            rendered, state, started, deps)
         # **`rounds` 在 `chat` 真正发出后才加**（见下）：`deduct` 扣不动时
         # `LlmClient` 会在发请求前抛 `BudgetExceeded`，那次不算一轮。
@@ -392,9 +396,9 @@ async def run_with_deadline(trigger: Trigger, deps: Deps) -> TurnResult:
                                 est_out=MAX_TOKENS)
     if not allowed:
         return TurnResult(decision=TurnDecision(kind="error", speak=False,
-                                                why="agent 日预算已用完",
-                                                why_silent="agent 日预算已用完"),
-                          rounds=0, rendered=rendered, why="agent 日预算已用完",
+                                                why=BUDGET_EXHAUSTED_WHY,
+                                                why_silent=BUDGET_EXHAUSTED_WHY),
+                          rounds=0, rendered=rendered, why=BUDGET_EXHAUSTED_WHY,
                           grounded=GroundedText(text="", ungrounded=False, failed=False))
     state: dict = {"rounds": 0, "usage": None}
     started = time.monotonic()

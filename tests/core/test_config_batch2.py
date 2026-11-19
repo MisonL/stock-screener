@@ -129,3 +129,20 @@ def test_retry_on_contains_only_real_status_codes():
         for v in values:
             assert str(v).isdigit() or isinstance(v, int), (
                 f"retry.{name} 里出现了非状态码项 {v!r}：它不会被任何代码读取")
+
+
+def test_backoff_tiers_are_all_reachable():
+    """**退避表的档位数不能超过重试次数**——否则最后的档位永远取不到，是死配置。
+
+    `max_attempts: 3` = 首次 + 2 次重试，只有 2 次退避会真的发生。
+    配 `[1.0, 3.0, 8.0]` 时那个 8 秒档永远用不到：写在 YAML 里、
+    看起来像配置生效了，实际是死的。这类"看着配了其实没生效"的坑
+    在这个仓库里已经踩过三次（`retry_on`、`agent.yaml` 的回合预算、本条）。
+    """
+    attempts = int(CFG.retry.max_attempts)
+    table = list(CFG.retry.backoff)
+    retries = max(attempts - 1, 0)          # 首次不算重试
+    assert len(table) <= retries, (
+        f"退避表有 {len(table)} 档，但最多只有 {retries} 次重试："
+        f"第 {retries + 1} 档起永远不会被取到")
+    assert len(table) == retries, "退避档位应当正好覆盖每一次重试"

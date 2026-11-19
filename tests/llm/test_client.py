@@ -418,3 +418,38 @@ async def test_empty_choices_is_retried():
     assert len(m.requests) == CFG.retry.max_attempts, (
         f"空 choices 没有重试：只发了 {len(m.requests)} 次请求"
         f"（应当用满 {CFG.retry.max_attempts} 次）")
+
+
+async def test_actual_request_carries_the_configured_timeout():
+    """**真正发出去的请求要带上正确的超时**，不能只看 `default_timeout()` 的返回值。
+
+    Codex 复核指出：之前的 smoke 只断言了函数返回值，没有检查
+    `request.extensions["timeout"]`。函数返回对、但传参路径断掉的话，
+    测试照样绿，而线上行为完全不同——今天这个 100% 超时故障正是这一类。
+    """
+    from core.config import load_config
+    from pathlib import Path as _P
+    from llm.client import SAFETY_TIMEOUT_S
+
+    cfg = load_config(_P("config"))
+    seen: list[float | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # httpx 把实际生效的超时放在 extensions["timeout"] 里
+        ext = request.extensions.get("timeout") or {}
+        seen.append(ext.get("read"))
+        return httpx.Response(200, json=ok_body())
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler), trust_env=False,
+                             timeout=None)
+    client = LlmClient(cfg, http_client=http)
+    await client.chat([{"role": "user", "content": "hi"}], max_tokens=50)
+
+    assert seen, "请求没有发出去"
+    expected = float(cfg.llm.timeouts.chat_s) or SAFETY_TIMEOUT_S
+    assert seen[0] == expected, (
+        f"实际生效的 read timeout 是 {seen[0]}，期望 {expected}："
+        "配置与运行时不符")
+    # **绝不能让 0 或 None 落到 httpx**：0 = 立刻超时，None = 永远等
+    assert seen[0] is not None and seen[0] > 0, (
+        f"read timeout 是 {seen[0]}：0 会让请求立刻失败，None 会让它永久挂住")

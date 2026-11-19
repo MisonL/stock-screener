@@ -451,11 +451,12 @@ async def test_failed_alarm_turn_is_released_for_retry(tmp_path):
     而 `_run` 失败时原来没有任何回滚逻辑；清理任务只处理 3 天前的 pending，
     不会补跑。
     """
-    from agent.schedule import due_alarms, release_alarm, schedule_alarm
+    from agent.schedule import (ALARM_MAX_ATTEMPTS, ALARM_RETRY_BACKOFF_S, due_alarms,
+                                release_alarm, schedule_alarm)
     from core.clock import FixedClock
     from core.db import connect, migrate
     from tests.helpers import SH
-    from datetime import datetime
+    from datetime import datetime, timedelta
 
     conn = connect(tmp_path / "a.db")
     migrate(conn)
@@ -470,11 +471,26 @@ async def test_failed_alarm_turn_is_released_for_retry(tmp_path):
     conn.commit()
     assert due_alarms(conn, clock.now()) == [], "前提不成立：认领后不该再取到"
 
-    # 回合失败 → 退回
-    release_alarm(conn, alarm["id"])
-    again = due_alarms(conn, clock.now())
+    # 回合失败 → 退回（**但要退避**：立刻退回会变成每 2 秒重跑一次的死循环）
+    assert release_alarm(conn, alarm["id"], now=clock.now()) is True
+    assert due_alarms(conn, clock.now()) == [], "退回后立刻又到期 = 生产事故那个死循环"
+    later = clock.now() + timedelta(seconds=ALARM_RETRY_BACKOFF_S + 1)
+    again = due_alarms(conn, later)
     assert [a["id"] for a in again] == [alarm["id"]], (
         "闹钟回合失败后没有放回 pending：这次回访被永久丢弃了")
+
+    # **不能无限退回**：失败原因当天不恢复时（如日预算耗尽），
+    # 退回 N 次后必须转 cancelled，否则会把整天耗在同一条闹钟上。
+    conn.execute("UPDATE agent_schedule SET status='fired' WHERE id=?", (alarm["id"],))
+    conn.commit()
+    for i in range(2, ALARM_MAX_ATTEMPTS):
+        assert release_alarm(conn, alarm["id"], now=later) is True, f"第 {i} 次不该放弃"
+        conn.execute("UPDATE agent_schedule SET status='fired' WHERE id=?", (alarm["id"],))
+        conn.commit()
+    assert release_alarm(conn, alarm["id"], now=later) is False, "超过上限仍可重试"
+    status = conn.execute("SELECT status FROM agent_schedule WHERE id=?",
+                          (alarm["id"],)).fetchone()[0]
+    assert status == "cancelled", f"超过重试上限后应当取消，实际是 {status}"
 
 
 def test_scheduled_alarm_uses_the_injected_clock(tmp_path):
@@ -484,6 +500,7 @@ def test_scheduled_alarm_uses_the_injected_clock(tmp_path):
     生产用 `SystemClock` 无碍，但 `FixedClock`（测试/回放）下两个字段会差出真实
     日期，`get_own_history` 按 `created_at` 筛当日就查不到刚排的闹钟。
     """
+    from agent.main import AgentMain
     from agent.schedule import schedule_alarm
     from core.clock import FixedClock
     from core.db import connect, migrate
@@ -694,3 +711,59 @@ def test_turn_budget_comes_from_config(tmp_path):
         f"事件回合预算没从配置读：拿到的是 {(m.event_rounds, m.event_deadline)}")
     assert (m.other_rounds, m.other_deadline) == (5, 88.0), (
         f"心跳回合预算没从配置读：拿到的是 {(m.other_rounds, m.other_deadline)}")
+
+
+async def test_budget_exhausted_does_not_rerun_alarms(tmp_path):
+    """**预算耗尽后不能再空转跑闹钟**——这是一次真实事故。
+
+    现场：`release_alarm()` 把失败闹钟退回 `pending`，`due_alarms()` 返回所有
+    `due_at <= now` 的行，而 `_once()` 每 2 秒轮询一次。于是一条已过期的闹钟
+    陷入「到期 → 认领 → 失败 → 退回 → 2 秒后又到期」的死循环。
+    失败原因是「日预算已用完」——当天不可能恢复，循环一直转到收盘。
+
+    结果：一个交易日内写了 **17885 行** `agent_turn`，全是
+    `rounds=0, latency_ms=0` 的空转记录（根本没调模型），
+    把日志页和 `agent_turn` 表彻底冲垮，真正的告警淹没在里面。
+
+    修复：预算耗尽时 `_once()` 直接跳过闹钟循环。
+    """
+    from agent.main import AgentMain
+    from agent.schedule import schedule_alarm
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from tests.helpers import SH
+    from datetime import datetime, timedelta
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "bud.db")
+    migrate(conn)
+    clock = FixedClock(datetime(2026, 10, 30, 10, 30, tzinfo=SH))
+    # 一条已到期的闹钟
+    schedule_alarm(conn, turn_id=1, due_at=clock.now().isoformat(), market="cn_main",
+                   target="sh600519", note="回访", now=clock.now())
+
+    before = conn.execute("SELECT count(*) FROM agent_turn").fetchone()[0]
+
+    class _Deps:
+        def __init__(self):
+            self.conn = conn
+            self.cfg = cfg
+            self.clock = clock
+            self.pusher = None
+            self.llm = None
+            self.budget = None
+            self.alert = lambda *a, **k: None
+            self.conn_factory = lambda: conn
+
+    main = AgentMain(_Deps(), clock)
+    main.budget_exhausted = True            # 当天额度已用完
+    main._last_day = clock.today()
+    main.next_heartbeat_at = clock.now() + timedelta(hours=1)   # 避开心跳路径
+
+    await main._once()
+
+    after = conn.execute("SELECT count(*) FROM agent_turn").fetchone()[0]
+    assert after == before, (
+        f"预算耗尽后仍然跑了 {(after - before)} 个空转回合："
+        "这正是生产事故里一天 17885 行的来源")

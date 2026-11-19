@@ -17,7 +17,8 @@ from datetime import datetime, timedelta
 from agent.attention import AttentionLayer
 from agent.heartbeat import Heartbeat
 from agent.journal import record as journal_record
-from agent.loop import Deps, Trigger, render_trigger, run_with_deadline
+from agent.loop import (BUDGET_EXHAUSTED_WHY, Deps, Trigger, render_trigger,
+                        run_with_deadline)
 from agent.schedule import (after_alarm, due_alarms, next_heartbeat, release_alarm, schedule_alarm,
                             set_fired_turn)
 from core.clock import SH, SystemClock, TradingCalendar
@@ -229,8 +230,18 @@ class AgentMain:
             # 而 LLM 挂掉/预算耗尽/超时都会让这一轮白跑。不放回 `pending` 的话，
             # 模型说的"我 30 分钟后回来看"就静默作废（清理任务只处理 3 天前的
             # pending，不会补跑）。超时不算失败——它已经花掉预算跑过了。
+            # **预算耗尽时不要退回**：当天不可能恢复了，退回只会变成
+            # 「每 2 秒重跑一次失败回合」的死循环（生产实测一天 17885 行空转）。
+            # 直接转 cancelled，把这次回访算作放弃，而不是无限重试。
             if result.decision.kind in ("error", "invalid"):
-                release_alarm(self.deps.conn, trigger.alarm_id)
+                exhausted = getattr(result, "why", "") == BUDGET_EXHAUSTED_WHY
+                if exhausted:
+                    self.deps.conn.execute(
+                        "UPDATE agent_schedule SET status = 'cancelled', fired_turn = NULL"
+                        " WHERE id = ? AND status = 'fired'", (trigger.alarm_id,))
+                    self.deps.conn.commit()
+                else:
+                    release_alarm(self.deps.conn, trigger.alarm_id, now=self.clock.now())
         if result.decision.pending_action and self.deps.pusher is not None:
             # **把理由带进卡里**：沉默回合（`speak=false`）不推正文，确认卡是用户
             # 唯一看到的东西。只给一行"加入自选 sh600519"的话，用户不知道该不该点。
@@ -248,7 +259,7 @@ class AgentMain:
                            getattr(trigger, "target", None) or _first_target(trigger),
                            result.decision.schedule_note or "",
                            now=self.clock.now())
-        if getattr(result, "why", None) == "agent 日预算已用完":
+        if getattr(result, "why", None) == BUDGET_EXHAUSTED_WHY:
             self.budget_exhausted = True
         # 预算写库失败也要进「预算不可用」：否则下一唤醒继续请求、继续花
         try:
@@ -401,6 +412,12 @@ class AgentMain:
                 self._shadow_turn("heartbeat", f"due_at={nxt.isoformat()}")
             self.next_heartbeat_at = nxt
 
+        # **预算耗尽就跳过闹钟**：闹钟回合必然在 `run_with_deadline` 的预检里
+        # 立刻返回 error（rounds=0、0 毫秒），既不调模型也不产生任何价值，
+        # 只会在 `agent_turn` 里留下成千上万行空转记录。
+        # 跳过而不是 cancel：闹钟本身是有效的，只是今天没法跑。
+        if self.budget_exhausted:
+            return
         for alarm in due_alarms(self.deps.conn, now):
             # **先认领再跑**：不认领的话，60 秒的闹钟回合期间 2 秒后的下一轮会把同一个
             # 闹钟再取出一次，形成重复回合

@@ -587,6 +587,16 @@ async def test_failed_alarm_turn_releases_the_alarm(tmp_path):
                                           alarm_id=alarm["id"],
                                           target="sh600519", note="回访"))
 
-    back = due_alarms(env.conn, env.clock.now())
-    assert [a["id"] for a in back] == [alarm["id"]], (
-        "回合失败了，闹钟却没退回 pending：这次回访被永久丢弃")
+    # 退回后**不能立刻又到期**：那正是生产事故的死循环（每 2 秒重跑一次必败回合，
+    # 一天写了 17885 行空转）。现在会退避 60 秒再试。
+    assert due_alarms(env.conn, env.clock.now()) == [], "退回后立刻又到期 = 死循环"
+    status, attempts, due_at = env.conn.execute(
+        "SELECT status, attempts, due_at FROM agent_schedule WHERE id = ?",
+        (alarm["id"],)).fetchone()
+    assert status == "pending", "回合失败了，闹钟却没退回 pending：这次回访被永久丢弃"
+    assert attempts == 1, "退回没有记次，无法限制重试次数"
+    assert due_at > env.clock.now().isoformat(), "due_at 没有往后推，下一轮会立刻再取出"
+    # 退避期过后仍能取到（回访没有丢）
+    from datetime import datetime, timedelta
+    later = datetime.fromisoformat(due_at) + timedelta(seconds=1)
+    assert [a["id"] for a in due_alarms(env.conn, later)] == [alarm["id"]]

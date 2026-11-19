@@ -1,0 +1,16 @@
+-- `agent_schedule.attempts`：闹钟回合失败后被释放重试的次数（v0.2.81）。
+--
+-- **这是一次真实事故的修复**。`release_alarm()` 会把失败的闹钟退回 `pending`，
+-- 而 `_once()` 每 2 秒轮询一次、`due_alarms()` 返回所有 `due_at <= now` 的
+-- pending 行——于是一条**已过期**的闹钟会陷入死循环：
+--
+--   到期 → 认领(fired) → 跑回合 → 失败 → 退回(pending) → 2 秒后再来 → 再失败 …
+--
+-- 只要失败原因不是暂时的（最典型的是「agent 日预算已用完」——当天不可能恢复），
+-- 这个循环就会一直转到收盘。生产实测：一个交易日内写了 **17885 行**
+-- `agent_turn`（全是 `rounds=0, latency_ms=0` 的空转记录，根本没调模型），
+-- 把日志页和 `agent_turn` 表彻底冲垮，而真正的告警淹没在里面。
+--
+-- 修复要点：`release_alarm()` 记次并退避（`due_at` 往后推），
+-- 超过 `ALARM_MAX_ATTEMPTS` 就转 `cancelled` 而不是无限退回。
+ALTER TABLE agent_schedule ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;

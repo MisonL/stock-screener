@@ -108,24 +108,55 @@ def after_alarm(conn, alarm_id: int) -> bool:
     return cur.rowcount == 1
 
 
-def release_alarm(conn, alarm_id: int) -> None:
-    """把认领**退回去**（回合失败时用）。
+#: 闹钟回合失败后最多退回重试几次（第 N 次之后转 `cancelled`）。
+#: 3 次 ≈ 容忍一次瞬时故障（LLM 抖动/写库失败），又不至于把整天耗在同一条闹钟上。
+ALARM_MAX_ATTEMPTS = 3
+
+#: 退回时把 `due_at` 往后推多少秒（**必须 > 轮询间隔**，否则下一轮立刻又取出）。
+#: `_once()` 每 2 秒轮询，这里给 60 秒，既是退避也给上游恢复留时间。
+ALARM_RETRY_BACKOFF_S = 60
+
+
+def release_alarm(conn, alarm_id: int, *, now: datetime | None = None,
+                  backoff_s: float | None = None) -> bool:
+    """把认领**退回去**（回合失败时用）。返回是否还能再试。
 
     「先认领再跑」是为了防重复回合，但它让失败变成了永久丢失：
     `after_alarm` 在跑回合**之前**就把 status 改成 `fired`，若这一轮
     `_run` 因为 LLM 挂掉/预算耗尽/超时而失败，没有任何逻辑把闹钟放回
     `pending`——模型说的"我 30 分钟后回来看"就静默作废了。
-    清理任务只处理 3 天前的 pending，不会补跑。
 
-    退回成 `pending` 后下一轮（2 秒后）会重新取出它，与心跳的
-    `pending_retry` 是同一个思路。
+    **但"退回 pending"不能是无限的**（v0.2.81 修的真实事故）：
+    `_once()` 每 2 秒轮询、`due_alarms()` 返回所有 `due_at <= now` 的 pending 行，
+    于是一条已过期的闹钟会陷入
+    「到期 → 认领 → 失败 → 退回 → 2 秒后又到期」的死循环。
+    只要失败原因当天不可能恢复（最典型的是「日预算已用完」），
+    它就会一直转到收盘——生产实测一天写了 **17885 行** `agent_turn`
+    （全是 `rounds=0, latency_ms=0` 的空转），把日志彻底冲垮。
+
+    所以现在三件事一起做：
+      1. `attempts += 1` 记账；
+      2. `due_at` 往后推 `backoff_s`（默认 60 秒），**必须大于轮询间隔**；
+      3. 超过 `ALARM_MAX_ATTEMPTS` 转 `cancelled`，不再无限退回。
     """
+    now = now or datetime.now(SH)
+    backoff = ALARM_RETRY_BACKOFF_S if backoff_s is None else float(backoff_s)
     # **要连 `fired_turn` 一起清掉**：`_run` 里是先 `set_fired_turn` 再判失败，
     # 带上 `fired_turn IS NULL` 这个条件会让释放永远不生效（实测就是这样）。
     # 清空后下一次成功的回合会重新写上正确的 turn_id。
-    conn.execute("UPDATE agent_schedule SET status = 'pending', fired_turn = NULL"
-                 " WHERE id = ? AND status = 'fired'", (alarm_id,))
+    conn.execute(
+        "UPDATE agent_schedule"
+        "   SET status = CASE WHEN attempts + 1 >= ? THEN 'cancelled' ELSE 'pending' END,"
+        "       attempts = attempts + 1,"
+        "       fired_turn = NULL,"
+        "       due_at = ?"
+        " WHERE id = ? AND status = 'fired'",
+        (ALARM_MAX_ATTEMPTS,
+         (now + timedelta(seconds=backoff)).isoformat(), alarm_id))
     conn.commit()
+    row = conn.execute("SELECT status, attempts FROM agent_schedule WHERE id = ?",
+                       (alarm_id,)).fetchone()
+    return bool(row and row[0] == "pending")
 
 
 def set_fired_turn(conn, alarm_id: int, turn_id: int) -> None:

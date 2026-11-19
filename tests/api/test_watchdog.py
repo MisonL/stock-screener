@@ -357,3 +357,35 @@ def test_every_watchdog_kind_has_a_human_title():
 
     missing = [k for k in typing.get_args(AlertKind) if k not in _ALERT_TITLE]
     assert not missing, f"这些告警 kind 没有中文标题：{missing}"
+
+
+def test_churn_still_alerts_when_budget_exhausted(conn):
+    """**预算耗尽时空转更要报**，不能因为 `budget_exhausted` 而静音。
+
+    另外两条规则（`agent_stalled`、`llm_down`）都带 `not _budget_exhausted(...)`：
+    预算耗尽确实能解释"没有回合"和"没有成功回合"，那是预期停止，不该报。
+
+    但 `agent_churn` 正好相反——2026-11-19 那次事故的**根因就是预算耗尽**：
+    闹钟回合在预检里立刻返回 error（rounds=0、0 毫秒）→ 记账 → 闹钟退回 →
+    2 秒后再来。全天 17998 行。给这条规则加上同样的 gate，等于把
+    "最该报的那种空转"永久静音。
+    """
+    from api.watchdog import AGENT_TURN_CHURN_PER_HOUR
+
+    clock = FixedClock(datetime(2026, 11, 19, 14, 30, tzinfo=SH))
+    now = clock.now()
+    n = AGENT_TURN_CHURN_PER_HOUR + 50
+    step = 3000 / n
+    for i in range(n):
+        conn.execute(
+            "INSERT INTO agent_turn(ts, wake_kind, context_digest, rounds, decision,"
+            " fallback, market) VALUES (?,?,?,?,?,?,?)",
+            ((now - timedelta(seconds=i * step)).isoformat(), "alarm", "空转", 0,
+             "error", 0, "cn_main"))
+    conn.commit()
+    # 心跳声明预算已耗尽（这正是事故当天的状态）
+    set_beat(conn, "agent", 0, detail={"budget_exhausted": True}, clock=clock)
+
+    fired, _disp = run(conn, clock)
+    assert "agent_churn" in fired, (
+        f"预算耗尽时把空转告警静音了：{fired}——而这正是事故当天的状态")

@@ -116,7 +116,13 @@ def check(conn, clock, dispatcher, *, cfg=None, agent_turn_stale_min: int | None
     recent = conn.execute(
         "SELECT count(*) FROM agent_turn WHERE ts > ? AND ts <= ?",
         (window_start, now.isoformat())).fetchone()[0]
-    if recent > AGENT_TURN_CHURN_PER_HOUR and not _budget_exhausted(conn):
+    # **这里刻意不加 `_budget_exhausted(conn)` 的例外**——虽然另外两条规则都加了。
+    # 理由反过来想就清楚：预算耗尽能解释「没有回合」「没有成功回合」，
+    # 但它**解释不了「一小时内 18000 个回合」**。恰恰相反，这次事故的根因
+    # 就是预算耗尽后闹钟无限重试：预检立刻返回 error → 回合记账 → 闹钟退回 →
+    # 2 秒后再来。也就是说 `budget_exhausted` 是**这个故障的因**，不是免报的理由。
+    # 加上这个 gate 就等于「最该报的那种空转恰好被永久静音」。
+    if recent > AGENT_TURN_CHURN_PER_HOUR:
         if _alert(conn, clock, dispatcher, "agent_churn",
                   f"最近一小时内 {recent} 个回合（正常日峰值约 50），疑似空转死循环", now):
             fired.append("agent_churn")

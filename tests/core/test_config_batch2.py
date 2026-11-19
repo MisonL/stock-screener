@@ -10,8 +10,11 @@ CFG = load_config(Path("config"))
 
 
 def test_agent_values():
-    assert CFG.agent.event.deadline_s == 25
+    # `deadline_s: 0` = 不设回合时长上限（默认）。轮数（`rounds`）才是真正的界：
+    # 上游网关排队时每轮要 23–31 秒，任何固定 deadline 迟早被正常回合超过去。
+    assert CFG.agent.event.deadline_s == 0, "回合 deadline 默认应当是不限"
     assert CFG.agent.event.rounds == 3
+    assert CFG.agent.event.rounds > 0, "轮数必须有限，它是唯一保证回合会结束的东西"
     assert CFG.agent.heartbeat.max_min == 10
     assert CFG.agent.heartbeat.tight[0][0] == "09:15"
     assert CFG.agent.context.max_chars == 6000
@@ -24,8 +27,15 @@ def test_llm_and_retry_are_root_level_siblings():
     """`retry` 是 llm.yaml 的根级键：读 cfg.retry.max_attempts，不是 cfg.llm.retry。"""
     assert CFG.llm.model == "deepseek-flash"
     assert CFG.retry.max_attempts == 3
-    assert tuple(CFG.retry.backoff) == (0.5, 1.0)
+    # 退避表会随上游表现调整（限流严重时拉长）——只钉住结构与单调性
+    table = tuple(float(x) for x in CFG.retry.backoff)
+    assert len(table) >= 2 and all(x > 0 for x in table)
+    assert list(table) == sorted(table), "退避应当逐档变长，不该出现倒挂"
     assert "502" in [str(x) for x in CFG.retry.retry_on] or 502 in CFG.retry.retry_on
+    # **限流必须重试**：429 是"稍后再来"，不是"请求有错"
+    retry_on = [str(x) for x in CFG.retry.retry_on]
+    assert "429" in retry_on, "429 限流必须自动重试"
+    assert "429" not in [str(x) for x in CFG.retry.never_retry]
     # 预算是保守预扣（实测约 3.2 倍），值会随标定调整——这里只钉住结构
     assert len(tuple(CFG.llm.budget.agent)) == 2 and CFG.llm.budget.agent[0] > 0
     assert CFG.llm.pricing.is_estimate is True
@@ -104,3 +114,18 @@ def test_agent_budget_covers_a_full_trading_day():
         f"attempt × 每次约 {per_attempt:,} = {need_in:,}")
     assert limit_out >= total_attempts * MAX_TOKENS, (
         f"输出额度 {limit_out:,} 不够 {total_attempts} 次 attempt 的 max_tokens 预留")
+
+
+def test_retry_on_contains_only_real_status_codes():
+    """`retry_on` / `never_retry` 里**只能放具体状态码**。
+
+    超时、空响应、连接失败（http_000）这三类永远重试、不可配置关闭：
+    它们不是"服务器说不"，是"这次没拿到东西"，除了再试没有别的处理方式。
+    以前 YAML 里写着 `timeout`/`empty_body`/`http_000` 三个词，代码一个都不读
+    ——写了不生效的死配置，改它不会有任何行为变化。
+    """
+    for name in ("retry_on", "never_retry"):
+        values = list(getattr(CFG.retry, name))
+        for v in values:
+            assert str(v).isdigit() or isinstance(v, int), (
+                f"retry.{name} 里出现了非状态码项 {v!r}：它不会被任何代码读取")

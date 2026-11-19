@@ -31,6 +31,12 @@ OPENAI_IMPORT_NOTE = "延迟导入，见文件顶部说明"
 
 Verdict = Literal["retry", "double_tokens", "fatal", "ok"]
 
+#: 兜底硬上限（秒）。配置写 `0`（不设业务上限）时用它。
+#: 只在"上游彻底不回包"时才会撞上——实测上游最慢 31 秒，300 秒是 10 倍余量，
+#: 正常调用绝无可能撞上。**绝不能用 `None`**：那是"永远等"，会把回合永久卡住。
+#: 也不能太小：那等于变相恢复了固定超时，又回到"慢但正常"被判死的坑里。
+SAFETY_TIMEOUT_S = 300.0
+
 _RETRY_STATUS = (502, 503, 504, 0)
 _FATAL_STATUS = (400, 401, 403, 404)
 TOOL_MIN_MAX_TOKENS = 2000       # 工具路径下限：低于它会稳定截断 emit_decision 的 JSON
@@ -135,8 +141,35 @@ def _truncated_tool_args(message: Any, finish_reason: str | None) -> bool:
     return False
 
 
-def classify(src: _Attempt | Exception) -> Verdict:
-    """§7.5.6 的判空顺序：**先看 tool_calls**，再看 `finish_reason` 与正文。"""
+def _status_verdict(status: int, retry_on=(), fatal_status=()) -> str:
+    """状态码 → `"retry"` / `"fatal"`。**两个配置键都必须真的生效**。
+
+    判定顺序（顺序本身是语义）：
+      0. **2xx/3xx 一律"不是最终判决"** —— `_Attempt.status` 正常响应也是 200，
+         它的成败要看正文与 `finish_reason`，不能在这里提前定性。
+         漏了这一步会让所有正常响应被判成 fatal（实测：翻倍重试直接不触发）。
+      1. `never_retry` 里的一律 fatal —— 显式放弃优先
+      2. `retry_on` 里的一律 retry —— 显式重试
+      3. 其余按默认：5xx 与 0（连接失败）重试，其余 4xx 放弃
+
+    以前这里是写死的 `_FATAL_STATUS`，`retry_on` **没有任何读取点**、
+    `never_retry` 也没接线——两个键都写在 YAML 里，改了什么都不会发生。
+    """
+    if 200 <= status < 400:
+        return "ok"                     # 交给上层看正文 / finish_reason
+    if status in tuple(fatal_status or ()):
+        return "fatal"
+    if status in tuple(retry_on or ()):
+        return "retry"
+    return "retry" if (status == 0 or status >= 500) else "fatal"
+
+
+def classify(src: _Attempt | Exception, fatal_status=None, retry_on=None) -> Verdict:
+    """§7.5.6 的判空顺序：**先看 tool_calls**，再看 `finish_reason` 与正文。
+
+    `retry_on` / `fatal_status` 由配置 `retry.retry_on` / `retry.never_retry`
+    传入，见 `_status_verdict()`。
+    """
     if isinstance(src, Exception):
         if isinstance(src, NonRetryable):
             return "fatal"
@@ -145,11 +178,12 @@ def classify(src: _Attempt | Exception) -> Verdict:
         # 落到下面的 retry 分支——与原先 isinstance 判定的结论一致）。
         status = getattr(src, "status_code", None)
         if status is not None:
-            return "fatal" if status in _FATAL_STATUS else "retry"
+            return _status_verdict(int(status), retry_on, fatal_status)
         return "retry"
 
-    if src.status in _FATAL_STATUS:
+    if _status_verdict(int(src.status or 0), retry_on, fatal_status) == "fatal":
         return "fatal"
+    # 2xx/3xx 落到下面按正文与 finish_reason 判断（`_status_verdict` 返回 "ok"）
     if src.empty_body:
         return "retry"
     message = src.message
@@ -186,7 +220,10 @@ class LlmClient:
                 base_url=self._base_url,
                 api_key=self._api_key,
                 max_retries=0,                  # 我们的重试次数已经算过账，SDK 别再乘一次
-                http_client=self._http_client or httpx.AsyncClient(trust_env=False, timeout=60),
+                # 单次调用的超时由 `default_timeout()` 每次决定（配置 0 时用
+                # `SAFETY_TIMEOUT_S` 兜底）。这里给 `None` 是为了**不让 client
+                # 级默认值盖掉每次请求传的值**；真正生效的是请求上的 timeout。
+                http_client=self._http_client or httpx.AsyncClient(trust_env=False, timeout=None),
             )
         return self._client
 
@@ -208,9 +245,19 @@ class LlmClient:
         return int(self.cfg.llm.max_tokens.plain)
 
     def default_timeout(self, timeout_s: float | None, tools: list[dict] | None) -> float:
-        if timeout_s is not None:
-            return float(timeout_s)
-        return float(self.cfg.llm.timeouts.chat_s if not tools else self.cfg.llm.timeouts.agent_call_s)
+        """单次调用的超时（秒）。配置写 `0` 表示**不设业务上限**。
+
+        默认不设业务上限是一次生产故障换来的：上游网关排队时单次调用要 23–31
+        秒，任何固定值迟早会被正常调用超过去，然后每一次 attempt 都超时、
+        整个交易日报废（实盘：一天 21/21 个回合 timeout）。
+
+        但**绝不返回 `None`**：`None` 一路传到 SDK 就是"永远等"，上游不回包时
+        回合永久卡死、心跳跟着停摆。所以放开业务上限后仍套一层 `SAFETY_TIMEOUT_S`
+        兜底——只有上游彻底挂住才会撞上，正常回合几十秒就回来了。
+        """
+        raw = timeout_s if timeout_s is not None else float(
+            self.cfg.llm.timeouts.chat_s if not tools else self.cfg.llm.timeouts.agent_call_s)
+        return SAFETY_TIMEOUT_S if raw <= 0 else float(raw)
 
     async def chat(self, messages: list[dict], tools: list[dict] | None = None,
                    max_tokens: int | None = None, timeout_s: float | None = None,
@@ -264,7 +311,8 @@ class LlmClient:
                 except Exception:               # noqa: BLE001 —— 审计失败不影响调用
                     pass
 
-            verdict = classify(attempt)
+            verdict = classify(attempt, fatal_status=self.cfg.retry.never_retry,
+                               retry_on=self.cfg.retry.retry_on)
             if verdict == "ok":
                 return LlmResult(message=attempt.message, usage=total, attempts=attempts,
                                  latency_ms=int((time.monotonic() - started) * 1000),
@@ -296,7 +344,10 @@ class LlmClient:
         }
         if tools:
             body["tools"] = tools
-        resp = await self.client.chat.completions.create(**body, timeout=float(timeout_s))
+        # **`None` 才是"不设超时"**：传 `timeout=None` 时 SDK 会保留
+        # `client.timeout`（我们建 client 时也给了 None），于是整条链路无上限。
+        resp = await self.client.chat.completions.create(
+            **body, timeout=float(timeout_s))
         choices = getattr(resp, "choices", None) or []
         if not choices:
             return _Attempt(error="空 choices", status=200, empty_body=True,

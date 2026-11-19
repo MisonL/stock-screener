@@ -24,20 +24,25 @@ from core.clock import SH, SystemClock, TradingCalendar
 
 SLEEP_OUT_OF_SESSION_S = 60
 LOOP_EVERY_S = 2
-# **回合级 deadline，不是单次调用超时**（后者见 `config/llm.yaml` 的
-# `timeouts.agent_call_s`）。一条铁律：**deadline ≥ 单次调用超时 × 2**。
-# 一个回合至少要两次 LLM 调用（先决定查什么、拿到工具结果后再出决策），
-# deadline 只够一次调用时，每轮都死在"还没等回来就到点"上。
-# 原来的 25/60 是按单次 20 秒配的（25 < 20×2，本来就不够），
-# 中转站排队超过 20 秒后整个交易日 100% 回合超时。
-# 实测（上游排队时段）：**每轮 30 秒**——不是 20 秒，也不是 23 秒，
-# 而是随网关负载浮动的 23–31 秒。按 30 秒/轮算：
-#   · 事件回合典型 3 轮 → 90s，**给到 90s 等于零余量**，实测照样超时
-#     （11:06 / 11:10 两轮都卡在 90.00s）。给 120s。
-#   · 心跳/闹钟回合典型 2 轮 → 60s，给 120s（可容纳 4 轮）。
-#     上限压在这里是因为密集期心跳间隔就是 120 秒，再长会让心跳互相堆积。
-EVENT_ROUNDS_BUDGET, EVENT_DEADLINE_S = 3, 120
-OTHER_ROUNDS_BUDGET, OTHER_DEADLINE_S = 6, 120
+# **回合预算：轮数是主界，deadline 是可选的业务上限（`0` = 不设）。**
+#
+# 默认不设业务上限是一次生产故障换来的：上游网关排队时段**每轮要 23–31 秒**，
+# 任何固定的 deadline 迟早会被正常回合超过去，然后整天的回合全部报废
+# （实盘：一天 21/21 个回合 timeout）。
+#
+# 但 `0` **不等于完全没有上限**：`agent/loop.py` 会给一个兜底的
+# `SAFETY_DEADLINE_S`（10 分钟），只有"上游彻底不回包"才会撞上。
+# 那个值刻意小于 watchdog 的判死阈值（15 分钟），让回合自己收尾记 `timeout`，
+# 而不是被外部判定成"进程卡死"。
+#
+# 要收紧时长时把这里改成正数；一条铁律不变：**若设了单次调用上限，
+# deadline 必须 ≥ 该上限 × 2**——一个回合至少要两次 LLM 调用
+# （先决定查什么、拿到工具结果后再出决策）。
+# 下面两组是**兜底默认值**（配置文件缺键时用）。真正生效的值从
+# `config/agent.yaml` 的 `event` / `heartbeat_turn` 读（见 `_turn_budget`）——
+# 否则"改成可配置参数"就是空话：改 YAML 不会改变运行时行为。
+EVENT_ROUNDS_BUDGET, EVENT_DEADLINE_S = 3, 0
+OTHER_ROUNDS_BUDGET, OTHER_DEADLINE_S = 6, 0
 ESCALATED_RECYCLE_MIN = 30
 CONFIRM_EXPIRE_H = 24
 OPEN_TURN_AT = (9, 26)
@@ -125,6 +130,39 @@ def _default_market(conn, cfg) -> str:
     return enabled[0] if enabled else "cn_main"
 
 
+def _turn_budget(cfg, section: str, rounds_default: int, deadline_default: float
+                 ) -> tuple[int, float]:
+    """从 `config/agent.yaml` 读一组回合预算：`(rounds, deadline_s)`。
+
+    **必须真读配置**：这两段以前是死配置（`core/config.py` 只做校验），
+    写死在 `agent/main.py` 的常量里——运维改 YAML 完全不会有任何效果，
+    而故障排查时第一反应恰恰是去查 YAML。
+
+    缺键/非法值一律回落到兜底默认，不让一个笔误把 agent 挡在启动之外。
+    """
+    try:
+        block = getattr(getattr(cfg, "agent", None), section)
+    except (AttributeError, TypeError):
+        return rounds_default, deadline_default
+    rounds = getattr(block, "rounds", None)
+    deadline = getattr(block, "deadline_s", None)
+    try:
+        rounds = int(rounds) if rounds is not None else rounds_default
+    except (TypeError, ValueError):
+        rounds = rounds_default
+    try:
+        deadline = float(deadline) if deadline is not None else deadline_default
+    except (TypeError, ValueError):
+        deadline = deadline_default
+    # 轮数必须为正：0 轮等于"永不开口"，让它回落到默认
+    if rounds <= 0:
+        rounds = rounds_default
+    # deadline < 0 无意义（0 合法 = 不设业务上限），负数当笔误
+    if deadline < 0:
+        deadline = deadline_default
+    return rounds, deadline
+
+
 class AgentMain:
     def __init__(self, deps, clock=None):
         self.deps = deps
@@ -141,6 +179,11 @@ class AgentMain:
         digest = (row[0] or "") if row is not None else ""
         self._shadow_beat_at = (digest.split("due_at=", 1)[1].strip()
                                 if "due_at=" in digest else None)
+        # 回合预算从配置读一次（运行中改 YAML 不生效，与 shadow_mode 同一口径）
+        self.event_rounds, self.event_deadline = _turn_budget(
+            deps.cfg, "event", EVENT_ROUNDS_BUDGET, EVENT_DEADLINE_S)
+        self.other_rounds, self.other_deadline = _turn_budget(
+            deps.cfg, "heartbeat_turn", OTHER_ROUNDS_BUDGET, OTHER_DEADLINE_S)
         self.next_heartbeat_at = None
         self.budget_exhausted = False
         self._last_day = self.clock.today()
@@ -327,8 +370,8 @@ class AgentMain:
                     market=getattr(group, "market", None))
                 continue
             await self._run(self._trigger("event", group=group, events=events,
-                                          rounds=EVENT_ROUNDS_BUDGET,
-                                          deadline=EVENT_DEADLINE_S))
+                                          rounds=self.event_rounds,
+                                          deadline=self.event_deadline))
 
         if now >= self.next_heartbeat_at:
             due_at = self.next_heartbeat_at
@@ -347,8 +390,8 @@ class AgentMain:
                 for ev in retry:
                     ev.agent_status = "pending_retry"
                 await self._run(self._trigger("heartbeat", events=retry,
-                                              rounds=OTHER_ROUNDS_BUDGET,
-                                              deadline=OTHER_DEADLINE_S))
+                                              rounds=self.other_rounds,
+                                              deadline=self.other_deadline))
             nxt = next_heartbeat(self.clock.now())
             if (self.shadow_mode and nxt.isoformat() != self._shadow_beat_at
                     and nxt <= self.clock.now()):
@@ -371,8 +414,8 @@ class AgentMain:
                     market=alarm.get("market"))
                 set_fired_turn(self.deps.conn, alarm["id"], turn_id)
                 continue
-            await self._run(self._trigger("alarm", rounds=OTHER_ROUNDS_BUDGET,
-                                          deadline=OTHER_DEADLINE_S,
+            await self._run(self._trigger("alarm", rounds=self.other_rounds,
+                                          deadline=self.other_deadline,
                                           alarm_id=alarm["id"],
                                           target=alarm.get("target"),
                                           note=alarm.get("note") or ""))
@@ -382,8 +425,8 @@ class AgentMain:
             if self.shadow_mode:
                 self._shadow_turn("open", f"trade_date={now.date().isoformat()}")
             else:
-                await self._run(self._trigger("open", rounds=OTHER_ROUNDS_BUDGET,
-                                              deadline=OTHER_DEADLINE_S))
+                await self._run(self._trigger("open", rounds=self.other_rounds,
+                                              deadline=self.other_deadline))
 
     async def run(self):
         while True:

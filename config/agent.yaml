@@ -12,17 +12,21 @@ heartbeat:
     - ["11:00", "11:30"]
     - ["13:00", "13:30"]
 
-# ⚠️ 这两段**目前是死配置**（`core/config.py` 只做校验与默认值，全仓无读取点）。
-# 真正的回合预算写死在 `agent/main.py` 的 `EVENT_ROUNDS_BUDGET/EVENT_DEADLINE_S`
-# 与 `OTHER_ROUNDS_BUDGET/OTHER_DEADLINE_S`，改这里不会有任何效果。
-# 保留键名只是因为它们是必填键（删掉会让既有配置文件加载失败）。
+# **回合预算：这两段真的生效**（`agent/main.py::_turn_budget` 在启动时读取）。
+# 改这里会改变运行时行为，改完重启 agent 生效。
+#
+# `rounds`：一个回合最多跑几轮 LLM 调用。**必须为正**，它是保证回合会结束的主界。
+# `deadline_s`：回合时长上限（秒）。`0` = 不设业务上限，只保留代码里的兜底
+#               `SAFETY_DEADLINE_S`（10 分钟，防上游彻底不回包时永久挂住）。
+#               设正数时，铁律是 **deadline ≥ 单次调用上限 × 2**：一个回合至少
+#               两次 LLM 调用（先决定查什么、拿到工具结果后再出决策）。
 event:
-  rounds: 3            # 未生效
-  deadline_s: 25       # 未生效
+  rounds: 3
+  deadline_s: 0
 
 heartbeat_turn:
-  rounds: 6            # 未生效
-  deadline_s: 60       # 未生效
+  rounds: 6
+  deadline_s: 0
 
 context:
   max_chars: 6000

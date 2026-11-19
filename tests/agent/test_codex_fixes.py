@@ -581,3 +581,116 @@ def test_turn_deadline_allows_at_least_two_llm_calls():
         f"心跳回合 deadline {m.OTHER_DEADLINE_S}s < 单次调用 {call_s}s × 2")
     assert m.OTHER_DEADLINE_S >= m.EVENT_DEADLINE_S, (
         "心跳/闹钟回合的 deadline 不该比事件回合更紧")
+
+
+def test_no_deadline_still_terminates_by_rounds():
+    """**不设 deadline 也不能无限跑**：轮数是真正的界。
+
+    deadline 默认 0（不设上限）来自一次生产故障——上游网关排队时每轮要
+    23–31 秒，任何固定 deadline 迟早被正常回合超过去，然后整天回合报废。
+    安全性靠 `rounds_budget`：每一轮都会消耗掉一格，跑完必然退出。
+
+    这里断言「三层约束」的取值语义，而不是某个具体秒数。
+    """
+    from agent.loop import _call_timeout
+    import time
+
+    from agent.loop import SAFETY_DEADLINE_S
+
+    started = time.monotonic() - 1000          # 假装回合已经跑了 1000 秒
+    # 都不设业务上限 → 落回兜底硬上限（**不是 None**：None 会永久挂住）
+    assert _call_timeout(0, 0, started) == SAFETY_DEADLINE_S
+    assert _call_timeout(0, None, started) == SAFETY_DEADLINE_S
+    assert _call_timeout(None, None, started) == SAFETY_DEADLINE_S
+    assert SAFETY_DEADLINE_S >= 600, "兜底上限太小，会误杀慢但正常的回合"
+    # 只设单次上限
+    assert _call_timeout(40, 0, started) == 40
+    # 只设回合 deadline：用剩余时间，且不会算成负数
+    assert 990 <= _call_timeout(0, 2000, started) <= 1000, "应当用剩余时间"
+    assert _call_timeout(0, 500, started) == 1.0, "到点后至少给 1 秒，不能是 0/负数"
+    # 两者都设，取小的
+    assert _call_timeout(40, 2000, started) == 40
+    assert _call_timeout(300, 2000, started) == 300
+
+
+def test_safety_deadline_is_shorter_than_watchdog_stale():
+    """兜底 deadline 必须**明显小于** watchdog 的判死阈值。
+
+    两者都设 30 分钟时有个隐蔽问题：watchdog 的 `agent_stalled` 会先触发
+    （15 分钟无新回合 → P1 告警），而回合自己还没收尾——用户收到"调度卡死"，
+    实际只是上游慢。让回合先在 10 分钟时自己结束并记一行 `timeout`，
+    证据更准确，也不会误报"进程卡死"。
+
+    另一头也不能太小：那等于变相恢复固定超时，又回到"慢但正常被判死"的坑。
+    实测上游最慢 31 秒，兜底必须是它的若干倍。
+    """
+    from agent.loop import SAFETY_DEADLINE_S
+    from api.watchdog import AGENT_TURN_STALE_S
+    from llm.client import SAFETY_TIMEOUT_S
+    from chat.session import SAFETY_TIMEOUT_S as CHAT_SAFETY
+
+    assert SAFETY_DEADLINE_S < AGENT_TURN_STALE_S, (
+        f"兜底 deadline {SAFETY_DEADLINE_S}s 不小于 watchdog 判死阈值 "
+        f"{AGENT_TURN_STALE_S}s：watchdog 会先报「卡死」")
+    assert SAFETY_TIMEOUT_S == CHAT_SAFETY, "盯盘与对话的单次兜底应当一致"
+    # 兜底要显著大于实测最慢（31 秒），否则会误杀正常调用
+    assert SAFETY_TIMEOUT_S >= 31 * 5, "单次兜底太小，会误杀慢但正常的调用"
+    # 但不该大到失去意义（最坏 = 单次兜底 × 轮数，不能超过太久）
+    assert SAFETY_TIMEOUT_S <= 900, "单次兜底过大，卡住时恢复太慢"
+
+
+def test_turn_budget_comes_from_config(tmp_path):
+    """**回合预算必须真的从 YAML 读**——不能是死配置。
+
+    这两段以前是死配置：真正的值写死在 `agent/main.py` 的常量里，运维改
+    `config/agent.yaml` 完全不会有任何效果。而故障排查时第一反应恰恰是查 YAML，
+    于是拿到的是假信息。用户明确要求"改成可配置参数"，这里把线接上。
+
+    断言的是**端到端**：改配置 → 构造 AgentMain → 实例上的预算变了。
+    """
+    from agent.main import AgentMain
+    from core.config import load_config
+    from core.clock import FixedClock
+    from core.db import connect, migrate
+    from pathlib import Path
+    from tests.helpers import SH
+    from datetime import datetime
+    import shutil
+
+    src = Path("config")
+    dst = tmp_path / "cfg"
+    shutil.copytree(src, dst)
+    yaml_path = dst / "agent.yaml"
+    text = yaml_path.read_text(encoding="utf-8")
+    # 改成一组**不同于兜底默认**的值，确保读到的确实来自配置
+    text = text.replace("""event:
+  rounds: 3
+  deadline_s: 0""", """event:
+  rounds: 2
+  deadline_s: 77""")
+    text = text.replace("""heartbeat_turn:
+  rounds: 6
+  deadline_s: 0""", """heartbeat_turn:
+  rounds: 5
+  deadline_s: 88""")
+    yaml_path.write_text(text, encoding="utf-8")
+
+    cfg = load_config(dst)
+    conn = connect(tmp_path / "b.db")
+    migrate(conn)
+    clock = FixedClock(datetime(2026, 10, 30, 10, 30, tzinfo=SH))
+
+    class _Deps:
+        def __init__(self):
+            self.conn = conn
+            self.cfg = cfg
+            self.clock = clock
+            self.pusher = None
+            self.llm = None
+            self.budget = None
+
+    m = AgentMain(_Deps(), clock)
+    assert (m.event_rounds, m.event_deadline) == (2, 77.0), (
+        f"事件回合预算没从配置读：拿到的是 {(m.event_rounds, m.event_deadline)}")
+    assert (m.other_rounds, m.other_deadline) == (5, 88.0), (
+        f"心跳回合预算没从配置读：拿到的是 {(m.other_rounds, m.other_deadline)}")

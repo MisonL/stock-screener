@@ -156,6 +156,39 @@ def _bump_rounds(state: dict) -> None:
     state["rewrites"] = int(state.get("rewrites") or 0) + 1
 
 
+#: 兜底硬上限（秒）。只在"上游彻底不回包"时才会撞上，不是正常的时长约束。
+#: 取 10 分钟，**刻意小于 `api/watchdog.py` 的 `AGENT_TURN_STALE_S`（15 分钟）**：
+#: 让回合自己收尾并记一行 `timeout`，比"被外部判定为卡死"留下更好的证据。
+#: 正常回合几十秒到几分钟，撞不到这里。
+SAFETY_DEADLINE_S = 600.0
+
+
+def _call_timeout(cap: float, deadline_s: float | None, started: float) -> float | None:
+    """本轮单次调用的超时。**返回 `None` 表示不设上限**。
+
+    三层约束，取最小的那层：
+      · `cap` —— 配置的单次调用上限（`<= 0` 表示不限，这是默认值）
+      · `deadline_s` —— 回合的总时长上限（`<= 0` 表示不限，默认）
+    都放开时返回 `None`，让 SDK 一直等到上游返回。
+
+    **绝不能把 0 或负数传下去**：那会被 SDK 当成"立刻超时"，
+    于是每个 attempt 都瞬间失败——正是这个坑导致过整个交易日报废。
+    """
+    cap = float(cap or 0)
+    deadline_s = float(deadline_s or 0)
+    limits: list[float] = []
+    if cap > 0:
+        limits.append(cap)
+    if deadline_s > 0:
+        # 不能是负数或 0：到点了但还没发出的调用至少要有 1 秒
+        limits.append(max(deadline_s - (time.monotonic() - started), 1.0))
+    if not limits:
+        # **绝不返回 None**：`None` 会一路传到 SDK 变成"永远等"。
+        # 上游不回包时那就是永久卡死。兜底给一个足够大的值。
+        return SAFETY_DEADLINE_S
+    return min(limits)
+
+
 def _est_in(msgs: list[dict], tools: list[dict] | None = None) -> int:
     """输入 token 粗估：**消息正文 + 工具 schema + 历史 tool_calls 参数**。
 
@@ -261,8 +294,8 @@ async def run_turn(trigger: Trigger, deps: Deps, rendered: Rendered,
     usage = None
 
     while rounds < trigger.rounds_budget:
-        remaining = trigger.deadline_s - (time.monotonic() - started)
-        timeout_s = min(max(remaining, 1.0), float(deps.cfg.llm.timeouts.agent_call_s))
+        timeout_s = _call_timeout(deps.cfg.llm.timeouts.agent_call_s,
+                                  trigger.deadline_s, started)
         # **每一轮都查**：只在回合开头查的话，首轮把额度用光后，后续工具轮与
         # grounding 重写仍然继续调用中转站——日预算是硬上限，不是软提示
         if not deps.budget.allow(est_in=_est_in(msgs, tools), est_out=MAX_TOKENS):
@@ -365,9 +398,19 @@ async def run_with_deadline(trigger: Trigger, deps: Deps) -> TurnResult:
                           grounded=GroundedText(text="", ungrounded=False, failed=False))
     state: dict = {"rounds": 0, "usage": None}
     started = time.monotonic()
+    # **`deadline_s <= 0` 表示不设"正常"时长上限**，但仍然套一层**兜底硬上限**
+    # `SAFETY_DEADLINE_S`。
+    #
+    # 为什么兜底不能去掉：轮数上限只保证"跑够轮数就退出"，管不到**卡在某一次
+    # 调用里**——上游如果不回包（不是慢，是真挂），`await` 永不返回，回合永远
+    # 结束不了，心跳也跟着停摆。`api/watchdog.py` 的 `agent_stalled` 会告警，
+    # 但它只报警、不杀回合。所以这里留一个"只有真挂了才会撞上"的值：
+    # 正常回合最多几十秒到几分钟，30 分钟是个纯安全网，不会误杀正常回合。
+    limit = float(trigger.deadline_s or 0)
+    if limit <= 0:
+        limit = SAFETY_DEADLINE_S
     try:
-        return await asyncio.wait_for(run_turn(trigger, deps, rendered, state),
-                                      trigger.deadline_s)
+        return await asyncio.wait_for(run_turn(trigger, deps, rendered, state), limit)
     except asyncio.TimeoutError:
         return TurnResult(decision=TurnDecision.timeout(), rounds=int(state.get("rounds") or 0),
                           rendered=rendered, usage=state.get("usage"),

@@ -334,3 +334,32 @@ def test_turn_and_event_update_atomic(conn):
         record(bad, event_trigger(), _result(), FixedClock(T0))
     # 事务回滚：agent_turn 里一行都不该留下
     assert bad.execute("SELECT count(*) FROM agent_turn").fetchone()[0] == 0
+
+
+async def test_zero_deadline_does_not_kill_the_turn_immediately(conn):
+    """**`deadline_s=0` 表示"不设业务上限"，不是"立刻超时"**。
+
+    这条测试是为了堵一个假绿缺口：只断言 `_call_timeout()` / `SAFETY_*` 常量
+    是没用的——把 `run_with_deadline` 里的 `limit` 换回 `trigger.deadline_s`
+    （也就是 0 秒），那些断言照样通过，但真实行为变成"每个回合瞬间超时"。
+
+    这里走**真实路径**：让模型慢 0.3 秒返回，deadline 给 0。旧实现
+    （`wait_for(..., 0)`）会立刻抛 TimeoutError；新实现会等它跑完。
+    """
+    r = await run(conn, script=[Step(content="", delay=0.3,
+                                     tool_calls=[ToolCall("emit_decision",
+                                                          {"speak": True, "body": "慢但正常"})])],
+                  deadline=0)
+    assert r.decision.kind == "speak", (
+        f"deadline=0 时回合被立刻掐断了（decision={r.decision.kind}）："
+        "0 应当表示不设业务上限")
+    assert r.rounds == 1
+
+
+async def test_huge_deadline_still_allows_slow_turn(conn):
+    """对照组：正常的大 deadline 同样允许慢回合跑完（证明上面的测试不是恒真）。"""
+    r = await run(conn, script=[Step(content="", delay=0.3,
+                                     tool_calls=[ToolCall("emit_decision",
+                                                          {"speak": True, "body": "慢"})])],
+                  deadline=60)
+    assert r.decision.kind == "speak"

@@ -30,6 +30,24 @@ WRITE_TOOLS = ("mcp_add_watch", "mcp_remove_watch", "mcp_set_alert", "mcp_cancel
 NEEDS_CONFIRM_TEXT = "已发出确认卡，请在手机上确认"
 
 
+#: 兜底硬上限（秒）。配置写 0（不设业务上限）时用它——上游彻底不回包时才会撞上。
+#: 300 秒 ≈ 实测最慢（31 秒）的 10 倍，正常调用撞不到。
+SAFETY_TIMEOUT_S = 300.0
+
+
+def _call_timeout(remaining: float, configured: float) -> float:
+    """单次调用超时（秒）。
+
+    配置 >0 时取「本轮剩余」与配置的较小值；配置 <=0 表示不设业务上限，
+    此时只用本轮剩余时间，但**仍不超过 `SAFETY_TIMEOUT_S`**。
+    绝不能返回 0/负数/None：0 会被 SDK 当成立刻超时，None 则是"永远等"。
+    """
+    remaining = max(float(remaining), 1.0)
+    configured = float(configured)
+    limit = remaining if configured <= 0 else min(remaining, configured)
+    return min(limit, SAFETY_TIMEOUT_S)
+
+
 def _expected_errors() -> tuple[type[BaseException], ...]:
     """只有这些算「外部依赖坏了」，可以降级成结构化快捷指令。
 
@@ -173,7 +191,9 @@ class ChatSession:
                     return self._fallback(session_id, text, "对话额度已用完")
                 result = await self.llm.chat(
                     messages, tools, max_tokens=MAX_TOKENS,
-                    timeout_s=min(remaining, float(self.cfg.llm.timeouts.chat_s)),
+                    # 配置为 0 表示不限单次调用时长：此时只用本轮的剩余时间，
+                    # 不能把 0 传下去（SDK 会当成"立刻超时"）。
+                    timeout_s=_call_timeout(remaining, self.cfg.llm.timeouts.chat_s),
                     deduct=_deduct_of(self.budget),
                     est_in=_est_in(messages, chat_tools),
                     on_attempt=_audit_of(self.budget))

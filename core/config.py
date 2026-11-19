@@ -270,8 +270,8 @@ REQUIRED_KEYS: list[tuple[str, ...]] = (
 
 _EMPTY_AGENT = {
     "heartbeat": {"base_min": 5, "tight_min": 2, "max_min": 10, "tight": [], "relaxed": []},
-    "event": {"rounds": 3, "deadline_s": 25},
-    "heartbeat_turn": {"rounds": 6, "deadline_s": 60},
+    "event": {"rounds": 3, "deadline_s": 0},
+    "heartbeat_turn": {"rounds": 6, "deadline_s": 0},
     "context": {"max_chars": 6000, "sector_events": 8, "own_history": 10, "own_history_trim": 5},
     "channel_b_daily_cap": 15,
     "fatigue": {"free": 10, "step": 5, "raise": 0.5},
@@ -284,12 +284,13 @@ _EMPTY_AGENT = {
 _EMPTY_LLM = {
     "llm": {
         "base_url": "", "api_key_env": "DEEPSEEK_API_KEY", "model": "", "thinking": "disabled",
-        "timeouts": {"agent_call_s": 20, "chat_s": 60},
+        # 0 = 不设超时（默认）。见 config/llm.yaml 的说明与 RUNBOOK。
+        "timeouts": {"agent_call_s": 0, "chat_s": 0},
         "max_tokens": {"plain": 800, "tools": 2000},
         "budget": {"agent": (300000, 40000), "chat": (200000, 20000)},
         "pricing": {"in_cny_per_mtok": 2.0, "out_cny_per_mtok": 8.0, "is_estimate": True},
     },
-    "retry": {"max_attempts": 3, "backoff": (0.5, 1.0),
+    "retry": {"max_attempts": 3, "backoff": (1.0, 3.0, 8.0),
               "retry_on": (), "never_retry": ()},
 }
 

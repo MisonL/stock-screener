@@ -159,6 +159,9 @@ def _bump_rounds(state: dict) -> None:
 #: 预算耗尽的统一措辞。`agent/main.py` 用它判断"今天不可能再跑了"，
 #: 从而跳过闹钟——避免"每 2 秒重跑一次必败回合"的死循环（生产实测一天 17885 行）。
 BUDGET_EXHAUSTED_WHY = "agent 日预算已用完"
+#: "轮数用尽"的 why 文案。**必须与 `agent/main.py` 的判定同源**：
+#: 它是"模型自己在 N 轮内没有收敛"，重试必然再次用尽，不该退回闹钟重跑。
+ROUNDS_EXHAUSTED_WHY = "轮数用尽"
 
 #: 兜底硬上限（秒）。只在"上游彻底不回包"时才会撞上，不是正常的时长约束。
 #: 取 10 分钟，**刻意小于 `api/watchdog.py` 的 `AGENT_TURN_STALE_S`（15 分钟）**：
@@ -385,7 +388,7 @@ async def run_turn(trigger: Trigger, deps: Deps, rendered: Rendered,
         for _ in calls[MAX_TOOL_CALLS_PER_ROUND:]:
             tool_calls.append({"name": _name(_), "args": _json_args(_), "capped": True})
 
-    return _result(TurnDecision.timeout("轮数用尽"), rounds, tool_calls, rendered, state,
+    return _result(TurnDecision.timeout(ROUNDS_EXHAUSTED_WHY), rounds, tool_calls, rendered, state,
                    started, deps)
 
 

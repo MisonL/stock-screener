@@ -417,11 +417,22 @@ def test_all_production_alert_kinds_have_chinese_titles():
     from pathlib import Path as _P
     from notify.templates import _ALERT_TITLE
 
+    # **三种写法都要扫**，只扫 `.alert("..."` 会对 7 个生产 kind 完全盲（评审 M-e）：
+    #   · `dispatcher.alert("disk", ...)`            —— 直接调用（9 个）
+    #   · `_alert(conn, clock, disp, "agent_down",...)` —— watchdog 内部（5 个）
+    #   · `self.on_alert("upstream_dead", ...)`       —— jobs 回调（2 个）
+    # 实测只扫第一种时，删掉 `agent_down` / `upstream_dead` 的标题测试照样绿。
     kinds: set[str] = set()
+    patterns = (
+        r'\.alert\(\s*"([a-z_]+)"',
+        r'_alert\([^)]*?"([a-z_]+)"',
+        r'on_alert\(\s*"([a-z_]+)"',
+    )
     for pkg in ("api", "jobs", "agent", "notify"):
         for f in _P(pkg).rglob("*.py"):
             src = f.read_text(encoding="utf-8")
-            kinds |= set(re.findall(r'\.alert\(\s*"([a-z_]+)"', src))
-    assert kinds, "没有扫到任何告警调用点，正则失效了"
+            for pat in patterns:
+                kinds |= set(re.findall(pat, src))
+    assert len(kinds) >= 10, f"只扫到 {sorted(kinds)}，正则可能失效"
     missing = sorted(k for k in kinds if k not in _ALERT_TITLE)
     assert not missing, f"这些告警 kind 在手机上会显示裸标识符：{missing}"

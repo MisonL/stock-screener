@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from contextlib import closing
@@ -17,8 +18,8 @@ from datetime import datetime, timedelta
 from agent.attention import AttentionLayer
 from agent.heartbeat import Heartbeat
 from agent.journal import record as journal_record
-from agent.loop import (BUDGET_EXHAUSTED_WHY, Deps, Trigger, render_trigger,
-                        run_with_deadline)
+from agent.loop import (BUDGET_EXHAUSTED_WHY, ROUNDS_EXHAUSTED_WHY, Deps, Trigger,
+                        render_trigger, run_with_deadline)
 from agent.schedule import (after_alarm, due_alarms, next_heartbeat, release_alarm, schedule_alarm,
                             set_fired_turn)
 from core.clock import SH, SystemClock, TradingCalendar
@@ -49,6 +50,9 @@ CONFIRM_EXPIRE_H = 24
 #: 作废扫描的最小间隔（秒）。每轮 `_once()`（2 秒）都扫一次没必要，
 #: 但也不能像原来那样"一天只扫一次"——那样同日积压扫不到。
 ALARM_SWEEP_EVERY_S = 60
+#: 单轮 `_once()` 最多跑几个闹钟回合。宕机后积压十几条同时到期时，
+#: 一口气串行跑完会连着烧掉上百轮 LLM；每轮限 2 条，积压照样被消化。
+ALARM_MAX_PER_ONCE = 2
 OPEN_TURN_AT = (9, 26)
 #: 开盘回合每天最多试几次（防"日志写不出来 → 每 2 秒重跑一次"）
 OPEN_TURN_MAX_ATTEMPTS = 3
@@ -247,7 +251,20 @@ class AgentMain:
             # 回来看"静默作废，与最初那个"失败即永久丢失"是同一个毛病
             # （`release_alarm` 的 docstring 里本来就写了"LLM 挂掉/预算耗尽/超时"，
             # 实现只覆盖了前两种）。现在它有 60 秒退避与 3 次上限，退回不会成环。
-            if result.decision.kind in ("error", "invalid", "timeout"):
+            # **"轮数用尽"不退回**（v0.2.93 修的 M-c）。它和"回合超时"是两种
+            # 完全不同的失败：超时是外部慢，重试有意义；轮数用尽是**模型自己
+            # 在 6 轮内没有收敛**，隔 60 秒再跑一遍必然同样用尽——评审实测
+            # 3 次重试 ≈ 18 轮 LLM 调用全烧在同一条没有收敛的闹钟上，
+            # 最后一次转 cancelled 且**无任何通知**，用户以为"30 分钟后回来看"
+            # 实际静默丢了。
+            # 直接 cancelled，把这次回访明确记为放弃。
+            rounds_exhausted = getattr(result, "why", "") == ROUNDS_EXHAUSTED_WHY
+            if rounds_exhausted:
+                self.deps.conn.execute(
+                    "UPDATE agent_schedule SET status = 'cancelled', fired_turn = NULL"
+                    " WHERE id = ? AND status = 'fired'", (trigger.alarm_id,))
+                self.deps.conn.commit()
+            elif result.decision.kind in ("error", "invalid", "timeout"):
                 exhausted = getattr(result, "why", "") == BUDGET_EXHAUSTED_WHY
                 if exhausted:
                     self.deps.conn.execute(
@@ -440,19 +457,29 @@ class AgentMain:
 
         if now >= self.next_heartbeat_at:
             due_at = self.next_heartbeat_at
-            # 家务与「下一跳」与影子无关：不做的话影子期 escalated 永不回收、
-            # 心跳停摆，两周观测拿到的就是一堆过期事件。
-            self.heartbeat_housekeeping()
-            # **下一跳必须在跑回合之前推进**（v0.2.90 修的 S2）。
+            # **下一跳最先推进，必须在任何可能抛异常的事之前**（v0.2.90/0.2.93）。
+            #
             # `_run` 的顺序是「跑回合 → 记日志 → 推送/确认卡/排闹钟」，任何一步
-            # 抛异常都会被 `run()` 吞掉（它只是发个 alert 继续循环）。原来
+            # 抛异常都会被 `run()` 吞掉（只发个 alert 继续循环）。原来
             # `self.next_heartbeat_at = nxt` 写在 `await self._run(...)` **之后**，
             # 于是只要日志写成功之后炸一次，下一跳就永远不推进——
             # `now >= next_heartbeat_at` 恒成立，**每 2 秒跑一次心跳回合**。
             # 这与 11-19 那 17998 行是完全相同的形状，只是触发器不同。
-            # 推进放在前面，最坏情况是"这一次心跳的推送丢了"，那是可接受的。
+            #
+            # v0.2.93 又把 `heartbeat_housekeeping()` 挪到它后面：那个方法要写两张表
+            # 并 commit，正是"磁盘满/写锁超时"会炸的地方；它一炸，`_once()` 整体抛出，
+            # 心跳/闹钟/开盘回合**全部停摆**（虽然不写垃圾行，但比写了更糟）。
+            # 家务是"尽力而为"的维护，不该有能力让调度停摆。
             nxt = next_heartbeat(now)
             self.next_heartbeat_at = nxt
+            # 家务与「下一跳」与影子无关：不做的话影子期 escalated 永不回收、
+            # 心跳停摆，两周观测拿到的就是一堆过期事件。
+            # **它自己炸了也不能影响调度**：只记日志。
+            try:
+                self.heartbeat_housekeeping()
+            except Exception:                              # noqa: BLE001
+                logging.getLogger("agent").warning(
+                    "heartbeat_housekeeping 失败（已忽略）", exc_info=True)
             if self.shadow_mode:
                 # 影子期不排队 LLM 回合（pending_retry 的事件已被 poll() 拦在 shadow 行里）
                 source = f"due_at={due_at.isoformat()}"
@@ -467,6 +494,16 @@ class AgentMain:
                 await self._run(self._trigger("heartbeat", events=retry,
                                               rounds=self.other_rounds,
                                               deadline=self.other_deadline))
+            # **回合跑完再按墙钟补正一次**（v0.2.93 修的 M-b）。
+            # 上面那个 `nxt` 是用 `_once()` 开头的 `now` 算的，而回合可能跑几分钟
+            # （上游慢时单轮 23–31 秒、6 轮回合 3 分钟是常态）。回合结束时 `nxt`
+            # 往往已经过期，于是下一轮 `_once()` 立刻又是一次心跳——同一段墙钟里
+            # 心跳回合数比原来多 37%~62%，全是白花的 token，还吃掉
+            # `AGENT_TURN_CHURN_PER_HOUR` 的余量。
+            # `next_heartbeat` 是纯函数、不抛异常，补这一次不会重新引入 S2。
+            self.next_heartbeat_at = max(self.next_heartbeat_at,
+                                         next_heartbeat(self.clock.now()))
+            nxt = self.next_heartbeat_at
             if (self.shadow_mode and nxt.isoformat() != self._shadow_beat_at
                     and nxt <= self.clock.now()):
                 # **不能排出一个已经到期的下一跳**：盘后（>15:05）next_heartbeat 给的是
@@ -489,7 +526,15 @@ class AgentMain:
                 or (now - self._alarm_swept_at).total_seconds() >= ALARM_SWEEP_EVERY_S):
             self.sweep_stale_alarms(now)
             self._alarm_swept_at = now
-        for alarm in ([] if self.budget_exhausted else due_alarms(self.deps.conn, now)):
+        # **单轮最多跑 `ALARM_MAX_PER_ONCE` 个闹钟回合**（v0.2.93 修的 M-d）。
+        # 按日期作废把"同日迟到"的闹钟都保住了（对：语境有效），但也失去了原来
+        # "同日过期 1 小时"顺手提供的泄压：宕机到 13:00 恢复时，上午积压的
+        # 十几条会**同一轮全部到期**，`due_alarms()` 的 LIMIT 10 会一口取出 10 条，
+        # 单条闹钟回合上限 6 轮、墙钟上限 600 秒——串行 10 条最坏 100 分钟连续回合。
+        # 这正是 `sweep_stale_alarms` docstring 里列为"要防的事故"那种形状。
+        # 每轮只跑 2 条：积压仍会被消化（每 2 秒一轮），但不会一口气烧光预算。
+        for alarm in ([] if self.budget_exhausted
+                      else due_alarms(self.deps.conn, now)[:ALARM_MAX_PER_ONCE]):
             # **先认领再跑**：不认领的话，60 秒的闹钟回合期间 2 秒后的下一轮会把同一个
             # 闹钟再取出一次，形成重复回合
             if not after_alarm(self.deps.conn, alarm["id"]):

@@ -262,3 +262,45 @@ def test_cleanup_runs_optimize_to_refresh_statistics(conn, tmp_path):
     assert any("optimize" in c.lower() for c in rec.calls), (
         "cleanup 没有跑 PRAGMA optimize：优化器统计会一直是空的，选池查询继续全表扫。"
         f"实际执行的语句里没有它（共 {len(rec.calls)} 条）")
+
+
+def test_cleanup_alarm_day_cutoff_matches_sweep(tmp_path):
+    """**cleanup 与 `sweep_stale_alarms()` 必须用同一个"过期"定义**（评审 L-b）。
+
+    上一版 cleanup 用 `due_at < now - 3d`（满 72 小时），sweep 用"日期更早"。
+    两条口径**不是同一个集合**：`date(due_at) < date(now-3d)` 严格包含于
+    `due_at < now-3d`——前者以零点为界，后者以当前时刻为界。于是
+    「3 天前 05:00 到期、now 是 10:00」这种样本，旧口径删、新口径留，
+    同一批数据在两条路径上得出不同答案，排查时对不上。
+
+    现有 `test_cleanup_cancels_stale_pending_schedule` 用 5 天前的数据，
+    两种口径都过，所以抓不到这个差异。这里构造**恰好卡在两者之间**的样本：
+    到期时间 3 天前的 05:00（按日期算就是第 3 天，按 72 小时算已过期 5 小时）。
+    """
+    now = datetime(2026, 11, 19, 10, 0, tzinfo=SH)
+    conn = connect(tmp_path / "c.db")
+    migrate(conn)
+
+    edge = datetime(2026, 11, 16, 5, 0, tzinfo=SH)
+    # 前提：两种口径在这个样本上结论相反
+    assert (now - edge) > timedelta(days=3), "样本没落在 72 小时之外"
+    assert edge.date().isoformat() == (now - timedelta(days=3)).date().isoformat(), \
+        "样本没卡在同一个自然日上"
+
+    far = datetime(2026, 11, 14, 14, 0, tzinfo=SH)      # 真正的陈货，两条口径都该删
+    recent = datetime(2026, 11, 18, 14, 0, tzinfo=SH)   # 昨天的，都该留
+    for due, note in ((edge, "边界样本"), (far, "四天前的"), (recent, "昨天的")):
+        conn.execute(
+            "INSERT INTO agent_schedule(created_at, due_at, market, target, note, status)"
+            " VALUES (?,?,?,?,?,?)",
+            (due.isoformat(), due.isoformat(), "cn_main", "sh600519", note, "cancelled"))
+    conn.commit()
+
+    cleanup(conn, FixedClock(now), data_dir=str(tmp_path))
+
+    notes = {r[0] for r in conn.execute("SELECT note FROM agent_schedule")}
+    assert "四天前的" not in notes, "真正的陈货没被删"
+    assert "昨天的" in notes, "3 天之内的被误删了"
+    assert "边界样本" in notes, (
+        "边界样本被删了：cleanup 用的仍是 '满 72 小时' 口径，"
+        "与 sweep_stale_alarms 的「按日期」口径不一致")

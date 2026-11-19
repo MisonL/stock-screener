@@ -9,6 +9,12 @@
 """
 from __future__ import annotations
 
+import time
+
+#: 记账故障标志置位期间，每隔这么久放行一次"真扣一次"的探测。
+#: 太短会在锁竞争时反复撞 busy_timeout（5 秒），太长会让自愈延迟。
+WRITE_FAILED_PROBE_S = 30.0
+
 from core.clock import SystemClock as _SystemClock
 
 
@@ -68,7 +74,18 @@ class Budget:
         """
         est_in = max(0, int(est_in or 0))
         est_out = max(0, int(est_out or 0))
-        if self._write_failed():
+        # **故障标志不能"一置永置"**（v0.2.93 修的 S-a）。
+        #
+        # 原来的写法是 `if self._write_failed(): return False` —— 直接短路。
+        # 而自动清除挂在 `_try_deduct()` 里，于是**生产路径永远执行不到清除**：
+        # 一次 SQLite 写锁抖动置上标志，之后每次 `deduct()` 都在 syscall 前返回
+        # False，标志再也无人清除。`job_state` 的键里没有日期，所以这不是
+        # "当天失效"，是**永久**失效——只能手工 DELETE，而 `preflight.py`
+        # 又会因这个键拦住下一次部署。
+        #
+        # 现在改成**定期放行探测**：连续失败时仍 fail-closed（不让调用方
+        # 一次次去撞锁），但每隔 PROBE 秒真试一次，写恢复正常就自愈。
+        if self._write_failed() and not self._probe_allowed():
             return False
         try:
             return self._try_deduct(est_in, est_out)
@@ -84,10 +101,26 @@ class Budget:
             self._mark_write_failed()
             return False
 
+    def _probe_allowed(self) -> bool:
+        """故障标志在置位期间，是否到了可以再试一次的时刻。
+
+        **必须定期真试**：`_try_deduct()` 成功时会清标志，若这里永远返回 False，
+        清除路径就成了死代码（这正是 v0.2.91 犯的错）。
+        """
+        now = time.monotonic()
+        last = getattr(self, "_last_probe_at", None)
+        if last is not None and now - last < WRITE_FAILED_PROBE_S:
+            return False
+        self._last_probe_at = now
+        return True
+
     def _mark_write_failed(self) -> None:
         """置本池故障标志。**写不进去也不能抛**：调用方已经在失败路径上。"""
         import logging
 
+        # **置位同时记下探测起点**：否则"刚失败"和"很久没试过"无法区分，
+        # 下一次 `deduct()` 会立刻放行探测，等于没有 fail-closed。
+        self._last_probe_at = time.monotonic()
         try:
             with self.conn:
                 self.conn.execute(

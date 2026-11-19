@@ -1354,14 +1354,11 @@ async def test_timeout_turn_releases_the_alarm(tmp_path):
                           why="回合超时")
 
     import agent.main as m_mod
-    orig = m_mod.run_with_deadline
-    m_mod.run_with_deadline = _fake_run_with_deadline
-    try:
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(m_mod, "run_with_deadline", _fake_run_with_deadline)
         await main._run(main._trigger("alarm", rounds=3, deadline=0,
                                       alarm_id=alarm["id"], target="sh600519",
                                       note="回访"))
-    finally:
-        m_mod.run_with_deadline = orig
 
     status, attempts = conn.execute(
         "SELECT status, attempts FROM agent_schedule WHERE id = ?",
@@ -1416,3 +1413,259 @@ async def test_next_day_alarm_survives_the_sweep(tmp_path):
     assert rows["明天开盘看"] == "pending", "次日回访被误杀了——这是最常见的合法闹钟"
     assert rows["前天的陈货"] == "cancelled"
     assert cancelled == 1
+
+
+async def test_housekeeping_failure_does_not_stall_the_scheduler(tmp_path, monkeypatch):
+    """**家务失败不能让整个调度停摆**（评审 M-a）。
+
+    `heartbeat_housekeeping()` 要写两张表并 commit，正是"磁盘满/写锁超时"会炸的地方。
+    上一版把下一跳推进放在它**之后**：它一炸，`_once()` 整体抛给 `run()` 吞掉，
+    心跳、闹钟、开盘回合**全部**停摆——不写垃圾行，但比写了更糟（什么都不发生，
+    只有 15 分钟后 `agent_stalled` 会报）。
+    """
+    from agent.context import Rendered
+    from agent.loop import Deps
+    from agent.main import AgentMain
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from llm.budget import Budget
+    from llm.tools import ToolRegistry
+    from tests.helpers import SH
+    from datetime import datetime
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "hk2.db")
+    migrate(conn)
+    now = datetime(2026, 11, 19, 10, 30, tzinfo=SH)
+    clock = FixedClock(now)
+
+    class _SilentLlm:
+        async def chat(self, *a, **k):
+            from types import SimpleNamespace
+
+            return SimpleNamespace(content="", tool_calls=[
+                {"id": "c1", "function": {"name": "emit_decision", "arguments":
+                 '{"speak": false, "body": "", "why_silent": "无事"}'}}],
+                attempts=1, usage=None)
+
+    deps = Deps(conn=conn, cfg=cfg, clock=clock, llm=_SilentLlm(),
+                budget=Budget(conn, "agent", cfg.llm.budget.agent),
+                tools=ToolRegistry(conn, cfg, clock, mcp=None),
+                render=lambda t: Rendered("…", 1, False, {}),
+                pusher=None, memory=None, westock=None)
+    deps.conn_factory = lambda: conn
+    deps.alert = lambda *a, **k: None
+
+    main = AgentMain(deps, clock)
+    main.next_heartbeat_at = now
+
+    def _boom():
+        raise RuntimeError("磁盘满 / 写锁超时")
+
+    monkeypatch.setattr(main, "heartbeat_housekeeping", _boom)
+
+    before = main.next_heartbeat_at
+    await main._once()                   # **不该抛**
+
+    assert main.next_heartbeat_at > before, (
+        "家务炸了，下一跳没推进：整个调度（心跳/闹钟/开盘）都会停摆到它能写库为止")
+
+
+async def test_long_turn_does_not_cause_back_to_back_heartbeats(tmp_path, monkeypatch):
+    """**回合比心跳间隔长时，不能让心跳背靠背**（评审 M-b）。
+
+    下一跳必须"先推进"（S2），但 `nxt` 是用 `_once()` **开头**的 `now` 算的。
+    回合跑几分钟后墙钟已经过去，`nxt` 往往已经过期，于是下一轮 `_once()`
+    立刻又是一次心跳。评审实测同一段墙钟（09:15–11:15）心跳回合数：
+
+        回合 60s → 37 次（旧顺序 27）    回合 130s → 34 次（旧 21）
+
+    +37%~62%，全是白花的 token，还吃掉 `AGENT_TURN_CHURN_PER_HOUR` 的余量。
+    修法是回合结束后按**墙钟**再补正一次（`next_heartbeat` 是纯函数，不会抛，
+    所以不会重新引入 S2）。
+    """
+    from agent.context import Rendered
+    from agent.loop import Deps
+    from agent.main import AgentMain
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from llm.budget import Budget
+    from llm.tools import ToolRegistry
+    from tests.helpers import SH
+    from datetime import datetime, timedelta
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "hb3.db")
+    migrate(conn)
+    start = datetime(2026, 11, 19, 10, 30, tzinfo=SH)
+
+    class _SlowClock(FixedClock):
+        """每次 `now()` 都往前走，模拟长回合消耗的真实墙钟。"""
+
+        def __init__(self, t):
+            super().__init__(t)
+            self._t = t
+
+        def now(self):
+            self._t = self._t + timedelta(seconds=2)
+            return self._t
+
+        def advance(self, seconds):
+            self._t = self._t + timedelta(seconds=seconds)
+
+    clock = _SlowClock(start)
+
+    class _SilentLlm:
+        async def chat(self, *a, **k):
+            from types import SimpleNamespace
+            # 一个回合吃掉 180 秒（上游慢时的常态）
+            clock.advance(180)
+            return SimpleNamespace(content="", tool_calls=[
+                {"id": "c1", "function": {"name": "emit_decision", "arguments":
+                 '{"speak": false, "body": "", "why_silent": "无事"}'}}],
+                attempts=1, usage=None)
+
+    deps = Deps(conn=conn, cfg=cfg, clock=clock, llm=_SilentLlm(),
+                budget=Budget(conn, "agent", cfg.llm.budget.agent),
+                tools=ToolRegistry(conn, cfg, clock, mcp=None),
+                render=lambda t: Rendered("…", 1, False, {}),
+                pusher=None, memory=None, westock=None)
+    deps.conn_factory = lambda: conn
+    deps.alert = lambda *a, **k: None
+
+    main = AgentMain(deps, clock)
+    main.next_heartbeat_at = start
+
+    await main._once()
+
+    # 回合结束时刻 ≈ start + 180s（外加若干次 now() 的 2 秒步进）
+    end = clock.now()
+    assert main.next_heartbeat_at >= end, (
+        f"回合跑完后下一跳（{main.next_heartbeat_at}）早于当前时刻（{end}）："
+        "下一轮 _once() 会立刻再跑一次心跳，长回合下心跳背靠背")
+
+
+async def test_rounds_exhausted_alarm_is_cancelled_not_retried(tmp_path):
+    """**"轮数用尽"不该退回重试**（评审 M-c）。
+
+    它与"回合超时"是两种完全不同的失败：
+
+    · 回合超时 = 外部慢，隔 60 秒重试有意义；
+    · 轮数用尽 = **模型自己在 6 轮内没有收敛**，再跑一遍必然同样用尽。
+
+    评审实测退回重试的代价：3 次重试 ≈ **18 轮 LLM 调用**全烧在同一条没有收敛的
+    闹钟上，最后一次转 `cancelled` 且**无任何通知**——用户以为"30 分钟后回来看"，
+    实际静默丢了。现在直接 cancelled，明确记为放弃。
+
+    原来的 `test_timeout_turn_releases_the_alarm` 只覆盖了「回合超时」，
+    "轮数用尽也退回"这个决定没有任何测试表达。
+    """
+    from agent.main import AgentMain
+    from agent.schedule import due_alarms, schedule_alarm
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from tests.helpers import SH
+    from datetime import datetime
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "re.db")
+    migrate(conn)
+    now = datetime(2026, 11, 19, 10, 30, tzinfo=SH)
+    clock = FixedClock(now)
+    schedule_alarm(conn, turn_id=1, due_at=now.isoformat(), market="cn_main",
+                   target="sh600519", note="回访", now=now)
+    alarm = due_alarms(conn, now)[0]
+    conn.execute("UPDATE agent_schedule SET status='fired' WHERE id=?", (alarm["id"],))
+    conn.commit()
+
+    from types import SimpleNamespace
+
+    class _Deps:
+        def __init__(self):
+            self.conn = conn
+            self.cfg = cfg
+            self.clock = clock
+            self.pusher = None
+
+    main = AgentMain(_Deps(), clock)
+
+    from agent.decision import TurnDecision
+    from agent.loop import ROUNDS_EXHAUSTED_WHY, TurnResult
+
+    async def _fake(*a, **k):
+        return TurnResult(decision=TurnDecision.timeout(ROUNDS_EXHAUSTED_WHY),
+                          rounds=6, tool_calls=[], rendered=None, usage=None,
+                          fallback=0, latency_ms=90000, why=ROUNDS_EXHAUSTED_WHY)
+
+    import agent.main as m_mod
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(m_mod, "run_with_deadline", _fake)
+        await main._run(main._trigger("alarm", rounds=6, deadline=0,
+                                      alarm_id=alarm["id"], target="sh600519",
+                                      note="回访"))
+
+    status = conn.execute("SELECT status FROM agent_schedule WHERE id = ?",
+                          (alarm["id"],)).fetchone()[0]
+    assert status == "cancelled", (
+        f"轮数用尽后闹钟仍是 {status!r}：会再烧 2 次 × 6 轮 LLM，最后还是静默丢失")
+
+
+async def test_backlog_of_alarms_is_drained_gradually(tmp_path):
+    """**积压的同日闹钟不能在一轮里全部跑掉**（评审 M-d）。
+
+    按日期作废保住了"同日迟到"的闹钟（对：语境有效），但也失去了原来
+    "同日过期 1 小时"顺手提供的泄压。宕机到 13:00 恢复时，上午积压的十几条
+    **同一轮全部到期**，`due_alarms()` 的 `LIMIT 10` 会一口取出 10 条；
+    单条闹钟回合上限 6 轮、墙钟上限 600 秒——串行 10 条最坏 **100 分钟**连续回合，
+    而这正是 `sweep_stale_alarms` docstring 里列为"要防的事故"那种形状。
+
+    这里放 10 条同时到期的闹钟，断言单轮只跑 2 条（积压照样能被下一轮消化）。
+    """
+    from agent.main import ALARM_MAX_PER_ONCE, AgentMain
+    from agent.schedule import due_alarms, schedule_alarm
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from tests.helpers import SH
+    from datetime import datetime
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "backlog.db")
+    migrate(conn)
+    now = datetime(2026, 11, 19, 13, 0, tzinfo=SH)      # 上午宕机，13:00 才恢复
+    clock = FixedClock(now)
+    for i in range(10):
+        due = now.replace(hour=9, minute=30 + i)
+        schedule_alarm(conn, turn_id=i + 1, due_at=due.isoformat(), market="cn_main",
+                       target="sh600519", note=f"上午的回访{i}", now=due)
+    assert len(due_alarms(conn, now)) == 10, "前提不成立：应当有 10 条同时到期"
+
+    class _Deps:
+        def __init__(self):
+            self.conn = conn
+            self.cfg = cfg
+            self.clock = clock
+            self.pusher = None
+
+    main = AgentMain(_Deps(), clock)
+    claimed = {"n": 0}
+
+    async def _fake_run(trigger):
+        # 只数闹钟回合：13:00 已过 09:26，开盘回合也会跑一次，别混进来
+        if trigger.wake_kind == "alarm":
+            claimed["n"] += 1
+
+    main._run = _fake_run
+
+    await main._once()
+    assert claimed["n"] <= ALARM_MAX_PER_ONCE, (
+        f"一轮跑了 {claimed['n']} 条闹钟回合（上限 {ALARM_MAX_PER_ONCE}）："
+        "积压十几条时会连续烧掉上百轮 LLM")
+
+    # 积压不会丢：下一轮还能继续消化
+    main._alarm_swept_at = None
+    await main._once()
+    assert claimed["n"] > ALARM_MAX_PER_ONCE, "第二轮没有继续消化积压"

@@ -902,61 +902,57 @@ async def test_stale_alarms_are_cancelled_before_the_alarm_loop(tmp_path):
     assert statuses == ["cancelled", "cancelled"], f"过期闹钟没有作废：{statuses}"
 
 
-async def test_same_day_overdue_alarms_are_cancelled_after_an_hour(tmp_path):
-    """**同日但过期太久的闹钟也要作废**，不能等跨日。
+async def test_sweep_keeps_todays_alarms_even_if_late(tmp_path):
+    """**作废判据是日期，不是"迟了多久"**（v0.2.90 修的 M3）。
 
-    只按"跨交易日"作废会漏掉一个很常见的场景：当天宕机/重启两小时，
-    恢复时十条 09:30 的闹钟同时到期，连跑十个回合烧光预算。
-    更根本的是语义——闹钟都是"过 N 分钟回来看看"，拖一小时以上看到的
-    已经是另一段行情，照着它下的结论会误导用户。
+    上一版用 `now - 1 小时` 当阈值，会误杀两类**最该跑**的闹钟（评审实测）：
 
-    边界要双向卡住：1 小时内的迟到照常跑（那是正常的网络/排队抖动），
-    超过 1 小时才作废。
+    · 昨天排的、今天 09:20 的回访 —— 进程 10:30 才拉起（重启/盘后补拉）
+    · 09:30 的正常回访 —— 盘中短暂重启，10:40 才恢复
+
+    这两条的日期都是今天、语境完全有效，只是执行晚了。真正该杀的只有
+    "日期属于更早交易日"的陈货：隔天回答的是昨天的问题。
+
+    顺带钉住另一个坑：原来 `max(当天零点, now-1h)` 里零点分支是死代码
+    （盘中 `now-1h` 恒晚于零点），写着两条判据实际只有一条在跑。
     """
-    from agent.context import Rendered
-    from agent.loop import Deps
-    from agent.main import ALARM_MAX_STALE_S, AgentMain
-    from agent.schedule import schedule_alarm
+    from agent.main import AgentMain
+    from agent.schedule import due_alarms, schedule_alarm
     from core.clock import FixedClock
     from core.config import load_config
     from core.db import connect, migrate
-    from llm.budget import Budget
-    from llm.tools import ToolRegistry
     from tests.helpers import SH
     from datetime import datetime, timedelta
 
     cfg = load_config(Path("config"))
-    conn = connect(tmp_path / "sameday.db")
+    conn = connect(tmp_path / "sweep.db")
     migrate(conn)
-    now = datetime(2026, 11, 19, 11, 0, tzinfo=SH)      # 当天 11:00 恢复
-    clock = FixedClock(now)
+    now = datetime(2026, 11, 19, 10, 40, tzinfo=SH)      # 盘中重启，10:40 才恢复
 
-    late_ok = now - timedelta(seconds=ALARM_MAX_STALE_S // 2)     # 迟到 30 分钟：正常
-    too_late = now - timedelta(seconds=ALARM_MAX_STALE_S + 60)    # 迟到 61 分钟：作废
-    for due, note in ((late_ok, "迟到半小时"), (too_late, "迟到一小时")):
+    cases = {
+        "昨天的陈货": datetime(2026, 11, 18, 14, 1, tzinfo=SH),
+        "今天迟到 70 分钟（昨排今开）": datetime(2026, 11, 19, 9, 30, tzinfo=SH),
+        "今天迟到 10 分钟（正常）": datetime(2026, 11, 19, 10, 30, tzinfo=SH),
+        "今天稍后到期": datetime(2026, 11, 19, 11, 0, tzinfo=SH),
+    }
+    for note, due in cases.items():
         schedule_alarm(conn, turn_id=1, due_at=due.isoformat(), market="cn_main",
                        target="sh600519", note=note, now=due)
 
-    class _Llm:
-        async def chat(self, *a, **k):
-            return SimpleNamespace(content="", tool_calls=[], attempts=1, usage=None)
+    class _Deps:
+        def __init__(self):
+            self.conn = conn
+            self.cfg = cfg
+            self.clock = FixedClock(now)
 
-    deps = Deps(conn=conn, cfg=cfg, clock=clock, llm=_Llm(),
-                budget=Budget(conn, "agent", cfg.llm.budget.agent),
-                tools=ToolRegistry(conn, cfg, clock, mcp=None),
-                render=lambda t: Rendered("…", 1, False, {}),
-                pusher=None, memory=None, westock=None)
-    deps.conn_factory = lambda: conn
-    deps.alert = lambda *a, **k: None
-
-    main = AgentMain(deps, clock)
-    cancelled = main.sweep_stale_alarms(now)
+    cancelled = AgentMain(_Deps(), FixedClock(now)).sweep_stale_alarms(now)
 
     rows = dict(conn.execute("SELECT note, status FROM agent_schedule").fetchall())
-    assert rows["迟到一小时"] == "cancelled", (
-        "同日过期超过 1 小时的闹钟没作废：恢复后会一次性全部开跑")
-    assert rows["迟到半小时"] == "pending", "正常的迟到被误杀了"
-    assert cancelled == 1, f"作废条数应当是 1，实际 {cancelled}"
+    assert rows["昨天的陈货"] == "cancelled", "跨日的陈货没作废，明天开盘会补跑昨天的判断"
+    assert cancelled == 1, f"只该作废 1 条，实际 {cancelled}"
+    for note in ("今天迟到 70 分钟（昨排今开）", "今天迟到 10 分钟（正常）",
+                 "今天稍后到期"):
+        assert rows[note] == "pending", f"今天的闹钟被误杀了：{note}"
 
 
 async def test_housekeeping_actually_persists(tmp_path):
@@ -1093,3 +1089,216 @@ async def test_event_retry_terminates_via_gave_up(tmp_path):
         "SELECT trigger_id FROM agent_turn ORDER BY id DESC LIMIT 1").fetchone()[0]
     assert last is None, (
         f"最后一轮仍有事件重试回合（trigger_id={last}）：循环没有收敛，counts={counts}")
+
+
+async def test_budget_exhausted_alarm_is_cancelled_not_requeued(tmp_path):
+    """**预算耗尽取消闹钟的路径必须有断言级测试**（评审 M1）。
+
+    原来的 `test_budget_exhausted_does_not_rerun_alarms` 只覆盖"跳过闹钟循环"，
+    而 `_run()` 里"预算耗尽 → cancelled 而不是 release_alarm"这一条**没有任何测试**：
+    把 `exhausted` 改回 `False`（恢复事故形态）跑全量仍然全绿。
+
+    这里走真实 `_run()`：预算耗尽的结果 → 闹钟必须 `cancelled`，
+    且**不能**退回 `pending`（那正是每 2 秒重跑一次的源头）。
+    """
+    from agent.main import AgentMain
+    from agent.schedule import due_alarms, schedule_alarm
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from agent.context import Rendered
+    from agent.loop import Deps
+    from llm.budget import Budget
+    from llm.tools import ToolRegistry
+    from tests.helpers import SH
+    from datetime import datetime
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "bx.db")
+    migrate(conn)
+    now = datetime(2026, 11, 19, 10, 30, tzinfo=SH)
+    clock = FixedClock(now)
+    schedule_alarm(conn, turn_id=1, due_at=now.isoformat(), market="cn_main",
+                   target="sh600519", note="回访", now=now)
+    alarm = due_alarms(conn, now)[0]
+    conn.execute("UPDATE agent_schedule SET status='fired' WHERE id=?", (alarm["id"],))
+    conn.commit()
+
+    class _BoomLlm:
+        async def chat(self, *a, **k):
+            raise RuntimeError("不该被调用")
+
+    deps = Deps(conn=conn, cfg=cfg, clock=clock, llm=_BoomLlm(),
+                budget=Budget(conn, "agent", (0, 0)),      # 额度已用尽
+                tools=ToolRegistry(conn, cfg, clock, mcp=None),
+                render=lambda t: Rendered("…", 1, False, {}),
+                pusher=None, memory=None, westock=None)
+    deps.conn_factory = lambda: conn
+    deps.alert = lambda *a, **k: None
+
+    main = AgentMain(deps, clock)
+    await main._run(main._trigger("alarm", rounds=3, deadline=0,
+                                  alarm_id=alarm["id"], target="sh600519",
+                                  note="回访"))
+
+    status, fired_turn = conn.execute(
+        "SELECT status, fired_turn FROM agent_schedule WHERE id = ?",
+        (alarm["id"],)).fetchone()
+    assert status == "cancelled", (
+        f"预算耗尽后闹钟状态是 {status!r}：退回 pending 就是每 2 秒重跑一次的死循环")
+    assert fired_turn is None
+    assert due_alarms(conn, now) == [], "预算耗尽的闹钟又被排回队列了"
+
+
+async def test_heartbeat_advances_even_when_a_post_journal_step_raises(
+        tmp_path, monkeypatch):
+    """**心跳的下一跳必须在跑回合之前推进**（评审 S2，最严重的一条新发现）。
+
+    `_run` 的顺序是「跑回合 → 记日志 → 推送/确认卡/排闹钟」。任何一步抛异常都会
+    被 `run()` 吞掉（只发个 alert 继续循环）。原来 `self.next_heartbeat_at = nxt`
+    写在 `await self._run(...)` **之后**，于是只要**日志写成功之后**炸一次，
+    下一跳就永远不推进 —— `now >= next_heartbeat_at` 恒成立，**每 2 秒跑一次
+    心跳回合**。这与 11-19 那 17998 行是完全相同的形状，只是触发器不同。
+
+    **必须让日志写成功之后再炸**：LLM 自己抛异常会被 `run_with_deadline` 转成
+    `error` 结果、`journal_record` 照常写库、`_run` 正常返回——那种情况下
+    测试根本看不到差异（我第一版就是这么写的，改回旧实现照样绿）。
+    这里用 `schedule_next` 回合 + 打桩 `schedule_alarm` 制造"记账后抛异常"。
+    """
+    from agent.context import Rendered
+    from agent.loop import Deps
+    from agent.main import AgentMain
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from llm.budget import Budget
+    from llm.tools import ToolRegistry
+    from tests.agent.test_loop import Step, ToolCall
+    from tests.helpers import SH
+    from datetime import datetime, timedelta
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "hb.db")
+    migrate(conn)
+    now = datetime(2026, 11, 19, 10, 30, tzinfo=SH)
+    clock = FixedClock(now)
+
+    class _ScheduleLlm:
+        """返回一个排了闹钟的回合 —— 记账之后才会执行 `schedule_alarm`。"""
+
+        async def chat(self, messages, tools=None, max_tokens=None, timeout_s=None,
+                       deduct=None, est_in=0, on_attempt=None):
+            from types import SimpleNamespace
+
+            step = Step(tool_calls=[ToolCall("emit_decision", {
+                "speak": False, "body": "", "why_silent": "等下次",
+                "schedule_next": 30, "schedule_note": "回访"})])
+            return SimpleNamespace(content=step.content, tool_calls=step.tool_calls,
+                                   attempts=1, usage=step.usage)
+
+    deps = Deps(conn=conn, cfg=cfg, clock=clock, llm=_ScheduleLlm(),
+                budget=Budget(conn, "agent", cfg.llm.budget.agent),
+                tools=ToolRegistry(conn, cfg, clock, mcp=None),
+                render=lambda t: Rendered("…", 1, False, {}),
+                pusher=None, memory=None, westock=None)
+    deps.conn_factory = lambda: conn
+    deps.alert = lambda *a, **k: None
+
+    main = AgentMain(deps, clock)
+    main.next_heartbeat_at = now            # 心跳立即到期
+
+    def _boom(*a, **k):
+        raise RuntimeError("排闹钟阶段炸了（记账已经成功）")
+
+    monkeypatch.setattr("agent.main.schedule_alarm", _boom)
+
+    before = main.next_heartbeat_at
+    try:
+        await main._once()
+    except Exception:                       # noqa: BLE001 —— `run()` 会在外层吞掉
+        pass
+
+    # 前提：这一轮确实记账了（否则测的就不是"记账后抛异常"）
+    assert conn.execute("SELECT count(*) FROM agent_turn").fetchone()[0] == 1, \
+        "前提不成立：日志没写成功，测的不是 post-journal 阶段"
+    assert main.next_heartbeat_at > before, (
+        f"记账之后炸了一次，下一跳就没推进（仍是 {before}）："
+        "`now >= next_heartbeat_at` 恒成立，会每 2 秒重跑一次——"
+        "这就是 11-19 那 17998 行的同一形状")
+
+    # 再跑一轮：不该又触发心跳（否则就是循环）
+    nxt = main.next_heartbeat_at
+    try:
+        await main._once()
+    except Exception:                       # noqa: BLE001
+        pass
+    assert main.next_heartbeat_at == nxt, "第二跳又触发了：心跳在异常后仍然每轮重跑"
+
+
+async def test_open_turn_has_attempt_cap(tmp_path, monkeypatch):
+    """**开盘回合也要有次数上限**（评审 S2 的同源问题）。
+
+    `_open_turn_done()` 判断"当天有没有 open 行"。回合若在 `journal_record`
+    **之前**就失败（磁盘满、写锁超时、连接被关），那一行永远写不出来 ——
+    `now >= OPEN_TURN_AT` 恒成立，于是每 2 秒重跑一次开盘回合。
+    心跳可以靠"推进下一跳"解决，开盘回合没有下一跳，只能用当日尝试次数兜住。
+
+    **必须让记账本身失败**：LLM 抛异常会被 `run_with_deadline` 转成 `error` 结果、
+    日志照常落库、`_open_turn_done()` 随即为真——那种情况下有没有次数上限都一样，
+    测试看不到差异（我第一版就是这么写的，去掉上限照样绿）。
+    """
+    from agent.context import Rendered
+    from agent.loop import Deps
+    from agent.main import OPEN_TURN_MAX_ATTEMPTS, AgentMain
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from llm.budget import Budget
+    from llm.tools import ToolRegistry
+    from tests.helpers import SH
+    from datetime import datetime, timedelta
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "open.db")
+    migrate(conn)
+    now = datetime(2026, 11, 19, 9, 40, tzinfo=SH)      # 过了 09:26
+    clock = FixedClock(now)
+
+    class _SilentLlm:
+        async def chat(self, *a, **k):
+            from types import SimpleNamespace
+
+            return SimpleNamespace(content="", tool_calls=[
+                {"id": "c1", "function": {"name": "emit_decision", "arguments":
+                 '{"speak": false, "body": "", "why_silent": "无事"}'}}],
+                attempts=1, usage=None)
+
+    deps = Deps(conn=conn, cfg=cfg, clock=clock, llm=_SilentLlm(),
+                budget=Budget(conn, "agent", cfg.llm.budget.agent),
+                tools=ToolRegistry(conn, cfg, clock, mcp=None),
+                render=lambda t: Rendered("…", 1, False, {}),
+                pusher=None, memory=None, westock=None)
+    deps.conn_factory = lambda: conn
+    deps.alert = lambda *a, **k: None
+
+    main = AgentMain(deps, clock)
+    main.next_heartbeat_at = now + timedelta(hours=1)   # 心跳不在窗口内
+
+    attempts = {"n": 0}
+
+    def _boom(*a, **k):
+        attempts["n"] += 1
+        raise RuntimeError("记账失败（磁盘满/写锁超时）")
+
+    monkeypatch.setattr("agent.main.journal_record", _boom)
+
+    for _ in range(10):                     # 模拟 20 秒的轮询
+        try:
+            await main._once()
+        except Exception:                   # noqa: BLE001
+            pass
+
+    assert attempts["n"] <= OPEN_TURN_MAX_ATTEMPTS, (
+        f"开盘回合试了 {attempts['n']} 次（上限 {OPEN_TURN_MAX_ATTEMPTS}）："
+        "记账失败时会每 2 秒重跑一次，直到收盘")
+    assert main._open_attempts == OPEN_TURN_MAX_ATTEMPTS

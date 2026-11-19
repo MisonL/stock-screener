@@ -46,13 +46,12 @@ EVENT_ROUNDS_BUDGET, EVENT_DEADLINE_S = 3, 0
 OTHER_ROUNDS_BUDGET, OTHER_DEADLINE_S = 6, 0
 ESCALATED_RECYCLE_MIN = 30
 CONFIRM_EXPIRE_H = 24
-#: 同日闹钟最多允许迟到多久（秒）——超过就作废，见 `sweep_stale_alarms()`。
-#: 闹钟都是"过 N 分钟回来看看"，拖一小时以上看到的已是另一段行情。
-ALARM_MAX_STALE_S = 3600
 #: 作废扫描的最小间隔（秒）。每轮 `_once()`（2 秒）都扫一次没必要，
 #: 但也不能像原来那样"一天只扫一次"——那样同日积压扫不到。
 ALARM_SWEEP_EVERY_S = 60
 OPEN_TURN_AT = (9, 26)
+#: 开盘回合每天最多试几次（防"日志写不出来 → 每 2 秒重跑一次"）
+OPEN_TURN_MAX_ATTEMPTS = 3
 SHADOW_WHY = "只记录不升级"
 HEARTBEAT_SERVICE_DEFAULT = "agent"
 
@@ -196,6 +195,8 @@ class AgentMain:
         self._last_day = self.clock.today()
         # 上一次扫过期闹钟的时刻（见 `_once()` 里的闹钟循环）
         self._alarm_swept_at = None
+        # 今天试过几次开盘回合（见 `_once()` 尾部的次数上限）
+        self._open_attempts = 0
 
     def _trigger(self, wake_kind, *, group=None, events=None, rounds, deadline, alarm_id=None,
                  target=None, note=""):
@@ -229,7 +230,7 @@ class AgentMain:
             # 与 `release_alarm` 都不会执行，而闹钟在 `after_alarm` 里已经被
             # 认领成 `fired` 了，于是这次回访永久丢失，连一行日志都没有。
             if trigger.alarm_id is not None:
-                release_alarm(self.deps.conn, trigger.alarm_id)
+                release_alarm(self.deps.conn, trigger.alarm_id, now=self.clock.now())
             raise
         turn_id = journal_record(self.deps.conn, trigger, result, self.clock)
         if trigger.alarm_id is not None:
@@ -311,19 +312,22 @@ class AgentMain:
         （实测复现：`next_heartbeat_at` 初始为 None → 设成 09:17 → 09:15 这一轮
         `now < next_heartbeat_at`，housekeeping 不执行，而 alarm 循环执行。）
         """
-        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        # 两条判据都是"回访的前提已经过期"：
-        #   1. 跨交易日 —— 价位语境是当天的，隔天回答的是昨天的问题；
-        #   2. 同日但已过期超过 ALARM_MAX_STALE_S —— "过 30 分钟回来看看"拖了
-        #      两小时才跑，看到的已经是另一段行情，结论会误导用户。
-        # 第 2 条覆盖的是"当天宕机/重启后积压"：比如 09:00–11:00 不可用，
-        # 11:00 恢复时十条 09:30 的闹钟会同时到期、连跑十回合烧光预算。
-        # 取**较晚**的那个：两条判据都是"越界即作废"，所以阈值是并集的上界。
-        # 写成 `min` 会让同日那条判据永远失效（零点总是早于 `now-1h`）。
-        stale_before = max(midnight, now - timedelta(seconds=ALARM_MAX_STALE_S))
+        # 判据是**日期**，不是"过期多久"：闹钟的语境是"哪一天的行情"。
+        #   · `due_at` 属于更早的交易日 → 作废（隔天回答的是昨天的问题）
+        #   · `due_at` 是今天（哪怕已经迟了一两个小时） → 保留
+        #
+        # **"迟太久就作废"的写法是错的**（v0.2.90 修）：它会把
+        # 「昨天排的、今天 09:20 的回访」在进程 10:30 才拉起时一起杀掉——
+        # 那条闹钟的日期是今天、语境完全有效，只是进程晚启动了 70 分钟。
+        # 同样的误杀也发生在盘中短暂重启后：09:30 的正常回访在 10:40 恢复时被作废。
+        # 那两类恰恰是**最该跑**的，不能和"昨天的陈货"一视同仁。
+        #
+        # 顺带说明：原来用 `max(当天零点, now - 1小时)` 做阈值时，盘中 `now - 1h`
+        # 恒晚于零点，零点那个分支是**死代码**——写着两条判据，实际只有一条在跑。
+        today_iso = now.date().isoformat()
         cur = self.deps.conn.execute(
             "UPDATE agent_schedule SET status = 'cancelled'"
-            " WHERE status = 'pending' AND due_at < ?", (stale_before.isoformat(),))
+            " WHERE status = 'pending' AND substr(due_at, 1, 10) < ?", (today_iso,))
         self.deps.conn.commit()
         return cur.rowcount
 
@@ -410,6 +414,7 @@ class AgentMain:
         if self.clock.today() != self._last_day:
             self._last_day = self.clock.today()
             self.budget_exhausted = False
+            self._open_attempts = 0
         if self.next_heartbeat_at is None:
             self.next_heartbeat_at = next_heartbeat(now)
 
@@ -433,6 +438,16 @@ class AgentMain:
             # 家务与「下一跳」与影子无关：不做的话影子期 escalated 永不回收、
             # 心跳停摆，两周观测拿到的就是一堆过期事件。
             self.heartbeat_housekeeping()
+            # **下一跳必须在跑回合之前推进**（v0.2.90 修的 S2）。
+            # `_run` 的顺序是「跑回合 → 记日志 → 推送/确认卡/排闹钟」，任何一步
+            # 抛异常都会被 `run()` 吞掉（它只是发个 alert 继续循环）。原来
+            # `self.next_heartbeat_at = nxt` 写在 `await self._run(...)` **之后**，
+            # 于是只要日志写成功之后炸一次，下一跳就永远不推进——
+            # `now >= next_heartbeat_at` 恒成立，**每 2 秒跑一次心跳回合**。
+            # 这与 11-19 那 17998 行是完全相同的形状，只是触发器不同。
+            # 推进放在前面，最坏情况是"这一次心跳的推送丢了"，那是可接受的。
+            nxt = next_heartbeat(now)
+            self.next_heartbeat_at = nxt
             if self.shadow_mode:
                 # 影子期不排队 LLM 回合（pending_retry 的事件已被 poll() 拦在 shadow 行里）
                 source = f"due_at={due_at.isoformat()}"
@@ -447,14 +462,12 @@ class AgentMain:
                 await self._run(self._trigger("heartbeat", events=retry,
                                               rounds=self.other_rounds,
                                               deadline=self.other_deadline))
-            nxt = next_heartbeat(self.clock.now())
             if (self.shadow_mode and nxt.isoformat() != self._shadow_beat_at
                     and nxt <= self.clock.now()):
                 # **不能排出一个已经到期的下一跳**：盘后（>15:05）next_heartbeat 给的是
                 # 次日 09:15，而 `run()` 在 15:06 之后就不再调 `_once()`，那天的结束心跳
                 # 永远不到期。影子期这里补一次收尾心跳（同样只记账、不跑模型）。
                 self._shadow_turn("heartbeat", f"due_at={nxt.isoformat()}")
-            self.next_heartbeat_at = nxt
 
         # **预算耗尽就跳过闹钟**：闹钟回合必然在 `run_with_deadline` 的预检里
         # 立刻返回 error（rounds=0、0 毫秒），既不调模型也不产生任何价值，
@@ -490,8 +503,15 @@ class AgentMain:
                                           target=alarm.get("target"),
                                           note=alarm.get("note") or ""))
 
+        # **开盘回合也要有次数上限**（v0.2.90 的 S2 同源问题）：
+        # `_open_turn_done()` 判断的是"当天有没有 open 行"，而回合若在
+        # `journal_record` **之前**就抛异常，那一行永远写不出来 ——
+        # `now >= OPEN_TURN_AT` 恒成立，于是每 2 秒重跑一次开盘回合。
+        # 与心跳不同，这里没有"下一跳"可以推进，只能用当日尝试次数兜住。
         if ((now.hour, now.minute) >= OPEN_TURN_AT
-                and not self._open_turn_done(now.date().isoformat())):
+                and not self._open_turn_done(now.date().isoformat())
+                and self._open_attempts < OPEN_TURN_MAX_ATTEMPTS):
+            self._open_attempts += 1
             if self.shadow_mode:
                 self._shadow_turn("open", f"trade_date={now.date().isoformat()}")
             else:

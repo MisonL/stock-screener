@@ -105,6 +105,18 @@ class Budget:
                 (est_in, est_out, self.day, self.pool, est_in, self.limit_in,
                  est_out, self.limit_out))
             if cur.rowcount:
+                # **成功扣减就清掉故障标志**（v0.2.90 修的 M5）。
+                # 原来 `clear_write_failed()` 在生产里**零调用者**：一次写锁抖动置上
+                # `budget.write_failed:agent` 之后，`agent/main.py` 会把它读成
+                # `budget_exhausted=True`，于是当天剩下的时间**所有闹钟都被跳过**
+                # （回访一条都不跑），而且 watchdog 的两条规则还会因同一标志静音。
+                # 一个能自己恢复的瞬时故障不该有"永久"的效果。
+                # 这里是最自然的清除点：扣减成功就证明记账恢复正常了。
+                try:
+                    self.conn.execute("DELETE FROM job_state WHERE name = ?",
+                                      (f"budget.write_failed:{self.pool}",))
+                except Exception:                          # noqa: BLE001
+                    pass                                   # 清不掉不影响扣减结果
                 return True
             if self._row() is not None:
                 return False

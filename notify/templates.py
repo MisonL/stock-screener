@@ -339,11 +339,27 @@ _ALERT_PRIORITY = {"P0": 5, "P1": 4, "P2": 3}
 #: 告警类型 → 人读标题。**不能直接把 kind 当标题**：手机上收到 "agent_churn"
 #: 等于没收到——那是给代码看的标识符，不是给人看的。
 _ALERT_TITLE = {
+    # watchdog（api/watchdog.py::AlertKind）
     "agent_down": "agent 进程无响应",
     "agent_stalled": "agent 调度卡死",
     "agent_churn": "agent 空转死循环",
     "jobs_down": "盘中监控已停止",
     "llm_down": "LLM 连续不可用",
+    # 进程内自报（agent/main.py、api/routes.py）
+    "agent_main_crash": "agent 主循环异常",
+    "confirm": "确认执行失败",
+    # 定时任务自报（jobs/*）
+    "disk": "磁盘水位告警",
+    "backup": "备份失败",
+    "members": "成分股刷新失败",
+    "archive": "agent_turn 归档失败",
+    "self_check": "自检失败",
+    "westock_renew": "腾讯自选股授权过期",
+    "pool": "股票池异常",
+    # `jobs/snapshot.py` 通过 `on_alert` 回调传 kind，正则扫不到，手工补
+    "upstream_dead": "上游数据中断",
+    "snapshot_crash": "快照循环异常",
+    # 其它
     "push_channel_down": "推送通道不可用",
     "budget_exhausted": "agent 日预算已用完",
 }

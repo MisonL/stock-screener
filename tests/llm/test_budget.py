@@ -277,3 +277,45 @@ def test_concurrent_deduct_never_exceeds_limit(tmp_path):
     assert sum(results) == 3, f"应只放行 3 次（30×3=90），实际 {sum(results)} 次"
     row = base.execute("SELECT tokens_in, tokens_out FROM llm_budget WHERE pool='agent'").fetchone()
     assert row[0] == 90 and row[1] == 90, f"账面被双花：{tuple(row)}"
+
+
+def test_failed_flag_is_cleared_by_a_successful_deduct(tmp_path):
+    """**记账故障标志必须能被一次成功扣减清掉**（v0.2.90 修的 M5）。
+
+    原来 `clear_write_failed()` 在生产代码里**零调用者**。后果是一条链：
+    一次写锁抖动 → 置 `budget.write_failed:agent` → `agent/main.py` 读成
+    `budget_exhausted=True` → **当天剩下的时间所有闹钟都被跳过**（回访一条都不跑），
+    而且 watchdog 的 `agent_stalled` / `llm_down` 还会因同一标志静音。
+
+    一个能自己恢复的瞬时故障不该有"永久"的效果。
+    """
+    from core.db import connect, migrate
+    from core.clock import FixedClock
+    from datetime import datetime
+    from tests.helpers import SH
+    from llm.budget import Budget
+
+    conn = connect(tmp_path / "b.db")
+    migrate(conn)
+    clock = FixedClock(datetime(2026, 10, 30, 10, 0, tzinfo=SH))
+    b = Budget(conn, "agent", (1_000_000, 100_000))
+
+    # 先把预算行建好：首次 `_try_deduct` 若发现没有行会走 INSERT 再递归 `deduct()`，
+    # 而 `deduct()` 会因为故障标志短路——那是"行还没建"的分支，与"写恢复"无关
+    conn.execute("INSERT INTO llm_budget(day, pool, tokens_in, tokens_out) VALUES (?,?,0,0)",
+                 (b.day, "agent"))
+    conn.commit()
+
+    # 模拟一次写失败：标志被置上，之后 fail-closed
+    b._mark_write_failed()
+    assert b._write_failed() is True, "前提不成立"
+    assert b.deduct(100, 100) is False, "标志在时应当 fail-closed"
+
+    # **不手工删标志**：必须由成功扣减自己清掉。
+    # 直接调 `_try_deduct` 绕过 `_write_failed()` 的短路（那正是「写已经恢复」的场景）。
+    assert b._try_deduct(100, 100) is True
+    assert b._write_failed() is False, (
+        "成功扣减之后故障标志还在：当天剩下的闹钟都会被跳过，而 watchdog 也静音了")
+
+    # 清掉之后正常入口恢复可用
+    assert b.deduct(50, 50) is True

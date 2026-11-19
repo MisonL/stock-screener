@@ -400,3 +400,28 @@ def test_alert_title_is_human_readable():
     # 未知 kind 也要能渲染（不能 KeyError 把告警吞掉）
     msg2 = render_alert("some_new_kind", "正文", cfg, level="P0")
     assert msg2.body == "正文" and msg2.title
+
+
+def test_all_production_alert_kinds_have_chinese_titles():
+    """**生产里每一个真正会发出去的 kind 都要有中文标题**。
+
+    只测 `agent_churn` 一个是不够的：`_ALERT_TITLE` 删到只剩它，
+    上面那条测试照样绿。这里把源码里所有 `dispatcher.alert("<kind>", ...)`
+    的实参扫出来，逐个核对——新增告警点忘配标题会被立刻拦下。
+
+    实测缺口（v0.2.89 之前）：`disk`、`backup`、`members`、`archive`、
+    `self_check`、`westock_renew`、`agent_main_crash`、`confirm` 八个 kind
+    在手机上显示的仍是裸标识符。
+    """
+    import re
+    from pathlib import Path as _P
+    from notify.templates import _ALERT_TITLE
+
+    kinds: set[str] = set()
+    for pkg in ("api", "jobs", "agent", "notify"):
+        for f in _P(pkg).rglob("*.py"):
+            src = f.read_text(encoding="utf-8")
+            kinds |= set(re.findall(r'\.alert\(\s*"([a-z_]+)"', src))
+    assert kinds, "没有扫到任何告警调用点，正则失效了"
+    missing = sorted(k for k in kinds if k not in _ALERT_TITLE)
+    assert not missing, f"这些告警 kind 在手机上会显示裸标识符：{missing}"

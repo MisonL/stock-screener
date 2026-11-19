@@ -242,7 +242,12 @@ class AgentMain:
             # **预算耗尽时不要退回**：当天不可能恢复了，退回只会变成
             # 「每 2 秒重跑一次失败回合」的死循环（生产实测一天 17885 行空转）。
             # 直接转 cancelled，把这次回访算作放弃，而不是无限重试。
-            if result.decision.kind in ("error", "invalid"):
+            # **`timeout` 也要退回**（v0.2.90 修的 L2）。原来只有 `error`/`invalid`
+            # 会退回，超时回合把闹钟永久留在 `fired` —— 模型说的"我 30 分钟后
+            # 回来看"静默作废，与最初那个"失败即永久丢失"是同一个毛病
+            # （`release_alarm` 的 docstring 里本来就写了"LLM 挂掉/预算耗尽/超时"，
+            # 实现只覆盖了前两种）。现在它有 60 秒退避与 3 次上限，退回不会成环。
+            if result.decision.kind in ("error", "invalid", "timeout"):
                 exhausted = getattr(result, "why", "") == BUDGET_EXHAUSTED_WHY
                 if exhausted:
                     self.deps.conn.execute(

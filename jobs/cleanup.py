@@ -69,14 +69,22 @@ def cleanup(conn, clock, dispatcher=None, data_dir: str = "/app/data") -> dict[s
                 " WHERE status='pending' AND ts < ?", (stale,)).rowcount
 
         # 过期的 pending 计划改 cancelled（不是删除：留痕才能回答「为什么没跑」）
+        #
+        # **按日期（3 个自然日），不是按"过期满 72 小时"**（v0.2.90 修的 L3）：
+        # 用 `due_at < now - 3d` 时，一条 4 天前到期、但昨天才被作废的闹钟
+        # 会**活到明天**才被删——它与 `agent/main.py::sweep_stale_alarms()` 的
+        # "按日期"口径不一致，两条路径对"过期"的定义不同，排查时对不上。
+        # 这里统一成"3 个自然日之前的 due_at"。
         if _has_table(conn, "agent_schedule"):
-            stale = (now - timedelta(days=3)).isoformat()
+            stale_day = (now - timedelta(days=3)).date().isoformat()
             out["agent_schedule.cancelled"] = conn.execute(
-                "UPDATE agent_schedule SET status='cancelled' WHERE status='pending' AND due_at < ?",
-                (stale,)).rowcount
+                "UPDATE agent_schedule SET status='cancelled'"
+                " WHERE status='pending' AND substr(due_at, 1, 10) < ?",
+                (stale_day,)).rowcount
             out["agent_schedule"] = conn.execute(
-                "DELETE FROM agent_schedule WHERE status IN ('fired','cancelled') AND due_at < ?",
-                (stale,)).rowcount
+                "DELETE FROM agent_schedule"
+                " WHERE status IN ('fired','cancelled') AND substr(due_at, 1, 10) < ?",
+                (stale_day,)).rowcount
         else:
             out["agent_schedule.cancelled"] = -1
             out["agent_schedule"] = -1

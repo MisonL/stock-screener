@@ -1302,3 +1302,72 @@ async def test_open_turn_has_attempt_cap(tmp_path, monkeypatch):
         f"开盘回合试了 {attempts['n']} 次（上限 {OPEN_TURN_MAX_ATTEMPTS}）："
         "记账失败时会每 2 秒重跑一次，直到收盘")
     assert main._open_attempts == OPEN_TURN_MAX_ATTEMPTS
+
+
+async def test_timeout_turn_releases_the_alarm(tmp_path):
+    """**超时回合也要把闹钟退回去**（评审 L2）。
+
+    原来只有 `error`/`invalid` 会退，超时回合把闹钟永久留在 `fired`：
+    模型说的"我 30 分钟后回来看"就静默作废，与最初那个"失败即永久丢失"
+    是同一个毛病。`release_alarm` 的 docstring 本来就写明了
+    "LLM 挂掉/预算耗尽/**超时**"，实现只覆盖了前两种。
+
+    现在它有 60 秒退避与 3 次上限，退回不会成环。
+    """
+    from agent.main import AgentMain
+    from agent.schedule import due_alarms, schedule_alarm
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from tests.helpers import SH
+    from datetime import datetime, timedelta
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "to.db")
+    migrate(conn)
+    now = datetime(2026, 11, 19, 10, 30, tzinfo=SH)
+    clock = FixedClock(now)
+    schedule_alarm(conn, turn_id=1, due_at=now.isoformat(), market="cn_main",
+                   target="sh600519", note="回访", now=now)
+    alarm = due_alarms(conn, now)[0]
+    conn.execute("UPDATE agent_schedule SET status='fired' WHERE id=?", (alarm["id"],))
+    conn.commit()
+
+    from types import SimpleNamespace
+
+    class _Deps:
+        def __init__(self):
+            self.conn = conn
+            self.cfg = cfg
+            self.clock = clock
+            self.pusher = None
+
+    main = AgentMain(_Deps(), clock)
+
+    from agent.decision import TurnDecision
+    from agent.loop import TurnResult
+
+    async def _fake_run_with_deadline(*a, **k):
+        return TurnResult(decision=TurnDecision.timeout("回合超时"),
+                          rounds=1, tool_calls=[], rendered=None,
+                          usage=None, fallback=0, latency_ms=30000,
+                          why="回合超时")
+
+    import agent.main as m_mod
+    orig = m_mod.run_with_deadline
+    m_mod.run_with_deadline = _fake_run_with_deadline
+    try:
+        await main._run(main._trigger("alarm", rounds=3, deadline=0,
+                                      alarm_id=alarm["id"], target="sh600519",
+                                      note="回访"))
+    finally:
+        m_mod.run_with_deadline = orig
+
+    status, attempts = conn.execute(
+        "SELECT status, attempts FROM agent_schedule WHERE id = ?",
+        (alarm["id"],)).fetchone()
+    assert status == "pending", (
+        f"超时之后闹钟停在 {status!r}：这次回访被永久丢弃了（L2）")
+    assert attempts == 1
+    later = now + timedelta(seconds=61)
+    assert [a["id"] for a in due_alarms(conn, later)] == [alarm["id"]]

@@ -9,7 +9,15 @@ llm:
   thinking: disabled                # 默认关闭；要开时 max_tokens 须 ≥2000
 
   timeouts:
-    agent_call_s: 20
+    # **单次调用的超时，不是回合的超时**。这两者别混：
+    # 一个回合会跑 2–3 轮（工具结果回灌 + grounding 重写），回合总耗时是
+    # 单次调用的数倍。用回合耗时去校验这个值，方向和量级都会错。
+    #
+    # 20 秒是照着"成功回合 9–16 秒"定的，那次观察的是**回合总耗时**——
+    # 实测中转站在开盘繁忙时单次就要 23 秒以上（连只回 1 个 token 的请求也是），
+    # 于是每次 attempt 必然超时，一整天所有回合全部 timeout。
+    # 给到 40 秒留出排队余量；回合级的 deadline 见 agent/main.py。
+    agent_call_s: 40
     chat_s: 60
   max_tokens:
     plain: 800

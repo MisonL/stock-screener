@@ -557,3 +557,27 @@ def test_silent_turn_confirm_card_explains_why(tmp_path):
     # 没有理由时不能凭空造一个"理由："
     assert "理由" not in action_desc({"tool": "mcp_add_watch",
                                       "args": {"code": "sh600519"}}, "")
+
+
+def test_turn_deadline_allows_at_least_two_llm_calls():
+    """**回合 deadline 必须够两次 LLM 调用**，否则每个回合都注定超时。
+
+    一个回合至少调用两次模型：第一次决定查什么、拿到工具结果后再出决策。
+    deadline 只够一次调用时，每轮都在"还没等回来就到点"上被掐断。
+
+    这个不变式原来根本不成立：`EVENT_DEADLINE_S=25` 而单次上限 20 秒，
+    25 < 20×2。中转站排队一超过 20 秒，**整个交易日 100% 回合超时**
+    （实测单次最少 23 秒，连只回 1 个 token 的请求也是）。
+    """
+    from agent import main as m
+    from core.config import load_config
+    from pathlib import Path
+
+    call_s = load_config(Path("config")).llm.timeouts.agent_call_s
+    assert m.EVENT_DEADLINE_S >= call_s * 2, (
+        f"事件回合 deadline {m.EVENT_DEADLINE_S}s < 单次调用 {call_s}s × 2："
+        "回合根本没有机会跑完两轮")
+    assert m.OTHER_DEADLINE_S >= call_s * 2, (
+        f"心跳回合 deadline {m.OTHER_DEADLINE_S}s < 单次调用 {call_s}s × 2")
+    assert m.OTHER_DEADLINE_S >= m.EVENT_DEADLINE_S, (
+        "心跳/闹钟回合的 deadline 不该比事件回合更紧")

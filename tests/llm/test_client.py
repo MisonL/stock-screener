@@ -223,7 +223,24 @@ def test_nonretryable_from_once_propagates(monkeypatch):
 
 
 async def test_chat_timeout_uses_chat_budget():
-    """对话回合的默认超时是 60 秒（chat_s），盯盘回合才是 20 秒。"""
+    """对话回合用 `chat_s`，带工具的盯盘回合用 `agent_call_s`。
+
+    这里**从配置里取期望值**，不写死数字：`agent_call_s` 会因为上游网关
+    延迟变化而调整（2026-11-19 的 100% 超时故障就把它从 20 提到 40），
+    写死的话每次调超时都要来改这条测试，而且会掩盖"配置没生效"。
+    """
+    from core.config import load_config
+    from pathlib import Path as _P
+
+    cfg = load_config(_P("config"))
     client = Mock(ok_body()).client()
-    assert client.default_timeout(None, None) == 60
-    assert client.default_timeout(None, [{"type": "function"}]) == 20
+    # 关系本身就是语义：**不传 tools = 对话**（用 chat_s），**传 tools = 盯盘回合**
+    # （用 agent_call_s）。写死数字会把"配置改了但代码没读到"一起放过。
+    assert client.default_timeout(None, None) == cfg.llm.timeouts.chat_s
+    assert client.default_timeout(None, [{"type": "function"}]) == \
+        cfg.llm.timeouts.agent_call_s
+    assert client.default_timeout(None, []) == cfg.llm.timeouts.chat_s, \
+        "空 tools 列表应当按对话处理（falsy），不能误用盯盘超时"
+    # 单次调用的超时必须够回合级 deadline 跑完至少两轮（见 agent/main.py）
+    assert cfg.llm.timeouts.agent_call_s >= 30, (
+        "上游繁忙时段单次调用要 20 秒以上，给太小的值会让每次 attempt 必然超时")

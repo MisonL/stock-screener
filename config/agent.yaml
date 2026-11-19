@@ -12,13 +12,17 @@ heartbeat:
     - ["11:00", "11:30"]
     - ["13:00", "13:30"]
 
+# ⚠️ 这两段**目前是死配置**（`core/config.py` 只做校验与默认值，全仓无读取点）。
+# 真正的回合预算写死在 `agent/main.py` 的 `EVENT_ROUNDS_BUDGET/EVENT_DEADLINE_S`
+# 与 `OTHER_ROUNDS_BUDGET/OTHER_DEADLINE_S`，改这里不会有任何效果。
+# 保留键名只是因为它们是必填键（删掉会让既有配置文件加载失败）。
 event:
-  rounds: 3
-  deadline_s: 25
+  rounds: 3            # 未生效
+  deadline_s: 25       # 未生效
 
 heartbeat_turn:
-  rounds: 6
-  deadline_s: 60
+  rounds: 6            # 未生效
+  deadline_s: 60       # 未生效
 
 context:
   max_chars: 6000

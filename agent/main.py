@@ -24,8 +24,17 @@ from core.clock import SH, SystemClock, TradingCalendar
 
 SLEEP_OUT_OF_SESSION_S = 60
 LOOP_EVERY_S = 2
-EVENT_ROUNDS_BUDGET, EVENT_DEADLINE_S = 3, 25
-OTHER_ROUNDS_BUDGET, OTHER_DEADLINE_S = 6, 60
+# **回合级 deadline，不是单次调用超时**（后者见 `config/llm.yaml` 的
+# `timeouts.agent_call_s`）。一条铁律：**deadline ≥ 单次调用超时 × 2**。
+# 一个回合至少要两次 LLM 调用（先决定查什么、拿到工具结果后再出决策），
+# deadline 只够一次调用时，每轮都死在"还没等回来就到点"上。
+# 原来的 25/60 是按单次 20 秒配的（25 < 20×2，本来就不够），
+# 中转站排队超过 20 秒后整个交易日 100% 回合超时。
+#   · 事件回合：2 轮 × 40s = 80s，给 90s
+#   · 心跳/闹钟回合：3 轮 × 40s = 120s，**恰好等于密集期心跳间隔**，
+#     再长会让心跳互相堆积
+EVENT_ROUNDS_BUDGET, EVENT_DEADLINE_S = 3, 90
+OTHER_ROUNDS_BUDGET, OTHER_DEADLINE_S = 6, 120
 ESCALATED_RECYCLE_MIN = 30
 CONFIRM_EXPIRE_H = 24
 OPEN_TURN_AT = (9, 26)

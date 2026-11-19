@@ -767,3 +767,59 @@ async def test_budget_exhausted_does_not_rerun_alarms(tmp_path):
     assert after == before, (
         f"预算耗尽后仍然跑了 {(after - before)} 个空转回合："
         "这正是生产事故里一天 17885 行的来源")
+
+
+async def test_stale_alarms_from_previous_day_are_cancelled(tmp_path):
+    """**跨交易日的 pending 闹钟必须作废**，不能隔天补跑。
+
+    闹钟的语义是"过 N 分钟回来看看这个价位"——价位语境当天有效。隔天补跑
+    昨天没跑成的回访，看到的是新一天的行情、回答的是昨天的问题。
+
+    更糟的是它们会**一次性全部到期**：agent 停摆半天后，积累的十几条闹钟会在
+    同一秒被 `due_alarms()` 全部取出，连跑十几个回合烧光预算，再推一串过时判断
+    给用户。`jobs/cleanup.py` 只处理 3 天前的，救不了"昨天积压、今天开盘"这个
+    最常见的情形。
+
+    现场数据：2026-11-19 收盘时 16 条 pending 闹钟全部过期 2–3 小时，
+    最早那条还是 11-18 排的——次日开盘会同时到期。
+    """
+    from agent.main import AgentMain
+    from agent.schedule import due_alarms, schedule_alarm
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from tests.helpers import SH
+    from datetime import datetime, timedelta
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "stale.db")
+    migrate(conn)
+    today = datetime(2026, 11, 19, 9, 20, tzinfo=SH)
+    clock = FixedClock(today)
+
+    # 昨天排的、今天已过期的一条；今天刚排的一条有效闹钟
+    yesterday = (today - timedelta(days=1)).replace(hour=14, minute=1)
+    schedule_alarm(conn, turn_id=1, due_at=yesterday.isoformat(), market="cn_main",
+                   target="sh600519", note="昨天的回访", now=yesterday)
+    fresh_due = today + timedelta(minutes=30)
+    schedule_alarm(conn, turn_id=2, due_at=fresh_due.isoformat(), market="cn_main",
+                   target="sh600161", note="今天的回访", now=today)
+
+    class _Deps:
+        def __init__(self):
+            self.conn = conn
+            self.cfg = cfg
+            self.clock = clock
+            self.pusher = None
+            self.llm = None
+            self.budget = None
+            self.alert = lambda *a, **k: None
+            self.conn_factory = lambda: conn
+
+    main = AgentMain(_Deps(), clock)
+    main.heartbeat_housekeeping()
+
+    rows = dict(conn.execute("SELECT note, status FROM agent_schedule").fetchall())
+    assert rows["昨天的回访"] == "cancelled", "跨交易日的闹钟没有作废，明天开盘会补跑昨天的判断"
+    assert rows["今天的回访"] == "pending", "今天的闹钟被误杀了"
+    assert [a["note"] for a in due_alarms(conn, today)] == [], "过期闹钟仍会被取出"

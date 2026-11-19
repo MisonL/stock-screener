@@ -281,6 +281,17 @@ class AgentMain:
         cutoff = (now - timedelta(hours=CONFIRM_EXPIRE_H)).isoformat()
         conn.execute("UPDATE agent_turn SET pending_status = 'expired'"
                      " WHERE pending_status = 'pending' AND ts < ?", (cutoff,))
+        # **跨交易日的 pending 闹钟一律作废**。
+        # 闹钟的语义是"过 N 分钟回来看看这个价位"，价位语境当天有效。
+        # 隔天再跑一遍昨天没跑成的回访，看到的是新一天的行情、回答的是昨天的
+        # 问题——而且会**一次性全部到期**：agent 停摆半天后，积累的十几条闹钟
+        # 会在同一秒全部被取出，连跑十几个回合烧光预算，再推一串过时判断给用户。
+        # 清理任务（`jobs/cleanup.py`）只处理 3 天前的，救不了"昨天积压、今天开盘"
+        # 这个最常见的情形，所以在这里按交易日收口。
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        conn.execute("UPDATE agent_schedule SET status = 'cancelled'"
+                     " WHERE status = 'pending' AND due_at < ?",
+                     (midnight.isoformat(),))
         conn.commit()
 
     def close_sweep(self):

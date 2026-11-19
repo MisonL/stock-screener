@@ -24,11 +24,16 @@ STALE_S = 120                  # 心跳超过这么久没更新 → 判死
 CHECK_EVERY_S = 30             # 与 api/main.py 的调度周期一致
 REPEAT_S = 1800                # 同类告警 30 分钟内不重复
 AGENT_TURN_STALE_S = 15 * 60   # agent_turn 超过 15 分钟没有新行 → 调度卡死（规则 3）
-#: 回合数暴增的判据：一小时内超过这么多个回合就报（规则 5）。
-#: 正常日全天 78–131 个回合（实测 11-10 至 11-18），一小时 ~20 个；
-#: 事故日 14:00 起**每分钟 300 个**、全天 17998 个。50 是"绝对不正常"的低水位，
-#: 不会对任何一个正常日误报。
-AGENT_TURN_CHURN_PER_HOUR = 50
+#: 回合数暴增的判据：滚动一小时内超过这么多个回合就报（规则 5）。
+#:
+#: 实测数据（生产库 11-10 至 11-18 六个正常交易日）：
+#:   全天 78–131 个，逐小时峰值 27–48 个，**滚动一小时内最大值 50 个**（11-18 午后）。
+#:   事故日 11-19：14:05 起每分钟约 300 个，全天 17998 个。
+#:
+#: 所以阈值必须**明显高于 50**——第一版写 50 时，正常日 11-18 的午后就会误报
+#: （实测滚动窗口正好 50）。取 200：正常峰值的 4 倍，事故量的 1/90，
+#: 中间有两个数量级的空隙，怎么抖都掉不到一起。
+AGENT_TURN_CHURN_PER_HOUR = 200
 
 
 def in_watch_window(now: datetime) -> bool:
@@ -102,12 +107,18 @@ def check(conn, clock, dispatcher, *, cfg=None, agent_turn_stale_min: int | None
     # 从"连续失败"升级成"疯狂失败"没有任何人察觉）。
     #
     # 这类故障的特征是**量级异常**，所以判据也必须是量级。
+    # **必须有上界 `ts <= now`**：没有它就不是"滚动一小时"，而是"这一小时之后的所有
+    # 行"。实时运行时 `now` 就是当下，看不出区别；但只要 `now` 是注入的
+    # （回放/干跑/测试用 `FixedClock`），统计量就会把"未来"算进来——实测干跑
+    # 11-18 14:30 得到 18066，而正确的窗口值是 45。这种错在线上永远不触发，
+    # 却会让所有离线排查得出相反结论。
+    window_start = (now - timedelta(hours=1)).isoformat()
     recent = conn.execute(
-        "SELECT count(*) FROM agent_turn WHERE ts > ?",
-        ((now - timedelta(hours=1)).isoformat(),)).fetchone()[0]
+        "SELECT count(*) FROM agent_turn WHERE ts > ? AND ts <= ?",
+        (window_start, now.isoformat())).fetchone()[0]
     if recent > AGENT_TURN_CHURN_PER_HOUR and not _budget_exhausted(conn):
         if _alert(conn, clock, dispatcher, "agent_churn",
-                  f"一小时内 {recent} 个回合（正常约 20），疑似空转死循环", now):
+                  f"最近一小时内 {recent} 个回合（正常日峰值约 50），疑似空转死循环", now):
             fired.append("agent_churn")
 
     # 心跳本身断了就只判心跳：心跳陈旧时 `loop_last_tick_at` 必然也旧，

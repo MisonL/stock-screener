@@ -291,44 +291,56 @@ def test_turn_churn_detects_runaway_loop(conn):
         升级成"疯狂失败"在数量上没有任何阈值
       · `jobs_down` —— jobs 完全正常
 
-    这里造 60 个一分钟内的回合（正常一小时约 20 个），断言 `agent_churn` 触发。
-    """
-    from datetime import timedelta
+    这里复刻事故量级（每分钟数条），断言 `agent_churn` 触发。
+   """
+    from api.watchdog import AGENT_TURN_CHURN_PER_HOUR
 
     clock = FixedClock(datetime(2026, 10, 30, 10, 0, tzinfo=SH))
     now = clock.now()
-    for i in range(60):
+    n = AGENT_TURN_CHURN_PER_HOUR + 50
+    # 均匀铺在最近 50 分钟内（铺满 1 小时的话最早几条会滑出窗口）
+    step = 3000 / n
+    for i in range(n):
         conn.execute(
             "INSERT INTO agent_turn(ts, wake_kind, context_digest, rounds, decision,"
             " fallback, market) VALUES (?,?,?,?,?,?,?)",
-            ((now - timedelta(seconds=i * 30)).isoformat(), "alarm", "空转", 0,
+            ((now - timedelta(seconds=i * step)).isoformat(), "alarm", "空转", 0,
              "error", 0, "cn_main"))
     conn.commit()
 
     fired, _disp = run(conn, clock)
     assert "agent_churn" in fired, (
-        f"一小时内 60 个回合没有报警（正常约 20 个）：{fired}")
+        f"一小时内 {n} 个回合没有报警（阈值 {AGENT_TURN_CHURN_PER_HOUR}）：{fired}")
 
 
 def test_normal_turn_volume_does_not_alarm(conn):
     """**正常日的回合量不能报**——误报会把真故障淹掉。
 
-    实测正常日全天 78–131 个回合，一小时约 20 个。
+    数值必须来自生产实测，不能拍脑袋。第一次把阈值写成 50 时，对着
+    "正常日 11-18 午后滚动一小时正好 50 个回合"就会误报——那是最拥挤的正常日。
+    这里复刻实测的最忙一小时（50 个），并额外覆盖"窗口之外的行不能算进来"：
+    SQL 少了 `ts <= now` 上界时，回放过去某个时刻会把之后发生的所有行都算成
+    "最近一小时"（实测干跑 11-18 14:30 得到 18066，正确值是 45）。
     """
-    from datetime import timedelta
-
-    clock = FixedClock(datetime(2026, 10, 30, 10, 0, tzinfo=SH))
+    clock = FixedClock(datetime(2026, 10, 30, 14, 30, tzinfo=SH))
     now = clock.now()
-    for i in range(20):
+    for i in range(50):                     # 正常日最忙一小时
         conn.execute(
             "INSERT INTO agent_turn(ts, wake_kind, context_digest, rounds, decision,"
             " fallback, market) VALUES (?,?,?,?,?,?,?)",
-            ((now - timedelta(minutes=i * 3)).isoformat(), "alarm", "正常", 2,
+            ((now - timedelta(seconds=i * 60)).isoformat(), "alarm", "正常", 2,
+             "silent", 0, "cn_main"))
+    for i in range(500):                    # 窗口之外（未来）：没有上界就会被算进来
+        conn.execute(
+            "INSERT INTO agent_turn(ts, wake_kind, context_digest, rounds, decision,"
+            " fallback, market) VALUES (?,?,?,?,?,?,?)",
+            ((now + timedelta(minutes=10 + i)).isoformat(), "alarm", "未来", 2,
              "silent", 0, "cn_main"))
     conn.commit()
 
     fired, _disp = run(conn, clock)
-    assert "agent_churn" not in fired, f"正常回合量被误报为空转：{fired}"
+    assert "agent_churn" not in fired, (
+        f"正常回合量被误报为空转：{fired}（可能把窗口之外的行也算进来了）")
 
 
 def test_every_watchdog_kind_has_a_human_title():

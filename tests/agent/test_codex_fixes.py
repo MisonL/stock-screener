@@ -1371,3 +1371,48 @@ async def test_timeout_turn_releases_the_alarm(tmp_path):
     assert attempts == 1
     later = now + timedelta(seconds=61)
     assert [a["id"] for a in due_alarms(conn, later)] == [alarm["id"]]
+
+
+async def test_next_day_alarm_survives_the_sweep(tmp_path):
+    """**盘后排的"次日回访"不能被作废**——它是最常见的一种合法闹钟。
+
+    15:10 收盘后模型说"明天开盘再看"，`due_at` 是**次日**。按日期判据
+    `substr(due_at,1,10) < 今天` 而今天还是"排闹钟那天"，所以次日回访
+    自然保留。这条测试把那层保护钉住：如果有人把判据改成
+    `due_at < 今天零点` 之外的东西（比如"只留今天到期的"），立刻会红。
+
+    生产核查：库里 `due_at` 全部是 ISO 文本（`typeof='text'`，长度 ≥ 25，
+    格式异常 0 条），`substr(due_at,1,10)` 稳定取到日期。
+    """
+    from agent.main import AgentMain
+    from agent.schedule import schedule_alarm
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from tests.helpers import SH
+    from datetime import datetime
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "next.db")
+    migrate(conn)
+    after_close = datetime(2026, 11, 19, 15, 10, tzinfo=SH)
+
+    tomorrow_0900 = datetime(2026, 11, 20, 9, 20, tzinfo=SH)
+    schedule_alarm(conn, turn_id=1, due_at=tomorrow_0900.isoformat(), market="cn_main",
+                   target="sh600519", note="明天开盘看", now=after_close)
+    # 一条真正该走的陈货做对照
+    old = datetime(2026, 11, 18, 14, 1, tzinfo=SH)
+    schedule_alarm(conn, turn_id=2, due_at=old.isoformat(), market="cn_main",
+                   target="sh600161", note="前天的陈货", now=old)
+
+    class _Deps:
+        def __init__(self):
+            self.conn = conn
+            self.cfg = cfg
+            self.clock = FixedClock(after_close)
+
+    cancelled = AgentMain(_Deps(), FixedClock(after_close)).sweep_stale_alarms(after_close)
+    rows = dict(conn.execute("SELECT note, status FROM agent_schedule").fetchall())
+    assert rows["明天开盘看"] == "pending", "次日回访被误杀了——这是最常见的合法闹钟"
+    assert rows["前天的陈货"] == "cancelled"
+    assert cancelled == 1

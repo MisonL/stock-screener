@@ -1014,3 +1014,82 @@ async def test_housekeeping_actually_persists(tmp_path):
     pending = fresh.execute("SELECT pending_status FROM agent_turn").fetchone()[0]
     assert status == "pending_retry", f"escalated 事件没被回收（状态 {status}）：housekeeping 少了 commit"
     assert pending == "expired", f"确认卡没被标记过期（状态 {pending}）：housekeeping 少了 commit"
+
+
+async def test_event_retry_terminates_via_gave_up(tmp_path):
+    """**事件重试路径的死循环防线是 `gave_up` 两振出局，不是心跳节奏。**
+
+    闹钟死循环的根因是「失败→退回→立刻又到期」没有任何终止条件。
+    事件路径不一样：`journal.record` 记住第一次失败（`new → pending_retry`），
+    第二次再失败就转 `gave_up`，从此不再被取出。
+
+    这条测试钉住的是**那个终止条件**。第一版把它写成"事件重试只在心跳分支里跑"，
+    结果把 `_pending_retry()` 挪到心跳分支外，测试照样绿——因为真正拦住循环的是
+    `gave_up`，迁移心跳位置并不会让循环失控。测错了防线就是假绿。
+
+    所以这里直接断言：不管跑多少轮，事件最终都落到 `gave_up`，且回合总数有上界。
+    """
+    from agent.context import Rendered
+    from agent.loop import Deps
+    from agent.main import AgentMain
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from llm.budget import Budget
+    from llm.tools import ToolRegistry
+    from tests.helpers import SH
+    from datetime import datetime, timedelta
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "ev.db")
+    migrate(conn)
+    now = datetime(2026, 11, 19, 10, 30, tzinfo=SH)
+    clock = FixedClock(now)
+    for i in range(10):
+        conn.execute(
+            "INSERT INTO event_log(ts, trade_date, market, kind, scope, target, payload,"
+            " salience, escalated, agent_status, dedupe_key)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (now.isoformat(), "20261119", "cn_main", "price", "target", "sh600519",
+             '{"kind":"price"}', 3.0, 0, "new", f"k{i}"))
+    conn.commit()
+
+    class _BoomLlm:
+        async def chat(self, *a, **k):
+            raise RuntimeError("LLM 挂了")
+
+    deps = Deps(conn=conn, cfg=cfg, clock=clock, llm=_BoomLlm(),
+                budget=Budget(conn, "agent", cfg.llm.budget.agent),
+                tools=ToolRegistry(conn, cfg, clock, mcp=None),
+                render=lambda t: Rendered("…", 1, False, {}),
+                pusher=None, memory=None, westock=None)
+    deps.conn_factory = lambda: conn
+    deps.alert = lambda *a, **k: None
+
+    main = AgentMain(deps, clock)
+    main.budget_exhausted = True                 # 与事故当天同状态
+
+    # 逼着心跳每轮都到期，让事件重试路径**每轮都真的跑一次**
+    counts = []
+    for _ in range(8):
+        before = conn.execute("SELECT count(*) FROM agent_turn").fetchone()[0]
+        main.next_heartbeat_at = main.clock.now()      # 心跳立即到期
+        await main._once()
+        after = conn.execute("SELECT count(*) FROM agent_turn").fetchone()[0]
+        counts.append(after - before)
+
+    statuses = dict(conn.execute(
+        "SELECT agent_status, count(*) FROM event_log GROUP BY agent_status"))
+    assert statuses == {"gave_up": 10}, (
+        f"事件没有收敛到 gave_up（{statuses}）："
+        "两振出局的终止条件失效了，这就是闹钟死循环的同一形状")
+
+    # **必须有上界**：10 条事件最多 2 振 = 20 个回合，不能随轮数线性增长。
+    # 每轮那个固定的 +1 是心跳自己的回合（`trigger_id IS NULL`），不是事件重试。
+    assert sum(counts) <= 30, (
+        f"8 轮共写了 {sum(counts)} 个回合，事件重试没有终止：{counts}")
+    # 最后一轮只该有心跳回合，不该再有带事件的重试回合
+    last = conn.execute(
+        "SELECT trigger_id FROM agent_turn ORDER BY id DESC LIMIT 1").fetchone()[0]
+    assert last is None, (
+        f"最后一轮仍有事件重试回合（trigger_id={last}）：循环没有收敛，counts={counts}")

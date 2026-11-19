@@ -1,5 +1,28 @@
 ## [Unreleased]
 
+### 修复
+
+- **补齐"每条每 2 秒重跑的路径"的核实**，并把事件重试的防线测对。
+
+  排查了 `_once()` 里所有可能被反复执行的路径：
+
+  | 路径 | 终止条件 | 结论 |
+  |---|---|---|
+  | 闹钟 `due_alarms()` | 之前**没有**终止条件 | 事故来源，已修（退避+次数上限+跨日作废） |
+  | 事件 `_pending_retry()` | `journal.record` 两振出局 → `gave_up` | 安全 |
+  | 开盘回合 `_open_turn_done()` | 当日有 `open` 行即不再跑 | 安全 |
+  | `close_sweep()` | `_close_done()` 落 `job_state` | 安全 |
+
+  实测：预算耗尽下连跑 5 轮，开盘回合只在第 1 轮执行、之后 4 轮均 0 行；
+  `close_sweep` 4 次均 0 行；事件路径 10 条事件最多 20 个回合后全部 `gave_up`。
+
+  **同时修掉一条自己写错的测试**：第一版叫
+  `test_event_retry_path_is_bounded_by_heartbeat`，断言"事件重试只在心跳分支里跑"。
+  把 `_pending_retry()` 挪到心跳分支外之后测试照样绿——因为真正拦住循环的是
+  `gave_up`，不是心跳节奏。**测错了防线就是假绿**。改成
+  `test_event_retry_terminates_via_gave_up`，直接断言收敛到 `gave_up`
+  且回合数有上界；去掉 `gave_up` 分支立刻转红。
+
 ## [0.2.88] - 2026-11-20
 
 ### 修复

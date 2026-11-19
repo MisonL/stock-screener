@@ -826,9 +826,134 @@ async def test_stale_alarms_from_previous_day_are_cancelled(tmp_path):
             self.conn_factory = lambda: conn
 
     main = AgentMain(_Deps(), clock)
-    main.heartbeat_housekeeping()
+    # 作废不再挂在 `heartbeat_housekeeping()` 上：那个方法只在心跳到期时跑，
+    # 进程启动头一两分钟不会执行，昨天的闹钟会先开跑（已用真实路径复现）。
+    main.sweep_stale_alarms(clock.now())
 
     rows = dict(conn.execute("SELECT note, status FROM agent_schedule").fetchall())
     assert rows["昨天的回访"] == "cancelled", "跨交易日的闹钟没有作废，明天开盘会补跑昨天的判断"
     assert rows["今天的回访"] == "pending", "今天的闹钟被误杀了"
     assert [a["note"] for a in due_alarms(conn, today)] == [], "过期闹钟仍会被取出"
+
+
+async def test_stale_alarms_are_cancelled_before_the_alarm_loop(tmp_path):
+    """**顺序很关键**：跨日作废必须发生在闹钟循环之前。
+
+    `heartbeat_housekeeping()` 在心跳分支里跑，而闹钟循环在它之后——这个顺序是
+    "昨天积压的十几条不会在开盘第一秒全部开跑"的唯一保证。把作废挪到闹钟循环
+    之后，两条独立测试（作废测试 + 预算跳过测试）各自都还是绿的，只有这条会红。
+
+    **必须让心跳回合真的成功**（用真实 `Budget` + 假 LLM）：心跳若因预算不足
+    提前返回，会顺手把 `budget_exhausted` 置真，于是闹钟循环本来就被跳过——
+    那样无论顺序对不对都看不到差异，测试就成了假绿。
+    """
+    from agent.context import Rendered
+    from agent.loop import Deps
+    from agent.main import AgentMain
+    from agent.schedule import schedule_alarm
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from llm.budget import Budget
+    from llm.tools import ToolRegistry
+    from tests.agent.test_loop import FakeLlm
+    from tests.agent.test_shadow_and_drill import FakeNtfy, _silent
+    from agent.push import AgentPusher
+    from tests.helpers import SH
+    from datetime import datetime, timedelta
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "order.db")
+    migrate(conn)
+    open_day = datetime(2026, 11, 20, 9, 15, tzinfo=SH)   # 次日开盘前第一次心跳
+    clock = FixedClock(open_day)
+
+    # 昨天积累的两条过期闹钟
+    for i, note in enumerate(("昨 1", "昨 2")):
+        due = (open_day - timedelta(days=1)).replace(hour=14, minute=i)
+        schedule_alarm(conn, turn_id=1, due_at=due.isoformat(), market="cn_main",
+                       target="sh600519", note=note, now=due)
+
+    llm = FakeLlm([_silent("盘前无变化"), _silent("回访完成")])
+    deps = Deps(conn=conn, cfg=cfg, clock=clock, llm=llm,
+                budget=Budget(conn, "agent", cfg.llm.budget.agent),
+                tools=ToolRegistry(conn, cfg, clock, mcp=None),
+                render=lambda t: Rendered("…", 1, False, {}),
+                pusher=AgentPusher(conn, FakeNtfy(), cfg, clock),
+                memory=None, westock=None)
+    deps.conn_factory = lambda: conn
+    deps.alert = lambda *a, **k: None
+
+    main = AgentMain(deps, clock)
+    # **不要手动设 `next_heartbeat_at`**：真实初始化留的是 None，`_once()` 会把它
+    # 设成 `next_heartbeat(now)`——09:15 时给的是 09:17，于是这一轮心跳**不到期**。
+    # 早期版本这条测试手动设成 `open_day` 让心跳立刻到期，反而掩盖了真实缺陷：
+    # 把作废逻辑放进 `heartbeat_housekeeping()` 时测试照样绿，而生产会在启动后
+    # 的头 2 分钟里让昨天的闹钟开跑（已用真实路径复现）。
+    main._last_day = clock.today()
+
+    await main._once()
+
+    assert main.budget_exhausted is False, "前提不成立：心跳因预算不足提前返回了"
+    assert conn.execute(
+        "SELECT count(*) FROM agent_turn WHERE wake_kind = 'alarm'").fetchone()[0] == 0, (
+        "昨天的闹钟在开盘第一时间就跑起来了：作废与闹钟循环的顺序不对")
+    statuses = [r[0] for r in conn.execute("SELECT status FROM agent_schedule")]
+    assert statuses == ["cancelled", "cancelled"], f"过期闹钟没有作废：{statuses}"
+
+
+async def test_same_day_overdue_alarms_are_cancelled_after_an_hour(tmp_path):
+    """**同日但过期太久的闹钟也要作废**，不能等跨日。
+
+    只按"跨交易日"作废会漏掉一个很常见的场景：当天宕机/重启两小时，
+    恢复时十条 09:30 的闹钟同时到期，连跑十个回合烧光预算。
+    更根本的是语义——闹钟都是"过 N 分钟回来看看"，拖一小时以上看到的
+    已经是另一段行情，照着它下的结论会误导用户。
+
+    边界要双向卡住：1 小时内的迟到照常跑（那是正常的网络/排队抖动），
+    超过 1 小时才作废。
+    """
+    from agent.context import Rendered
+    from agent.loop import Deps
+    from agent.main import ALARM_MAX_STALE_S, AgentMain
+    from agent.schedule import schedule_alarm
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from llm.budget import Budget
+    from llm.tools import ToolRegistry
+    from tests.helpers import SH
+    from datetime import datetime, timedelta
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "sameday.db")
+    migrate(conn)
+    now = datetime(2026, 11, 19, 11, 0, tzinfo=SH)      # 当天 11:00 恢复
+    clock = FixedClock(now)
+
+    late_ok = now - timedelta(seconds=ALARM_MAX_STALE_S // 2)     # 迟到 30 分钟：正常
+    too_late = now - timedelta(seconds=ALARM_MAX_STALE_S + 60)    # 迟到 61 分钟：作废
+    for due, note in ((late_ok, "迟到半小时"), (too_late, "迟到一小时")):
+        schedule_alarm(conn, turn_id=1, due_at=due.isoformat(), market="cn_main",
+                       target="sh600519", note=note, now=due)
+
+    class _Llm:
+        async def chat(self, *a, **k):
+            return SimpleNamespace(content="", tool_calls=[], attempts=1, usage=None)
+
+    deps = Deps(conn=conn, cfg=cfg, clock=clock, llm=_Llm(),
+                budget=Budget(conn, "agent", cfg.llm.budget.agent),
+                tools=ToolRegistry(conn, cfg, clock, mcp=None),
+                render=lambda t: Rendered("…", 1, False, {}),
+                pusher=None, memory=None, westock=None)
+    deps.conn_factory = lambda: conn
+    deps.alert = lambda *a, **k: None
+
+    main = AgentMain(deps, clock)
+    cancelled = main.sweep_stale_alarms(now)
+
+    rows = dict(conn.execute("SELECT note, status FROM agent_schedule").fetchall())
+    assert rows["迟到一小时"] == "cancelled", (
+        "同日过期超过 1 小时的闹钟没作废：恢复后会一次性全部开跑")
+    assert rows["迟到半小时"] == "pending", "正常的迟到被误杀了"
+    assert cancelled == 1, f"作废条数应当是 1，实际 {cancelled}"

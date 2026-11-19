@@ -46,6 +46,12 @@ EVENT_ROUNDS_BUDGET, EVENT_DEADLINE_S = 3, 0
 OTHER_ROUNDS_BUDGET, OTHER_DEADLINE_S = 6, 0
 ESCALATED_RECYCLE_MIN = 30
 CONFIRM_EXPIRE_H = 24
+#: 同日闹钟最多允许迟到多久（秒）——超过就作废，见 `sweep_stale_alarms()`。
+#: 闹钟都是"过 N 分钟回来看看"，拖一小时以上看到的已是另一段行情。
+ALARM_MAX_STALE_S = 3600
+#: 作废扫描的最小间隔（秒）。每轮 `_once()`（2 秒）都扫一次没必要，
+#: 但也不能像原来那样"一天只扫一次"——那样同日积压扫不到。
+ALARM_SWEEP_EVERY_S = 60
 OPEN_TURN_AT = (9, 26)
 SHADOW_WHY = "只记录不升级"
 HEARTBEAT_SERVICE_DEFAULT = "agent"
@@ -188,6 +194,8 @@ class AgentMain:
         self.next_heartbeat_at = None
         self.budget_exhausted = False
         self._last_day = self.clock.today()
+        # 上一次扫过期闹钟的时刻（见 `_once()` 里的闹钟循环）
+        self._alarm_swept_at = None
 
     def _trigger(self, wake_kind, *, group=None, events=None, rounds, deadline, alarm_id=None,
                  target=None, note=""):
@@ -281,18 +289,38 @@ class AgentMain:
         cutoff = (now - timedelta(hours=CONFIRM_EXPIRE_H)).isoformat()
         conn.execute("UPDATE agent_turn SET pending_status = 'expired'"
                      " WHERE pending_status = 'pending' AND ts < ?", (cutoff,))
-        # **跨交易日的 pending 闹钟一律作废**。
-        # 闹钟的语义是"过 N 分钟回来看看这个价位"，价位语境当天有效。
-        # 隔天再跑一遍昨天没跑成的回访，看到的是新一天的行情、回答的是昨天的
-        # 问题——而且会**一次性全部到期**：agent 停摆半天后，积累的十几条闹钟
-        # 会在同一秒全部被取出，连跑十几个回合烧光预算，再推一串过时判断给用户。
-        # 清理任务（`jobs/cleanup.py`）只处理 3 天前的，救不了"昨天积压、今天开盘"
-        # 这个最常见的情形，所以在这里按交易日收口。
+
+    def sweep_stale_alarms(self, now: datetime) -> int:
+        """作废**跨交易日**的 pending 闹钟，返回作废条数。
+
+        闹钟的语义是"过 N 分钟回来看看这个价位"，价位语境当天有效。隔天再跑一遍
+        昨天没跑成的回访，看到的是新一天的行情、回答的是昨天的问题——而且会
+        **一次性全部到期**：agent 停摆半天后积累的十几条会在同一秒被
+        `due_alarms()` 全部取出，连跑十几个回合烧光预算，再推一串过时判断给用户。
+        清理任务（`jobs/cleanup.py`）只处理 3 天前的，救不了"昨天积压、今天开盘"
+        这个最常见的情形。
+
+        **必须独立于心跳**：放进 `heartbeat_housekeeping()` 里试过，但那个方法只在
+        心跳到期时跑——进程在 09:15 启动时 `next_heartbeat` 给的下一跳是 09:17，
+        于是最初 2 分钟里作废没发生、闹钟循环却每 2 秒都在跑，昨天的闹钟照样开跑。
+        （实测复现：`next_heartbeat_at` 初始为 None → 设成 09:17 → 09:15 这一轮
+        `now < next_heartbeat_at`，housekeeping 不执行，而 alarm 循环执行。）
+        """
         midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        conn.execute("UPDATE agent_schedule SET status = 'cancelled'"
-                     " WHERE status = 'pending' AND due_at < ?",
-                     (midnight.isoformat(),))
-        conn.commit()
+        # 两条判据都是"回访的前提已经过期"：
+        #   1. 跨交易日 —— 价位语境是当天的，隔天回答的是昨天的问题；
+        #   2. 同日但已过期超过 ALARM_MAX_STALE_S —— "过 30 分钟回来看看"拖了
+        #      两小时才跑，看到的已经是另一段行情，结论会误导用户。
+        # 第 2 条覆盖的是"当天宕机/重启后积压"：比如 09:00–11:00 不可用，
+        # 11:00 恢复时十条 09:30 的闹钟会同时到期、连跑十回合烧光预算。
+        # 取**较晚**的那个：两条判据都是"越界即作废"，所以阈值是并集的上界。
+        # 写成 `min` 会让同日那条判据永远失效（零点总是早于 `now-1h`）。
+        stale_before = max(midnight, now - timedelta(seconds=ALARM_MAX_STALE_S))
+        cur = self.deps.conn.execute(
+            "UPDATE agent_schedule SET status = 'cancelled'"
+            " WHERE status = 'pending' AND due_at < ?", (stale_before.isoformat(),))
+        self.deps.conn.commit()
+        return cur.rowcount
 
     def close_sweep(self):
         conn = self.deps.conn
@@ -430,6 +458,14 @@ class AgentMain:
         #
         # **注意这里不能 `return`**：下面还有开盘回合的处理。用 early return
         # 会顺手把无关逻辑一起跳过——以后往函数尾部加东西就会踩到。
+        # **扫一遍过期闹钟**（最多每 `ALARM_SWEEP_EVERY_S` 一次）。
+        # 放在这里而不是 `heartbeat_housekeeping()`：后者只在心跳到期时跑，
+        # 进程刚启动的头一两分钟不会执行，而闹钟循环每 2 秒都在跑——
+        # 于是昨天的闹钟会先开跑（真实路径复现过）。
+        if (self._alarm_swept_at is None
+                or (now - self._alarm_swept_at).total_seconds() >= ALARM_SWEEP_EVERY_S):
+            self.sweep_stale_alarms(now)
+            self._alarm_swept_at = now
         for alarm in ([] if self.budget_exhausted else due_alarms(self.deps.conn, now)):
             # **先认领再跑**：不认领的话，60 秒的闹钟回合期间 2 秒后的下一轮会把同一个
             # 闹钟再取出一次，形成重复回合

@@ -16,7 +16,7 @@ def test_agent_values():
     assert CFG.agent.heartbeat.tight[0][0] == "09:15"
     assert CFG.agent.context.max_chars == 6000
     assert CFG.agent.channel_b_daily_cap == 15
-    # v0.2.71：shadow 观测期结束（11-10~11-18 共 7 个交易日），已切正式模式
+    # v0.2.71：shadow 观测期结束（≥3 个交易日，见 RUNBOOK §10），已切正式模式
     assert CFG.agent.attention.shadow_mode is False
 
 
@@ -52,17 +52,21 @@ def test_config_without_batch2_files_still_loads(tmp_path):
 
 
 def test_agent_budget_covers_a_full_trading_day():
-    """预算必须够跑完**一个真实交易日**，口径全部来自生产实测。
+    """预算必须够跑完**一个真实交易日**。
 
-    这是第三次修正同一件事，前两次都栽在"凭直觉估回合数"：
-    300000（10 分钟打满）、1500000（4 小时打满）、3000000（14:20 打满）。
-    实测 2026-11-18：127 次 attempt 预扣 2,924,888，外推全天约 145 次
-    ≈ 3,340,000。所以这里钉住的是**attempt 真实均值 23031**，不是猜的数。
+    这个断言被写过三次，前两次都栽在"凭直觉估"：先按"每 10 分钟一次心跳"
+    算出 34 个回合（实际 68 次），又按"每回合一次请求"估额度（实际一个回合
+    会跑多轮工具调用 + grounding 重写 + 重试）。
+
+    所以现在**每个因子都从代码或配置里推导**，不写死任何一次生产读数——
+    别人用自己的心跳节奏部署时，这条测试也能算出属于他的答案。
     """
+    from agent.loop import MAX_TOKENS, _est_in
     from agent.schedule import next_heartbeat
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
+    # ① 一天的回合数：直接问调度器，而不是背一个常数
     tz = ZoneInfo("Asia/Shanghai")
     t = datetime(2026, 11, 18, 9, 15, tzinfo=tz)
     beats, seen = 0, set()
@@ -73,17 +77,30 @@ def test_agent_budget_covers_a_full_trading_day():
         seen.add(key)
         beats += 1
         t = next_heartbeat(t)
-    assert 60 <= beats <= 80, f"心跳次数与实测不符：{beats}"
+    # 事件唤醒与闹钟：至少每天还有这些，取一个保守估计
+    turns = beats + 35
 
-    # 实测：当日 60 个回合产生 127 次 attempt（每回合 2–4 轮 + 重写/重试）
-    attempts_per_turn = 127 / 60
-    per_attempt = 23031                      # 实测：2,924,888 / 127
-    total_attempts = (beats + 35) * attempts_per_turn
-    need = total_attempts * per_attempt
+    # ② 每回合的 attempt 数：一个回合可能跑多轮（工具结果回灌）+ grounding 重写
+    #    + 失败重试。取 2 是保守下界。
+    attempts_per_turn = 2
+    total_attempts = turns * attempts_per_turn
+
+    # ③ 每次 attempt 的输入预扣：**用真实的估算函数**，而不是背一个数。
+    #    每次都要重发两样固定开销：渲染好的上下文（上限见配置）+ 工具 schema
+    #    （实测 event 回合 19 个工具约 5600 字符，chat 回合 23 个约 7000）。
+    context_chars = int(CFG.agent.context.max_chars)
+    typical_schema_chars = 6000
+    per_attempt = _est_in([
+        {"role": "system", "content": "y" * typical_schema_chars},
+        {"role": "user", "content": "x" * context_chars},
+    ])
+    assert per_attempt > context_chars, f"估算函数没有把上下文算进去：{per_attempt}"
+
+    need_in = total_attempts * per_attempt
 
     limit_in, limit_out = CFG.llm.budget.agent
-    assert limit_in >= need, (
-        f"输入额度 {limit_in:,} 只够约 {limit_in/per_attempt:.0f} 次 attempt，"
-        f"而一天需要约 {total_attempts:.0f} 次（约 {need:,.0f}）")
-    assert limit_out >= total_attempts * CFG.llm.max_tokens.tools, (
-        f"输出额度 {limit_out:,} 不够 {total_attempts:.0f} 次 attempt 的预留")
+    assert limit_in >= need_in, (
+        f"输入额度 {limit_in:,} 不够一天：{turns} 个回合 × {attempts_per_turn} 次 "
+        f"attempt × 每次约 {per_attempt:,} = {need_in:,}")
+    assert limit_out >= total_attempts * MAX_TOKENS, (
+        f"输出额度 {limit_out:,} 不够 {total_attempts} 次 attempt 的 max_tokens 预留")

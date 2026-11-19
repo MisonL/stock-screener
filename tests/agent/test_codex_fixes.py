@@ -310,8 +310,9 @@ def test_alarm_context_reaches_the_model_messages():
 def test_budget_exhaustion_mid_turn_is_recorded_as_error_not_timeout():
     """轮次**中途**预算耗尽要记 `error`，不能记 `timeout`。
 
-    实测 2026-11-18 上午 11 条 timeout 里有 10 条其实是预算耗尽，真实超时率
-    被虚报成 51%（实际约 5%）。入口层的预检一直记 error，这里必须一致。
+    实测某天上午 11 条 timeout 里有 10 条其实是预算耗尽（耗时 0–5 秒，
+    根本没等），真实超时率被虚报成 51%（实际约 5%）。
+    入口层的预检一直记 error，这里必须一致。
 
     真跑 `run_turn`：让预算在首轮之后耗尽（allow 第一次 True、之后 False），
     断言产出的 decision 是 error 而不是 timeout。

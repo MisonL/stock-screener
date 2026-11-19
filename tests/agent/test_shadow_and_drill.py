@@ -209,7 +209,7 @@ def test_shadow_flag_defaults_to_true_when_key_missing():
 def test_production_config_records_the_current_stage():
     """把当前部署阶段钉住，改配置时要有意识地同步这里。
 
-    v0.2.71 已过 shadow 观测期（11-10~11-18 共 7 个交易日）切到正式模式。
+    v0.2.71 已过 shadow 观测期（≥3 个交易日，见 RUNBOOK §10）切到正式模式。
     **要退回 shadow，必须同时改 `config/agent.yaml` 和这里**——否则
     "yaml 改了但容器没重建"这类事故会在正式模式下悄悄发生。
     """

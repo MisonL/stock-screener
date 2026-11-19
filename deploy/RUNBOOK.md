@@ -542,9 +542,10 @@ shadow 期 `poll()` 只写 `agent_turn(decision='shadow')`、不调用 LLM、不
 | B：agent 主动开口（心跳/计划/事件唤醒后的发言） | 被拦下，只记 `decision='shadow'` |
 | C：运维告警（自检失败、磁盘、断流） | **照常推送**，与 shadow 无关 |
 
-实测 2026-11-12（shadow 第 2 天）：`push_log` 有 11 条 `accepted`、`llm_budget` 0 行、
-所有回合 `tokens_in/out` 均为 NULL。看到有推送不代表 shadow 没生效——
-判断依据是**回合表的 `decision` 全为 `shadow`、且零 LLM 花费**。
+看几个数就能确认 shadow 真的生效：`push_log` 有 `accepted` 行（通道 A 照常）、
+`llm_budget` **零行**、所有回合的 `tokens_in/out` 均为 **NULL**。
+看到有推送不代表 shadow 没生效——判断依据是**回合表的 `decision` 全为 `shadow`、
+且零 LLM 花费**。
 
 **标定口径**：让通道 B 被 `suppressed` 的比例落在 **20–40%**。按直方图调
 `config/strategy.yaml` 的 `attention.salience_min` 与 `attention.base`，**不改代码**。

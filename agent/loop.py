@@ -270,8 +270,8 @@ async def run_turn(trigger: Trigger, deps: Deps, rendered: Rendered,
             # 「一轮收场」占比虚高到 1.0。
             # **必须记 `error` 而不是 `timeout`**：预算耗尽不是"慢"，
             # 它是配置/额度问题。记成 timeout 会让「回合超时率」这个告警口径
-            # 失真——实测 2026-11-18 上午 11 条 timeout 里有 10 条其实是预算耗尽，
-            # 真实超时率被虚报成 51%（实际约 5%）。
+            # 失真——实测某天上午 11 条 timeout 里有 10 条其实是预算耗尽
+            # （耗时 0–5 秒，根本没等），真实超时率被虚报成 51%（实际约 5%）。
             # 入口层（`run_with_deadline` 前面的预检）一直记的是 `error`，
             # 这里跟它统一。
             return _result(TurnDecision.error("agent 日预算已用完"), rounds, tool_calls,

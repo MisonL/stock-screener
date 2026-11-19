@@ -427,9 +427,10 @@ class AgentMain:
         # 立刻返回 error（rounds=0、0 毫秒），既不调模型也不产生任何价值，
         # 只会在 `agent_turn` 里留下成千上万行空转记录。
         # 跳过而不是 cancel：闹钟本身是有效的，只是今天没法跑。
-        if self.budget_exhausted:
-            return
-        for alarm in due_alarms(self.deps.conn, now):
+        #
+        # **注意这里不能 `return`**：下面还有开盘回合的处理。用 early return
+        # 会顺手把无关逻辑一起跳过——以后往函数尾部加东西就会踩到。
+        for alarm in ([] if self.budget_exhausted else due_alarms(self.deps.conn, now)):
             # **先认领再跑**：不认领的话，60 秒的闹钟回合期间 2 秒后的下一轮会把同一个
             # 闹钟再取出一次，形成重复回合
             if not after_alarm(self.deps.conn, alarm["id"]):

@@ -743,8 +743,6 @@ async def test_budget_exhausted_does_not_rerun_alarms(tmp_path):
     schedule_alarm(conn, turn_id=1, due_at=clock.now().isoformat(), market="cn_main",
                    target="sh600519", note="回访", now=clock.now())
 
-    before = conn.execute("SELECT count(*) FROM agent_turn").fetchone()[0]
-
     class _Deps:
         def __init__(self):
             self.conn = conn
@@ -760,12 +758,23 @@ async def test_budget_exhausted_does_not_rerun_alarms(tmp_path):
     main.budget_exhausted = True            # 当天额度已用完
     main._last_day = clock.today()
     main.next_heartbeat_at = clock.now() + timedelta(hours=1)   # 避开心跳路径
+    # 开盘回合先占掉：本测试只关心闹钟，不该被 09:26 之后的开盘回合干扰
+    conn.execute("INSERT INTO agent_turn(ts, wake_kind, context_digest, rounds, decision,"
+                 " fallback, market) VALUES (?,?,?,?,?,?,?)",
+                 (clock.now().isoformat(), "open", "占位", 1, "silent", 0, "cn_main"))
+    conn.commit()
 
+    # 只看闹钟回合的增量：占位行与别的心跳行不该混进断言
+    def alarm_turns():
+        return conn.execute(
+            "SELECT count(*) FROM agent_turn WHERE wake_kind = 'alarm'").fetchone()[0]
+
+    before = alarm_turns()
     await main._once()
+    after = alarm_turns()
 
-    after = conn.execute("SELECT count(*) FROM agent_turn").fetchone()[0]
     assert after == before, (
-        f"预算耗尽后仍然跑了 {(after - before)} 个空转回合："
+        f"预算耗尽后仍然跑了 {(after - before)} 个空转闹钟回合："
         "这正是生产事故里一天 17885 行的来源")
 
 

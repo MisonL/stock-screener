@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.2.88] - 2026-11-20
+
 ### 修复
 
 - **抽方法时把 `conn.commit()` 一起搬走了，housekeeping 的两条 UPDATE 全部失效**。

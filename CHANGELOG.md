@@ -1,5 +1,23 @@
 ## [Unreleased]
 
+### 修复
+
+- **抽方法时把 `conn.commit()` 一起搬走了，housekeeping 的两条 UPDATE 全部失效**。
+
+  重构 `heartbeat_housekeeping()` 时新增了 `sweep_stale_alarms()`，把原函数末尾的
+  `conn.commit()` 挪进了新方法，**旧函数就此失去提交**。后果：
+
+  - `escalated` 事件永远不会回收成 `pending_retry`（升级后卡死在 escalated）；
+  - 确认卡永远不会标记 `expired`（24 小时后仍显示可点，点下去是过期票据）。
+
+  而且**没有任何报错**——两条 UPDATE 在事务里悬着，连接关闭时被隐式回滚。
+
+  生产暂未受影响（当时 `escalated` 与 `pending` 卡各 0 条），但这是个会静默积累的坑。
+
+  顺带说明为什么普通断言抓不到：同一连接里能查到未提交的数据。测试必须**另开一个
+  连接**去查才算数。已加 `test_housekeeping_actually_persists`，变异验证有效
+  （去掉 commit → 立刻转红）。
+
 ## [0.2.87] - 2026-11-20
 
 ### 修复

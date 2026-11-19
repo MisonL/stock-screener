@@ -957,3 +957,60 @@ async def test_same_day_overdue_alarms_are_cancelled_after_an_hour(tmp_path):
         "同日过期超过 1 小时的闹钟没作废：恢复后会一次性全部开跑")
     assert rows["迟到半小时"] == "pending", "正常的迟到被误杀了"
     assert cancelled == 1, f"作废条数应当是 1，实际 {cancelled}"
+
+
+async def test_housekeeping_actually_persists(tmp_path):
+    """**`heartbeat_housekeeping()` 的两条 UPDATE 必须真的落库**。
+
+    抽 `sweep_stale_alarms()` 时，把原来函数末尾的 `conn.commit()` 一起搬走了——
+    两条 UPDATE 于是在事务里悬着，连接关闭时被隐式回滚，**没有任何报错**：
+    escalated 事件永不回收、确认卡永不过期。
+
+    这类"忘了 commit"用普通断言抓不到（同一连接里查得到未提交的数据），
+    必须另开一个连接去查。
+    """
+    from agent.main import AgentMain
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from tests.helpers import SH
+    from datetime import datetime, timedelta
+
+    cfg = load_config(Path("config"))
+    db = tmp_path / "hk.db"
+    conn = connect(db)
+    migrate(conn)
+    now = datetime(2026, 11, 19, 10, 30, tzinfo=SH)
+    clock = FixedClock(now)
+
+    # 一条早就该回收的 escalated 事件
+    old_ts = (now - timedelta(minutes=90)).isoformat()
+    conn.execute(
+        "INSERT INTO event_log(ts, trade_date, market, kind, scope, target, payload,"
+        " salience, escalated, agent_status, escalated_at, dedupe_key)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (old_ts, "20261119", "cn_main", "price", "target", "sh600519", "{}",
+         1.0, 1, "escalated", old_ts, "k1"))
+    # 一张早就该过期的确认卡（确认卡的有效期是 24 小时，比事件回收的 30 分钟长得多）
+    card_ts = (now - timedelta(hours=30)).isoformat()
+    conn.execute(
+        "INSERT INTO agent_turn(ts, wake_kind, context_digest, rounds, decision,"
+        " fallback, market, pending_status) VALUES (?,?,?,?,?,?,?,?)",
+        (card_ts, "heartbeat", "卡", 1, "silent", 0, "cn_main", "pending"))
+    conn.commit()
+
+    class _Deps:
+        def __init__(self):
+            self.conn = conn
+            self.cfg = cfg
+            self.clock = clock
+            self.conn_factory = lambda: db
+
+    AgentMain(_Deps(), clock).heartbeat_housekeeping()
+
+    # **另开连接查**：同连接能看到未提交的改动，测不出漏 commit
+    fresh = connect(db)
+    status = fresh.execute("SELECT agent_status FROM event_log").fetchone()[0]
+    pending = fresh.execute("SELECT pending_status FROM agent_turn").fetchone()[0]
+    assert status == "pending_retry", f"escalated 事件没被回收（状态 {status}）：housekeeping 少了 commit"
+    assert pending == "expired", f"确认卡没被标记过期（状态 {pending}）：housekeeping 少了 commit"

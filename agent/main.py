@@ -289,6 +289,11 @@ class AgentMain:
         cutoff = (now - timedelta(hours=CONFIRM_EXPIRE_H)).isoformat()
         conn.execute("UPDATE agent_turn SET pending_status = 'expired'"
                      " WHERE pending_status = 'pending' AND ts < ?", (cutoff,))
+        # **这个 commit 是必须的**：抽 `sweep_stale_alarms()` 时顺手把它一起搬走了，
+        # 于是上面两条 UPDATE 全部失效——escalated 事件永不回收、确认卡永不过期，
+        # 而且没有任何报错（事务在连接关闭时被隐式回滚）。
+        # 抽方法时"把 commit 跟着语句一起搬"是很容易踩的坑，加测试钉住。
+        conn.commit()
 
     def sweep_stale_alarms(self, now: datetime) -> int:
         """作废**跨交易日**的 pending 闹钟，返回作废条数。

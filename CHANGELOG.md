@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.2.87] - 2026-11-20
+
 ### 修复
 
 - **`agent_churn` 被 `budget_exhausted` 静音——把最该报的空转挡掉了**。

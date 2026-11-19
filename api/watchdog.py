@@ -17,12 +17,18 @@ from typing import Callable, Literal
 
 from core.clock import SH, TradingCalendar
 
-AlertKind = Literal["agent_down", "jobs_down", "agent_stalled", "llm_down"]
+AlertKind = Literal["agent_down", "jobs_down", "agent_stalled", "llm_down",
+                    "agent_churn"]
 
 STALE_S = 120                  # 心跳超过这么久没更新 → 判死
 CHECK_EVERY_S = 30             # 与 api/main.py 的调度周期一致
 REPEAT_S = 1800                # 同类告警 30 分钟内不重复
 AGENT_TURN_STALE_S = 15 * 60   # agent_turn 超过 15 分钟没有新行 → 调度卡死（规则 3）
+#: 回合数暴增的判据：一小时内超过这么多个回合就报（规则 5）。
+#: 正常日全天 78–131 个回合（实测 11-10 至 11-18），一小时 ~20 个；
+#: 事故日 14:00 起**每分钟 300 个**、全天 17998 个。50 是"绝对不正常"的低水位，
+#: 不会对任何一个正常日误报。
+AGENT_TURN_CHURN_PER_HOUR = 50
 
 
 def in_watch_window(now: datetime) -> bool:
@@ -81,6 +87,28 @@ def check(conn, clock, dispatcher, *, cfg=None, agent_turn_stale_min: int | None
     if _llm_down(conn, cfg, now) and not _budget_exhausted(conn):
         if _alert(conn, clock, dispatcher, "llm_down", "LLM 连续不可用", now):
             fired.append("llm_down")
+
+    # 规则 5：**回合数暴增 = 空转死循环**（v0.2.85）。
+    #
+    # 2026-11-19 实测：`release_alarm()` 把失败的闹钟退回 `pending`，而 `_once()`
+    # 每 2 秒轮询一次、`due_alarms()` 返回所有 `due_at <= now` 的行——一条已过期的
+    # 闹钟陷入「到期 → 认领 → 失败 → 退回 → 2 秒后又到期」的死循环，一直转到收盘。
+    # 全天写了 **17998 行** `agent_turn`（正常日 78–131 行）。
+    #
+    # **为什么原有四条规则一条都没报**：`agent_down` 看心跳（进程活得好好的）、
+    # `agent_stalled` 看"很久没有回合"（恰恰相反，回合多得离谱）、
+    # `llm_down` 看连续失败（每个空转回合都是 `error`，确实"连续失败"——
+    # 但它在 11:24 报过一次后进入 30 分钟去重，而空转是"看起来在干活"，
+    # 从"连续失败"升级成"疯狂失败"没有任何人察觉）。
+    #
+    # 这类故障的特征是**量级异常**，所以判据也必须是量级。
+    recent = conn.execute(
+        "SELECT count(*) FROM agent_turn WHERE ts > ?",
+        ((now - timedelta(hours=1)).isoformat(),)).fetchone()[0]
+    if recent > AGENT_TURN_CHURN_PER_HOUR and not _budget_exhausted(conn):
+        if _alert(conn, clock, dispatcher, "agent_churn",
+                  f"一小时内 {recent} 个回合（正常约 20），疑似空转死循环", now):
+            fired.append("agent_churn")
 
     # 心跳本身断了就只判心跳：心跳陈旧时 `loop_last_tick_at` 必然也旧，
     # 两个判据同时命中只会让文案在「进程死了」和「循环卡了」之间反复横跳。

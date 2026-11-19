@@ -336,11 +336,25 @@ def render_close_digest(stats: CloseStats, cfg, trade_date: int = 0,
 _ALERT_PRIORITY = {"P0": 5, "P1": 4, "P2": 3}
 
 
+#: 告警类型 → 人读标题。**不能直接把 kind 当标题**：手机上收到 "agent_churn"
+#: 等于没收到——那是给代码看的标识符，不是给人看的。
+_ALERT_TITLE = {
+    "agent_down": "agent 进程无响应",
+    "agent_stalled": "agent 调度卡死",
+    "agent_churn": "agent 空转死循环",
+    "jobs_down": "盘中监控已停止",
+    "llm_down": "LLM 连续不可用",
+    "push_channel_down": "推送通道不可用",
+    "budget_exhausted": "agent 日预算已用完",
+}
+
+
 def render_alert(kind: str, text: str, cfg, level: str = "P1",
                  secret: bytes | None = None) -> Message:
     """系统告警（§7.2）：P0 → 5 urgent（watchdog 的 agent 停止必须响铃），P1 → 4，P2 → 3。"""
     # 同上：图标交给 `tags`，标题只放文字
-    return Message(title=kind, body=text, priority=_ALERT_PRIORITY[level], tags=["bell"],
+    return Message(title=_ALERT_TITLE.get(kind, kind), body=text,
+                   priority=_ALERT_PRIORITY[level], tags=["bell"],
                    click=_link(cfg, "/", secret))
 
 

@@ -275,3 +275,73 @@ def test_afternoon_open_does_not_flag_healthy_agent(conn):
     set_beat(conn, "agent", 20, clock=clock2)
     fired2, _ = run(conn, clock2)
     assert "agent_stalled" in fired2, "午后真卡住却不再报警了"
+
+
+def test_turn_churn_detects_runaway_loop(conn):
+    """**回合数暴增必须报警**——2026-11-19 的空转死循环没有任何规则能发现。
+
+    现场：`release_alarm()` 把失败闹钟退回 `pending`，`_once()` 每 2 秒轮询，
+    一条过期闹钟陷入「到期→失败→退回→2 秒后又到期」，一直转到收盘，
+    全天写了 17998 行 `agent_turn`（正常日 78–131 行）。
+
+    原有四条规则一条都没报：
+      · `agent_down` —— 心跳正常（进程活着）
+      · `agent_stalled` —— 恰恰相反，回合多得离谱
+      · `llm_down` —— 11:24 报过一次后进入 30 分钟去重，而且"连续失败"
+        升级成"疯狂失败"在数量上没有任何阈值
+      · `jobs_down` —— jobs 完全正常
+
+    这里造 60 个一分钟内的回合（正常一小时约 20 个），断言 `agent_churn` 触发。
+    """
+    from datetime import timedelta
+
+    clock = FixedClock(datetime(2026, 10, 30, 10, 0, tzinfo=SH))
+    now = clock.now()
+    for i in range(60):
+        conn.execute(
+            "INSERT INTO agent_turn(ts, wake_kind, context_digest, rounds, decision,"
+            " fallback, market) VALUES (?,?,?,?,?,?,?)",
+            ((now - timedelta(seconds=i * 30)).isoformat(), "alarm", "空转", 0,
+             "error", 0, "cn_main"))
+    conn.commit()
+
+    fired, _disp = run(conn, clock)
+    assert "agent_churn" in fired, (
+        f"一小时内 60 个回合没有报警（正常约 20 个）：{fired}")
+
+
+def test_normal_turn_volume_does_not_alarm(conn):
+    """**正常日的回合量不能报**——误报会把真故障淹掉。
+
+    实测正常日全天 78–131 个回合，一小时约 20 个。
+    """
+    from datetime import timedelta
+
+    clock = FixedClock(datetime(2026, 10, 30, 10, 0, tzinfo=SH))
+    now = clock.now()
+    for i in range(20):
+        conn.execute(
+            "INSERT INTO agent_turn(ts, wake_kind, context_digest, rounds, decision,"
+            " fallback, market) VALUES (?,?,?,?,?,?,?)",
+            ((now - timedelta(minutes=i * 3)).isoformat(), "alarm", "正常", 2,
+             "silent", 0, "cn_main"))
+    conn.commit()
+
+    fired, _disp = run(conn, clock)
+    assert "agent_churn" not in fired, f"正常回合量被误报为空转：{fired}"
+
+
+def test_every_watchdog_kind_has_a_human_title():
+    """**每种 watchdog 告警都要有中文标题**，新增 kind 忘了配也拦得住。
+
+    `render_alert` 在查不到标题时会回落到 `kind` 本身——那是个静默降级：
+    告警照发，但手机上显示 "agent_churn"，用户不知道发生了什么。
+    这条测试把 `AlertKind` 和 `_ALERT_TITLE` 绑在一起，加新规则时强制补标题。
+    """
+    import typing
+
+    from notify.templates import _ALERT_TITLE
+    from api.watchdog import AlertKind
+
+    missing = [k for k in typing.get_args(AlertKind) if k not in _ALERT_TITLE]
+    assert not missing, f"这些告警 kind 没有中文标题：{missing}"

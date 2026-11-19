@@ -379,3 +379,24 @@ def test_template_seq_id_includes_kind_like_dispatcher():
     # 同票同序不同 kind 必须区分开
     other = replace(one, kind="breakout")
     assert t_seq(other) != t_seq(one), "同票同 seq 的 breakout/breakdown 撞号了"
+
+
+def test_alert_title_is_human_readable():
+    """**告警标题必须是中文人话**，不能直接把 `kind` 当标题。
+
+    手机上收到 "agent_churn" 等于没收到——那是给代码看的标识符。
+    这类问题单测很容易漏：只断言 `message.body` 里有没有关键字，标题是
+    标识符也照样通过。
+    """
+    from core.config import load_config
+    from pathlib import Path
+    from notify.templates import render_alert
+
+    cfg = load_config(Path("config"))
+    msg = render_alert("agent_churn", "一小时 17998 个回合", cfg, level="P1")
+    assert msg.title != "agent_churn", "标题直接用了标识符，用户看不懂"
+    assert any("\u4e00" <= ch <= "\u9fff" for ch in msg.title), (
+        f"标题里没有中文：{msg.title!r}")
+    # 未知 kind 也要能渲染（不能 KeyError 把告警吞掉）
+    msg2 = render_alert("some_new_kind", "正文", cfg, level="P0")
+    assert msg2.body == "正文" and msg2.title

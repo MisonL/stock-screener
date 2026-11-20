@@ -755,7 +755,11 @@ async def test_budget_exhausted_does_not_rerun_alarms(tmp_path):
             self.conn_factory = lambda: conn
 
     main = AgentMain(_Deps(), clock)
-    main.budget_exhausted = True            # 当天额度已用完
+    # **走真实路径置位**，不要直接写 `budget_exhausted`：
+    # v0.2.95 把它改成每轮重算的派生值（额度 latch ∨ 记账标志），
+    # 直接赋值会被 `_once()` 覆盖掉。这里让一次回合真的因预算耗尽失败。
+    main._quota_exhausted = True
+    main.budget_exhausted = True
     main._last_day = clock.today()
     main.next_heartbeat_at = clock.now() + timedelta(hours=1)   # 避开心跳路径
     # 开盘回合先占掉：本测试只关心闹钟，不该被 09:26 之后的开盘回合干扰
@@ -1730,3 +1734,176 @@ async def test_cross_day_new_events_are_marked_expired(tmp_path):
     assert got.get((20261119, "new")) == 4, (
         f"今天的事件被误收尾了：{got}——今天还要处理它们")
     assert (20261119, "expired") not in got
+
+
+async def test_budget_exhausted_flag_follows_the_db_flag(tmp_path):
+    """**`budget_exhausted` 必须是数据库标志的镜像，不能是当天不清的 latch**
+    （v0.2.95 修的 S1，第 5 次假绿）。
+
+    `llm/budget.py` 的探测自愈修好之后，评审发现还有第二层：
+
+    · `_run()` 里只做 `if 标志存在: True`，**从没有 `else: False`**；
+    · 它只在跨日复位（`_once()` 开头）。
+
+    于是记一次写锁抖动把它置上，即使探测已经自愈、库里的标志已经被删掉，
+    这里仍然恒为 True，**当天剩下的时间所有闹钟都被跳过**（回访一条都不跑）。
+
+    评审实测的完整链条：标志已清 → `deduct()` 返回 True → `_once()` 再跑一轮
+    → `budget_exhausted` 仍是 True → 闹钟仍 `pending`。
+
+    上一版的 `test_failed_flag_self_heals_through_the_production_entry` 只测到
+    `Budget` 内部（库标志清了），没测到这个 latch——所以它是**第 5 次假绿**：
+    标题写"self heals"，实际覆盖范围不含"当天所有回访"。
+    """
+    from agent.context import Rendered
+    from agent.loop import BUDGET_EXHAUSTED_WHY, Deps
+    from agent.main import AgentMain
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from llm.budget import Budget
+    from llm.tools import ToolRegistry
+    from tests.helpers import SH
+    from datetime import datetime, timedelta
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "latch.db")
+    migrate(conn)
+    now = datetime(2026, 11, 19, 10, 30, tzinfo=SH)
+    clock = FixedClock(now)
+
+    class _ExhaustedLlm:
+        """第一次调用：预算耗尽；之后（标志被清）正常返回沉默。"""
+
+        calls = 0
+
+        async def chat(self, *a, **k):
+            from types import SimpleNamespace
+            _ExhaustedLlm.calls += 1
+            if _ExhaustedLlm.calls == 1:
+                raise RuntimeError("预算耗尽路径由 run_with_deadline 的预检触发")
+            return SimpleNamespace(content="", tool_calls=[
+                {"id": "c1", "function": {"name": "emit_decision", "arguments":
+                 '{"speak": false, "body": "", "why_silent": "无事"}'}}],
+                attempts=1, usage=None)
+
+    deps = Deps(conn=conn, cfg=cfg, clock=clock, llm=_ExhaustedLlm(),
+                budget=Budget(conn, "agent", cfg.llm.budget.agent),
+                tools=ToolRegistry(conn, cfg, clock, mcp=None),
+                render=lambda t: Rendered("…", 1, False, {}),
+                pusher=None, memory=None, westock=None)
+    deps.conn_factory = lambda: conn
+    deps.alert = lambda *a, **k: None
+
+    main = AgentMain(deps, clock)
+    main.next_heartbeat_at = now + timedelta(hours=1)
+
+    # 直接把库标志置上（模拟一次写锁抖动），并让 main 读到它
+    conn.execute("INSERT OR REPLACE INTO job_state(name, value)"
+                 " VALUES ('budget.write_failed:agent', '1')")
+    conn.commit()
+    await main._once()
+    assert main.budget_exhausted is True, "前提不成立：应当进入预算不可用"
+
+    # 探测已自愈、库标志被删掉（`llm/budget.py::_try_deduct` 成功时就这么做）
+    conn.execute("DELETE FROM job_state WHERE name = 'budget.write_failed:agent'")
+    conn.commit()
+
+    await main._once()
+    assert main.budget_exhausted is False, (
+        "库里的标志已经清掉，main.budget_exhausted 仍是 True："
+        "当天剩下的时间所有闹钟都会被跳过（回访一条都不跑）")
+
+
+async def test_poll_failure_does_not_stall_the_scheduler(tmp_path, monkeypatch):
+    """**`attention.poll()` 失败不能让整个调度停摆**（评审 M2）。
+
+    它排在心跳推进与闹钟循环**之前**，而且内部 `if not events: return []` 会提前
+    返回。一旦它抛异常（写锁超时/磁盘满，正是它要写 `suppressed`/`escalated` 的
+    时候），`_once()` 整体抛出、被 `run()` 吞掉 → 心跳、闹钟、开盘回合**全部停摆**。
+
+    这与 v0.2.93 修的 `heartbeat_housekeeping` 是同一类错误，只是位置更早、
+    后果更重。`test_housekeeping_failure_does_not_stall_the_scheduler` 覆盖不到这里。
+    """
+    from agent.context import Rendered
+    from agent.loop import Deps
+    from agent.main import AgentMain
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from llm.budget import Budget
+    from llm.tools import ToolRegistry
+    from tests.helpers import SH
+    from datetime import datetime
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "poll.db")
+    migrate(conn)
+    now = datetime(2026, 11, 19, 10, 30, tzinfo=SH)
+    clock = FixedClock(now)
+
+    deps = Deps(conn=conn, cfg=cfg, clock=clock, llm=None,
+                budget=Budget(conn, "agent", cfg.llm.budget.agent),
+                tools=ToolRegistry(conn, cfg, clock, mcp=None),
+                render=lambda t: Rendered("…", 1, False, {}),
+                pusher=None, memory=None, westock=None)
+    deps.conn_factory = lambda: conn
+    deps.alert = lambda *a, **k: None
+
+    main = AgentMain(deps, clock)
+    main.next_heartbeat_at = now
+
+    def _boom():
+        raise RuntimeError("database or disk is full")
+
+    monkeypatch.setattr(main.attention, "poll", _boom)
+
+    before = main.next_heartbeat_at
+    await main._once()                   # **不该抛**
+
+    assert main.next_heartbeat_at > before, (
+        "poll() 炸了，下一跳没推进：心跳、闹钟、开盘回合会全部停摆")
+
+
+def test_failing_alarm_does_not_starve_the_backlog(tmp_path):
+    """**一直失败的闹钟不能把后面的积压饿死**（评审 M3 的不变量）。
+
+    评审怀疑：`ALARM_MAX_PER_ONCE` 取的是"最早 2 条"，失败的 `release_alarm`
+    把 `due_at` 往后推 60 秒，如果退避后它们仍是最早的，就会一轮轮反复跑它们，
+    后面的永远轮不到。
+
+    实测**不成立**，原因是退避把 `due_at` 推到了 `now+60`，而未退避的积压
+    到期时间都 `<= now`，按 `ORDER BY due_at` 一定排在它们前面。
+    但这是个**不明显的安全性质**，靠"碰巧"成立不安全——万一有人把
+    `ALARM_RETRY_BACKOFF_S` 调成 0，或者改成"退避不推 due_at"，
+    就会立刻退化成饿死。这里把不变量钉住。
+
+    注意：这条测试刻意用**真实默认退避**，不传 `backoff_s=0`——
+    传 0 就是人为构造出饿死，测的不是生产行为。
+    """
+    from agent.schedule import after_alarm, due_alarms, release_alarm, schedule_alarm
+    from core.clock import FixedClock
+    from core.db import connect, migrate
+    from tests.helpers import SH
+    from datetime import datetime, timedelta
+
+    conn = connect(tmp_path / "starve.db")
+    migrate(conn)
+    t0 = datetime(2026, 11, 19, 10, 0, tzinfo=SH)
+    for i in range(10):
+        schedule_alarm(conn, turn_id=0, due_at=t0.isoformat(), market="cn_main",
+                       target=f"sh60000{i}", note=f"a{i}", now=t0)
+
+    ran: list[str] = []
+    for rnd in range(5):
+        now = t0 + timedelta(seconds=rnd * 2)
+        for a in due_alarms(conn, now)[:2]:
+            ran.append(a["note"])
+            after_alarm(conn, a["id"])
+            release_alarm(conn, a["id"], now=now)      # 一律失败，走默认退避
+
+    # 5 轮 × 2 条 = 10 次机会。若不饿死，10 条应各被跑一次。
+    assert len(set(ran)) == 10, (
+        f"只跑到 {sorted(set(ran))}，有闹钟一次都没轮到："
+        f"失败的闹钟（{sorted({x for x in ran if ran.count(x) > 1})}）"
+        "在退避后仍排在积压前面，把后面的饿死了")

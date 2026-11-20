@@ -196,6 +196,8 @@ class AgentMain:
             deps.cfg, "heartbeat_turn", OTHER_ROUNDS_BUDGET, OTHER_DEADLINE_S)
         self.next_heartbeat_at = None
         self.budget_exhausted = False
+        # 今日额度是否用完（跨日复位；与"记账写库坏了"是两回事，见 `_once()`）
+        self._quota_exhausted = False
         self._last_day = self.clock.today()
         # 上一次扫过期闹钟的时刻（见 `_once()` 里的闹钟循环）
         self._alarm_swept_at = None
@@ -291,17 +293,44 @@ class AgentMain:
                            result.decision.schedule_note or "",
                            now=self.clock.now())
         if getattr(result, "why", None) == BUDGET_EXHAUSTED_WHY:
+            # 额度用完：**跨日才恢复**，所以单独记一个 latch，别被下面的重读清掉
+            self._quota_exhausted = True
             self.budget_exhausted = True
         # 预算写库失败也要进「预算不可用」：否则下一唤醒继续请求、继续花
+        #
+        # **但它是"标志的镜像"，不是独立的状态**（v0.2.95 修的 S1，第 5 次假绿）。
+        # 原来这里只做 `if 标志存在: True`，从没有 `else: False`——
+        # 于是 `budget_exhausted` 成了**只在跨日清零的 latch**：
+        # 记一次写锁抖动把它置上，即使 `llm/budget.py` 的探测已经自愈、
+        # 库里的标志已经被删掉，这里仍然恒为 True，
+        # **当天剩下的时间所有闹钟都被跳过**（回访一条都不跑）。
+        # 评审实测：标志已清、`deduct()` 返回 True、`_once()` 再跑一轮，
+        # `budget_exhausted` 仍是 True，闹钟仍 pending。
+        #
+        # 现在每次回合结束都跟着标志走：标志在就 True，不在就 False。
+        # 注意不能简单地整体 `= False`——那会把「本次回合刚因预算耗尽而失败」
+        # （上面那一行）也一起抹掉。
+        # 本次回合若正常跑完（不是预算耗尽），就跟着库标志复位；
+        # 若本次就是预算耗尽，上面那行已经置 True，不要被 `_budget_unavailable()`
+        # 的 False 覆盖（预算是"额度用完"，与"记账坏了"是两个不同的键）。
+        if getattr(result, "why", None) != BUDGET_EXHAUSTED_WHY:
+            self.budget_exhausted = self._quota_exhausted or self._budget_unavailable()
+        return turn_id
+
+    def _budget_unavailable(self) -> bool:
+        """预算是否不可用：**只看数据库标志**，每轮重读。
+
+        `llm/budget.py::_try_deduct` 成功扣减时会删掉这个键，于是这里下一轮
+        就自动复位——不需要谁记得去清 `self.budget_exhausted`。
+        读不到时 fail-closed 返回 True（宁可少跑一轮回访，不要反复撞锁）。
+        """
         try:
             row = self.deps.conn.execute(
                 "SELECT value FROM job_state WHERE name = 'budget.write_failed:agent'"
             ).fetchone()
-            if row and row[0]:
-                self.budget_exhausted = True
+            return bool(row and row[0])
         except Exception:                                  # noqa: BLE001
-            pass
-        return turn_id
+            return True
 
     def heartbeat_housekeeping(self):
         conn = self.deps.conn
@@ -452,11 +481,24 @@ class AgentMain:
         if self.clock.today() != self._last_day:
             self._last_day = self.clock.today()
             self.budget_exhausted = False
+            self._quota_exhausted = False
             self._open_attempts = 0
         if self.next_heartbeat_at is None:
             self.next_heartbeat_at = next_heartbeat(now)
 
-        for group in self.attention.poll():
+        # **`poll()` 必须包住**（v0.2.95 修的 M2）：它排在心跳推进与闹钟循环**之前**，
+        # 而且内部 `if not events: return []` 会提前返回。它一旦抛异常
+        # （写锁超时/磁盘满，正是它要写 `suppressed`/`escalated` 的时候），
+        # `_once()` 整体抛出、被 `run()` 吞掉 → 心跳、闹钟、开盘回合**全部停摆**。
+        # 这与 v0.2.93 修的 housekeeping 是同一类错误，只是位置更早、后果更重。
+        # 事件处理失败只该影响事件，不该影响调度。
+        try:
+            polled = self.attention.poll()
+        except Exception:                                  # noqa: BLE001
+            logging.getLogger("agent").warning(
+                "attention.poll 失败（本轮跳过事件）", exc_info=True)
+            polled = []
+        for group in polled:
             events = sorted(group.events, key=lambda e: e.id)
             group.events = events
             if self.shadow_mode:
@@ -542,6 +584,20 @@ class AgentMain:
                 or (now - self._alarm_swept_at).total_seconds() >= ALARM_SWEEP_EVERY_S):
             self.sweep_stale_alarms(now)
             self._alarm_swept_at = now
+        # **每轮都重读一次预算标志**（v0.2.95 修的 S1 后半）。
+        # 只在 `_run()` 里做镜像是**死锁**：预算不可用时闹钟循环被跳过、
+        # 开盘回合当天已经跑过、心跳还没到期 —— 于是这一轮根本不会 `_run`，
+        # 标志永远没机会复位。评审实测就是这个形状。
+        # 放在这里（闹钟循环之前）才保证"每轮必然执行一次"。
+        # **两个来源必须分开记，不能合成一个变量**（v0.2.95）。
+        #  · `_quota_exhausted`：今天的**额度**用完了 —— 当天不可能恢复，
+        #    只能跨日复位（`_once()` 开头那处）。
+        #  · `_budget_unavailable()`：**记账写库坏了** —— 依赖 30 秒探测自愈，
+        #    所以每轮都要重读，不能缓存。
+        # 混成一个变量会二选一地出错：缓存它，"记账坏了"就永不复位（S1 的 latch）；
+        # 每轮重读它，"额度用完"就会被清掉 —— **而额度用完正是 11-19 事故的成因**，
+        # 清掉之后闹钟恢复空转，一天又是上万行。
+        self.budget_exhausted = self._quota_exhausted or self._budget_unavailable()
         # **单轮最多跑 `ALARM_MAX_PER_ONCE` 个闹钟回合**（v0.2.93 修的 M-d）。
         # 按日期作废把"同日迟到"的闹钟都保住了（对：语境有效），但也失去了原来
         # "同日过期 1 小时"顺手提供的泄压：宕机到 13:00 恢复时，上午积压的

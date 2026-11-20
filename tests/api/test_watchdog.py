@@ -316,20 +316,25 @@ def test_turn_churn_detects_runaway_loop(conn):
 def test_normal_turn_volume_does_not_alarm(conn):
     """**正常日的回合量不能报**——误报会把真故障淹掉。
 
-    数值必须来自生产实测，不能拍脑袋。第一次把阈值写成 50 时，对着
-    "正常日 11-18 午后滚动一小时正好 50 个回合"就会误报——那是最拥挤的正常日。
-    这里复刻实测的最忙一小时（50 个），并额外覆盖"窗口之外的行不能算进来"：
+    数值必须来自生产实测，不能拍脑袋。这个阈值错过两次，两次都是**样本选错了**：
+
+    · 写 50 时，对着"正常日 11-18 午后滚动一小时正好 50 个"就会误报；
+    · 改 200 后，只量了正常日（峰值 50，看着有 4 倍余量）。但 **11-20 是暴跌日**，
+      模型每 2~6 分钟排一条回访闹钟，45 分钟建了 96 条，实测滚动一小时 **169 个**，
+      离 200 只剩 16% 余量。**暴跌日恰恰是模型最活跃、最该被监控的一天。**
+
+    这里复刻那个 169（暴跌日的合法峰值），并额外覆盖"窗口之外的行不能算进来"：
     SQL 少了 `ts <= now` 上界时，回放过去某个时刻会把之后发生的所有行都算成
     "最近一小时"（实测干跑 11-18 14:30 得到 18066，正确值是 45）。
     """
-    clock = FixedClock(datetime(2026, 10, 30, 14, 30, tzinfo=SH))
+    clock = FixedClock(datetime(2026, 11, 20, 10, 0, tzinfo=SH))
     now = clock.now()
-    for i in range(50):                     # 正常日最忙一小时
+    for i in range(169):                    # 暴跌日的合法峰值（11-20 实测）
         conn.execute(
             "INSERT INTO agent_turn(ts, wake_kind, context_digest, rounds, decision,"
             " fallback, market) VALUES (?,?,?,?,?,?,?)",
-            ((now - timedelta(seconds=i * 60)).isoformat(), "alarm", "正常", 2,
-             "silent", 0, "cn_main"))
+            ((now - timedelta(seconds=int(i * 3550 / 169))).isoformat(), "alarm", "暴跌日",
+             2, "silent", 0, "cn_main"))
     for i in range(500):                    # 窗口之外（未来）：没有上界就会被算进来
         conn.execute(
             "INSERT INTO agent_turn(ts, wake_kind, context_digest, rounds, decision,"

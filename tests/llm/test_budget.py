@@ -298,8 +298,10 @@ def test_failed_flag_self_heals_through_the_production_entry(tmp_path):
     注释还自我解释说"那正是「写已恢复」的场景"。那不成立：绕过短路就绕过了
     生产里唯一的恢复路径。**测试必须走 `deduct()`。**
 
-    现在改成定期放行探测（`WRITE_FAILED_PROBE_S`），这里把探测窗口调成 0
-    来验证自愈链路。
+    现在改成定期放行探测（`WRITE_FAILED_PROBE_S`）。这里**手工把
+    `_last_probe_at` 清成 None** 来跳过 30 秒等待（不改常量：改常量会让
+    "窗口真的存在"这件事失去测试——评审指出把常量改成 1e9 时这条测试照样绿，
+    所以另有一条 `test_probe_window_is_actually_respected` 专门钉住窗口本身）。
     """
     from core.db import connect, migrate
     from core.clock import FixedClock
@@ -329,3 +331,42 @@ def test_failed_flag_self_heals_through_the_production_entry(tmp_path):
 
     # 自愈之后不需要再靠探测
     assert b.deduct(50, 50) is True
+
+
+
+def test_probe_window_is_actually_respected(tmp_path):
+    """**探测窗口必须真实存在**（评审指出的假绿缺口）。
+
+    `test_failed_flag_self_heals_through_the_production_entry` 手工把
+    `_last_probe_at` 清成 None 来跳过 30 秒等待——所以它证明不了窗口本身。
+    评审把 `WRITE_FAILED_PROBE_S` 改成 `1e9`（等于永不探测，即 v0.2.91 的
+    原样回来），那条测试**照样绿**。这里用真实倒计时钉住它。
+
+    窗口的意义：写锁竞争时不让调用方反复撞 `busy_timeout`（5 秒）。
+    """
+    from core.db import connect, migrate
+    from core.clock import FixedClock
+    from datetime import datetime
+    from tests.helpers import SH
+    from llm.budget import Budget, WRITE_FAILED_PROBE_S
+    import time as _time
+
+    conn = connect(tmp_path / "w.db")
+    migrate(conn)
+    clock = FixedClock(datetime(2026, 10, 30, 10, 0, tzinfo=SH))
+    b = Budget(conn, "agent", (1_000_000, 100_000))
+    conn.execute("INSERT INTO llm_budget(day, pool, tokens_in, tokens_out) VALUES (?,?,0,0)",
+                 (b.day, "agent"))
+    conn.commit()
+    b._mark_write_failed()
+
+    # 窗口内：必须 fail-closed，不能放行
+    assert b.deduct(100, 100) is False, "窗口内就放行了：写锁竞争时会反复撞 busy_timeout"
+
+    # 把时钟拨到窗口外（**用字面量 31 秒，不引用常量**），必须放行一次真扣。
+    # 引用常量的话，把 `WRITE_FAILED_PROBE_S` 改成 1e9 时
+    # `monotonic() - 1e9 - 1` 仍然"在窗口外"，测试照样绿——变不出红。
+    assert WRITE_FAILED_PROBE_S < 60, f"探测窗口 {WRITE_FAILED_PROBE_S}s 太长，等同永不探测"
+    b._last_probe_at = _time.monotonic() - 31
+    assert b.deduct(100, 100) is True, "窗口已过却不放行：故障标志永远清不掉"
+    assert b._write_failed() is False

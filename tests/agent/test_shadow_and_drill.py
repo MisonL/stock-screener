@@ -539,9 +539,12 @@ def test_event_wake_has_hard_gate_in_once(env):
     from agent import main as agent_main
 
     src = inspect.getsource(agent_main.AgentMain._once)
-    # 事件循环体内必须出现 shadow 分支
-    seg = src[src.index("for group in self.attention.poll()"):]
-    seg = seg[:seg.index("if now >= self.next_heartbeat_at")]
+    # 事件循环体内必须出现 shadow 分支。
+    # **不要锚定 `for group in self.attention.poll()`**：v0.2.95 给 poll() 包了
+    # try/except（它一抛异常会让整个调度停摆），调用点变成 `for group in polled:`。
+    # 锚在"事件循环"这个语义上更稳：从 poll 调用点往后、到心跳分支之前。
+    start = src.index("self.attention.poll()")
+    seg = src[start:src.index("if now >= self.next_heartbeat_at")]
     assert "shadow" in seg, "事件唤醒路径没有 shadow 硬闸（只靠 poll() 返回空）"
 
 

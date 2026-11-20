@@ -76,8 +76,9 @@ _DRIFT_KEYS = (
     ("config/llm.yaml", "max_tokens"),
     # `p1_score`：站点 60、仓库 0（60 会把低分突破降级成 P2）。
     ("config/notify.yaml", "p1_score"),
-    # `own_history_trim`：已删除，站点若还有就是个死键。
-    ("config/agent.yaml", "own_history_trim"),
+    # `own_history_trim` **不加进来**：它现在是"应该不存在"的键，
+    # 而 `_DRIFT_KEYS` 的判据是"键存在与否"，加进去会变成
+    # 「删干净了反而报漂移」（实测就是这么报的）。
 )
 
 

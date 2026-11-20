@@ -233,9 +233,25 @@ class AttentionLayer:
             # **shadow 在疲劳门之前分支**：§10 说「上线头两周只记录不升级」，就是为了
             # 看真实分布。这时还没有任何真实推送，`effective_threshold` 恒等于基础阈值，
             # 拿它把事件标成 suppressed 既违背口径，又会让这些事件永久沉底。
+            #
+            # **但必须标记状态**（v0.2.94 修的根因）。原来这里只写 shadow 回合、
+            # 不改 `agent_status`，事件就一直停在 `new`；而 `poll()` 只查
+            # `trade_date = 今天`，**次日它们再也取不到**，于是既不 done 也不
+            # suppressed 地沉底。生产实测：shadow 观测期 11-10~11-17 每天积
+            # 1~63 条，合计 142 条僵尸行。
+            #
+            # 用一个独立状态 `shadowed`（不是 `done`）：它们在 shadow 期被
+            # **观测过但没有处理**，记成 done 会让"处理率"这类口径说谎。
+            shadowed_ids: list[int] = [e.id for g in singles_groups + merged
+                                       for e in g.events]
             for g in singles_groups + merged:
                 self._write_turn(g.events[0], "shadow", "只记录不升级",
-                                 digest=f"shadow 组={g.id} 事件={len(g.events)}")
+                                 digest=f"shadow 组={g.id} 事件={len(g.events)}",
+                                 commit=False)
+            # **回合行与状态标记同一事务**：先 commit 回合、再改状态，中途失败会让
+            # 事件留在 `new` 却已经有 shadow 回合行——下次 poll 又写一遍（幂等挡住
+            # 重复行），但状态永远不动。反过来先改状态再写回合，失败就丢观测。
+            self._mark_many(shadowed_ids, "shadowed")
             return []
 
         threshold = self.effective_threshold()

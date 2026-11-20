@@ -185,13 +185,21 @@ def test_pending_retry_events_not_in_groups(env):
 
 
 def test_shadow_mode_records_without_escalating(env):
-    """默认 shadow：写 decision='shadow' 的行，但不改 agent_status、不跑回合。"""
+    """默认 shadow：写 decision='shadow' 的行、标记 shadowed、不升级不跑回合。
+
+    **这里必须标记状态**（v0.2.94 修的根因）：原来不改 `agent_status`，事件就停在
+    `new`，而 `poll()` 只查 `trade_date = 今天`——次日再也取不到，于是既不 done
+    也不 suppressed 地**永久沉底**。生产实测 shadow 期积了 142 条僵尸行。
+
+    标 `shadowed` 而不是 `done`：它们在 shadow 期被观测过但没处理，
+    记成 done 会让"处理率"说谎。
+    """
     ids = seed(env, kind="breakdown", n=1)
     # 显式给 shadow=True：本用例测的是**机制**，不该跟着生产配置的阶段走
     assert AttentionLayer(env.conn, mkcfg(shadow=True), env.clock).poll() == []
     row = env.conn.execute(
         "SELECT agent_status, escalated FROM event_log WHERE id=?", (ids[0],)).fetchone()
-    assert (row[0], row[1]) == ("new", 0)      # shadow 不改状态
+    assert (row[0], row[1]) == ("shadowed", 0)   # 标记观测过，但没有升级
     turn = env.conn.execute("SELECT decision, why, trigger_id FROM agent_turn").fetchone()
     assert turn[0] == "shadow" and turn[1] == "只记录不升级" and turn[2] == ids[0]
 
@@ -280,7 +288,9 @@ def test_shadow_does_not_write_suppressed(env):
     statuses = [r[0] for r in env.conn.execute(
         "SELECT agent_status FROM event_log").fetchall()]
     assert "suppressed" not in statuses
-    assert statuses == ["new"]
+    # shadow 期事件被标记成 shadowed（不是 new，否则次日沉底；也不是 suppressed，
+    # 那等于用疲劳门去改观测口径）
+    assert statuses == ["shadowed"]
 
 
 def test_merge_is_anchored_on_first_item(env):
@@ -318,3 +328,34 @@ def test_poll_is_quiet_when_no_events(env):
     after = (conn.total_changes,
              conn.execute("SELECT count(*) FROM agent_turn").fetchone()[0])
     assert after == snapshot, "空跑发出了写入"
+
+
+def test_shadow_events_do_not_sink_forever(env):
+    """**shadow 期的事件不能永久沉底**（v0.2.94 修的根因）。
+
+    原来 shadow 分支只写 `decision='shadow'` 的回合行、**不改 `agent_status`**，
+    事件就一直停在 `new`。而 `poll()` 的查询是 `trade_date = 今天`——
+    次日它们再也取不到，于是既不 `done` 也不 `suppressed` 地沉底。
+    `jobs/cleanup.py` 要 30 天后才删，期间按 `agent_status` 做的统计全是僵尸。
+
+    生产实测：shadow 观测期 11-10~11-17 每天积 1~63 条，合计 **142 条**。
+    11-18 关掉 shadow 之后残留归零，但先前那 142 条已经没救了。
+
+    这条测试模拟"今天 shadow 观测完、明天再看"：事件必须是 `shadowed`，
+    且明天的 `poll()` 不会把它当新事件重新观测一遍。
+    """
+    from datetime import timedelta
+
+    ids = seed(env, kind="breakdown", n=1)
+    AttentionLayer(env.conn, mkcfg(shadow=True), env.clock).poll()
+
+    row = env.conn.execute("SELECT agent_status FROM event_log WHERE id=?", (ids[0],)).fetchone()
+    assert row[0] == "shadowed", (
+        f"shadow 之后事件停在 {row[0]!r}：次日 poll() 查不到它，会永久沉底")
+
+    # 第二天：同一层用新时钟
+    tomorrow = T0 + timedelta(days=1)
+    layer2 = AttentionLayer(env.conn, mkcfg(shadow=True), FixedClock(tomorrow))
+    assert layer2.poll() == [], "沉底事件在次日又被观测了一遍"
+    assert env.conn.execute(
+        "SELECT count(*) FROM agent_turn WHERE decision='shadow'").fetchone()[0] == 1

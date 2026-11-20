@@ -309,6 +309,22 @@ class AgentMain:
         deadline = (now - timedelta(minutes=ESCALATED_RECYCLE_MIN)).isoformat()
         conn.execute("UPDATE event_log SET agent_status = 'pending_retry'"
                      " WHERE agent_status = 'escalated' AND escalated_at < ?", (deadline,))
+        # **跨日沉底事件必须显式收尾**（v0.2.94）。
+        # `poll()` 只查 `trade_date = 今天`，所以前一天剩下的 `new` 事件
+        # **永远不会再被取出**——它们既不 `done` 也不 `suppressed`，
+        # 就这样停在"待处理"上。`jobs/cleanup.py` 要 30 天后才删，
+        # 期间任何按 `agent_status` 做的统计（比如"今天有多少事件没处理"）
+        # 都会读到一批永远不会动的僵尸行。
+        #
+        # 生产实测：shadow 观测期（11-10~11-17）每天都能积下 1~63 条，
+        # 因为 `poll()` 的 shadow 分支**只写 shadow 回合、不改事件状态**。
+        # 11-18 关掉 shadow 之后残留归零，但先前那 142 条已经沉底。
+        #
+        # 标成 `expired` 而不是 `done`：它们**确实没被处理**，
+        # 记成 done 会让"处理率"这类口径说谎。
+        conn.execute("UPDATE event_log SET agent_status = 'expired'"
+                     " WHERE agent_status = 'new' AND trade_date < ?",
+                     (self.clock.today(),))
         cutoff = (now - timedelta(hours=CONFIRM_EXPIRE_H)).isoformat()
         conn.execute("UPDATE agent_turn SET pending_status = 'expired'"
                      " WHERE pending_status = 'pending' AND ts < ?", (cutoff,))

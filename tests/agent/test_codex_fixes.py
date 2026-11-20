@@ -1669,3 +1669,64 @@ async def test_backlog_of_alarms_is_drained_gradually(tmp_path):
     main._alarm_swept_at = None
     await main._once()
     assert claimed["n"] > ALARM_MAX_PER_ONCE, "第二轮没有继续消化积压"
+
+
+async def test_cross_day_new_events_are_marked_expired(tmp_path):
+    """**跨日沉底的 `new` 事件要被显式收尾**。
+
+    `poll()` 只查 `trade_date = 今天`，前一天剩下的 `new` 事件**永远不会再被取出**：
+    既不 `done` 也不 `suppressed`，就停在"待处理"上。`cleanup` 要 30 天后才删，
+    期间任何按 `agent_status` 做的统计都会读到一批永远不会动的僵尸行。
+
+    生产实测（142 条）：全部集中在 shadow 观测期 11-10~11-17，因为
+    `poll()` 的 shadow 分支**只写 shadow 回合、不改事件状态**；11-18 关掉
+    shadow 之后残留归零，但先前那 142 条已经沉底。
+
+    标 `expired` 而不是 `done`：它们**确实没被处理**，记成 done 会让处理率说谎。
+    """
+    from agent.main import AgentMain
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from tests.helpers import SH
+    from datetime import datetime
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "exp.db")
+    migrate(conn)
+    now = datetime(2026, 11, 19, 10, 30, tzinfo=SH)
+    clock = FixedClock(now)
+
+    def _seed(trade_date: int, n: int, status: str = "new"):
+        for i in range(n):
+            conn.execute(
+                "INSERT INTO event_log(ts, trade_date, market, kind, scope, target,"
+                " payload, salience, escalated, agent_status, dedupe_key)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (now.isoformat(), trade_date, "cn_main", "breakout", "target",
+                 f"sh{600000+i}", "{}", 0.4, 0, status,
+                 f"{trade_date}-{status}-{i}"))
+
+    _seed(20261118, 5)                    # 昨天沉底的
+    _seed(20261117, 3)                    # 前天沉底的
+    _seed(20261119, 4)                    # 今天的，必须留着
+    _seed(20261118, 2, status="expired")  # 已经收尾的，不该被重复计入
+    conn.commit()
+
+    class _Deps:
+        def __init__(self):
+            self.conn = conn
+            self.cfg = cfg
+            self.clock = clock
+
+    AgentMain(_Deps(), clock).heartbeat_housekeeping()
+
+    rows = conn.execute(
+        "SELECT trade_date, agent_status, count(*) FROM event_log"
+        " GROUP BY trade_date, agent_status ORDER BY trade_date, agent_status").fetchall()
+    got = {(r[0], r[1]): r[2] for r in rows}
+    assert got.get((20261118, "expired")) == 7, f"昨天的沉底事件没收尾：{got}"
+    assert got.get((20261117, "expired")) == 3, f"前天的沉底事件没收尾：{got}"
+    assert got.get((20261119, "new")) == 4, (
+        f"今天的事件被误收尾了：{got}——今天还要处理它们")
+    assert (20261119, "expired") not in got

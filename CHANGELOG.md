@@ -1,31 +1,26 @@
 ## [Unreleased]
 
-### 防复发：机械检查禁止"手设生产路径推导出来的状态"
+### 防复发
 
-今天 7 次假绿里 **5 次**是同一个形状：在测试里直接给对象的内部字段赋值，
-跳过生产路径，于是测试验证的是"我设的那个值"，不是"代码算出来的值"。
+- **机械检查禁止"手设生产路径推导出来的状态"**。今天 7 次假绿里 **5 次**是同一个
+  形状：在测试里直接给对象的内部字段赋值，跳过生产路径，于是测试验证的是
+  "我设的那个值"，不是"代码算出来的值"。第 7 次尤其说明问题——写它的前一小时
+  我还在批判同一件事，还是犯了。这不是"下次注意"能防住的。
 
-第 7 次尤其说明问题：写它的前一小时我还在批判同一件事，还是犯了。
-这不是"下次注意"能防住的。
+  新增 `tests/test_no_manual_internal_state.py`：用 **AST**（不是正则，避免误伤
+  注释与文档字符串）扫描 `tests/` 下所有赋值，出现 `budget_exhausted` /
+  `_quota_exhausted` / `_budget_fail_streak` / `_budget_cancels` /
+  `_rounds_cancels` 的直接赋值就报错。变异验证：恢复一行手设立刻转红。
 
-新增 `tests/test_no_manual_internal_state.py`：用 **AST**（不是正则，
-避免误伤注释/文档字符串）扫描 `tests/` 下所有赋值，出现下面这些直接赋值就报错：
+- **清掉两处遗漏**：`test_budget_exhausted_skips_event_poll_entirely`
+  （第 7 次假绿的本体）与 `test_budget_exhausted_flag_and_reset`，
+  都改成从 `llm_budget` 出发。
 
-```
-<obj>.budget_exhausted = ...
-<obj>._quota_exhausted = ...
-<obj>._budget_fail_streak = ...
-<obj>._budget_cancels = ...
-<obj>._rounds_cancels = ...
-```
+- **`test_budget_cancelled_alarms_notify_the_user_once` 原来手写 `main._run`
+  替身再手动 `+= 1`**，测的是"我加的那个数"，改成走真实 `_run()`。
 
-顺带清掉了两处遗漏（`test_budget_exhausted_skips_event_poll_entirely` ——
-第 7 次假绿的本体，以及 `test_budget_exhausted_flag_and_reset`），
-都改成从 `llm_budget` 出发。`test_budget_cancelled_alarms_notify_the_user_once`
-原来手写 `main._run` 替身再手动 `+= 1`，改成走真实 `_run()`。
-
-**`env` fixture 的 `Budget` 补上 `clock=clock`**：原来省略后用 `SystemClock`，
-写库与读库算的不是同一个自然日——测试与生产同时被这个不一致坑过。
+- **`env` fixture 的 `Budget` 补上 `clock=clock`**：原来省略后用 `SystemClock`，
+  写库与读库算的不是同一个自然日——测试与生产同时被这个不一致坑过。
 
 ## [0.2.101] - 2026-11-20
 

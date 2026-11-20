@@ -1,5 +1,67 @@
 ## [Unreleased]
 
+### 修复（死配置审计：看起来配了，其实永远不生效）
+
+一次全量审计（枚举 `config/*.yaml` 全部叶子键 → 统计非测试代码里的读取点）
+找出 7 处"配置写了但没有任何读取点"。这类假象最费时间：按注释去改配置，
+改完毫无变化，还以为是别的原因。
+
+- **`agent.yaml::heartbeat.*`（5 键）**。真值原本写死在 `agent/schedule.py`，
+  且与配置**数值恰好相等**（2/5/10 min ↔ 120/300/600 s）——改了不生效却完全
+  看不出来。现在 `next_heartbeat(now, hb)` 接 `cfg.agent.heartbeat`，时段表也读配置。
+
+- **`llm.yaml::llm.max_tokens.plain/tools`**。三个 `llm.chat()` 调用点全部显式
+  传值，而 `default_max_tokens()` 只在 `max_tokens` 为假时才生效。遇到
+  「空正文 / `finish_reason=length` / JSON 截断」时第一反应就是调这个值。
+  顺带把 `plain` 从 800 改成 **1000**（代码实际一直用 1000）——接线不能顺带
+  改运行时行为，否则重写路径会被悄悄截断。
+
+- **`agent.yaml::context.sector_events / own_history`**。真值写死在
+  `agent/context.py`，而**同一段的 `context.max_chars` 却是真读的**。
+  `own_history_trim` **删掉了**：唯一没接线的键，也没有明确语义。
+
+- **`llm.yaml::llm.thinking`**。注入的是字面量 `"disabled"`，读不到配置。
+
+- **`notify.yaml::p1_score`**。旧行为是"非 P0 的突破一律 P1"，60 分闸门不存在
+  （直接放大 `p1_merge` 的合并压力）。现在接线，默认 `0 = 不设闸门`，
+  与旧行为完全一致。
+
+- **`strategy.yaml::direct_connection`**。**四处出口全部接线**（行情 Http、
+  LLM、推送 ntfy、MCP westock）。原来只接行情层一处，是半接线：配置说
+  "走代理"却只有行情层听，比完全没有这个开关更误导（本项目专门有 §6.2）。
+
+- **`ToolRegistry._returns` 删掉**。跨回合**无界累加**：`begin_turn()` 生产零调用
+  （`agent/loop.py` 早改用回合级局部变量），但 `invoke()` 仍每次 append 一份
+  完整信封，`_cache` 有 256 上限它没有。agent 进程里注册表是全程单例，
+  一个交易日的 K 线/板块历史全在里面。
+
+### 修复（第七轮评审：接线了但**生产调用点**没接，第 8 次假绿）
+
+派生函数本身都测到了，但**生产调用点**没有一条测试经过。把调用点改回旧写法，
+测试**全绿**——正是这一整天反复出现的那个形状：
+
+| 变异（改回旧写法） | 结果 |
+|---|---|
+| `main.py` 三处 `next_heartbeat(now, self._hb)` → `next_heartbeat(now)` | 72 个测试绿 |
+| `loop.py` 四个 `_max_out(deps)` → 常量 | 101 个测试绿 |
+| `chat/session.py` `out_tokens` → `MAX_TOKENS` | 17 个测试绿 |
+| `context.py` 两处调用点 → 不传 cfg | 11 个测试绿 |
+
+四条都补了走**真实入口**（`_once()` / `ask()` / `render_event()`）的端到端断言，
+现在每个变异都红在断言本身。
+
+- **`next_heartbeat` 加配置异常兜底**。`core/config.py` 只校验这五个键"存在"、
+  不校验类型，所以 `tight_min: "2min"`、`tight:` 留空都写得进去；而 `_once()`
+  在推进心跳前**裸调用**它、`run()` 又吞异常重试——一次类型错误就会让
+  心跳/闹钟/开盘回合全部停摆（v0.2.93 修过同一形状）。现在退回默认节奏并记 warning。
+
+- **`_max_out` 加正数 + 整数校验**。`tools: -5` 会发出非法 `max_tokens`，
+  `tools: yes` 会被 `int(True)` 变成 1（每次空正文 → 一直重试），
+  `tools: 2.9` 会被截成 2。
+
+- **`_EMPTY_LLM` 的 `plain: 800 → 1000`**，与 `config/llm.yaml` 对齐：
+  llm.yaml 缺失时重写路径会从 1000 变成 800。
+
 ## [0.2.104] - 2026-11-20
 
 ### 修复

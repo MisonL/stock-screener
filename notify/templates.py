@@ -343,6 +343,7 @@ _ALERT_TITLE = {
     "agent_down": "agent 进程无响应",
     "agent_stalled": "agent 调度卡死",
     "agent_churn": "agent 空转死循环",
+    "budget_under_reserved": "预算余量不足",
     "jobs_down": "盘中监控已停止",
     "llm_down": "LLM 连续不可用",
     # 进程内自报（agent/main.py、api/routes.py）

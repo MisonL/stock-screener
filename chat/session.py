@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from llm.budget import Budget
+from llm.budget import CHARS_TO_TOKENS, Budget
 from llm.client import LlmClient
 from llm.grounding import GroundedText, enforce
 from llm.prompts import CHAT_SYSTEM_PROMPT
@@ -492,7 +492,7 @@ def _est_in(messages: list[dict], tools: list[dict] | None = None) -> int:
             chars += len(str(c))
     if tools is not None:
         chars += len(str(tools))
-    return int(chars * 1.2)
+    return int(chars * CHARS_TO_TOKENS)
 
 
 def _as_payload(call) -> dict:

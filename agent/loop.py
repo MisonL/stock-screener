@@ -22,6 +22,7 @@ from typing import Any, Awaitable, Callable, Literal
 
 from agent.context import Rendered, render_event, render_heartbeat
 from agent.decision import EMIT_DECISION_TOOL, TurnDecision, parse_decision
+from llm.budget import CHARS_TO_TOKENS
 from llm.grounding import GroundedText, enforce
 
 MAX_TOOL_CALLS_PER_ROUND = 6
@@ -174,14 +175,14 @@ BUDGET_TOO_LARGE_WHY = "本次请求超出剩余额度"
 #:
 #: **实测值，不是拍脑袋**（第五轮评审指出原来的 2000 与真实差 4.5 倍）：
 #: 用真实 `ToolRegistry` 构造最小的心跳回合，`tools` 字符串 6793 字符、
-#: `SYSTEM_PROMPT` 603 字符，`_est_in(msgs, tools)` = **5197**（系数 0.7）。
-#: 取 7000 = 5197 再留 ~35% 余量（重试事件会带更长的历史）。
+#: `SYSTEM_PROMPT` 603 字符，`_est_in(msgs, tools)` = **5189**（系数 0.7）。
+#: 取 7000 = 5189 再留 ~35% 余量（重试事件会带更长的历史）。
 #:
-#: 这个值同时是**自洽性保证**：只要剩余额度 >= 7000，最小回合（5197）就一定能跑，
+#: 这个值同时是**自洽性保证**：只要剩余额度 >= 7000，最小回合（5189）就一定能跑，
 #: 于是不会出现"门控说还能跑、实际每个回合都失败写空转"的尾巴。
 #:
 #: **它跟着 `CHARS_TO_TOKENS` 缩放**：字符估算从 1.2 改成 0.7 后，同一个最小回合
-#: 从 8911 变成 5197（8911 × 0.7/1.2），所以这里从 12000 变成 7000。
+#: 从 8911 变成 5189（8911 × 0.7/1.2），所以这里从 12000 变成 7000。
 #: 两者必须同时改，否则"最小回合放得下"的判据就和实际估算口径脱钩。
 MIN_TURN_EST_IN = 7000
 #: "轮数用尽"的 why 文案。**必须与 `agent/main.py` 的判定同源**：
@@ -233,28 +234,6 @@ def budget_shortfall(deps, est_in: int, est_out: int = MAX_TOKENS) -> str | None
     if deps.budget.allow(est_in=MIN_TURN_EST_IN, est_out=est_out):
         return BUDGET_TOO_LARGE_WHY
     return BUDGET_EXHAUSTED_WHY
-
-
-#: 字符 → token 的换算系数（**实测校准，不是拍的**）。
-#:
-#: v0.2.103 之前的实现是 `chars * 1.2`（"中文 1 字 ≈ 1 token，再留 20%"）。
-#: 用生产 `token_audit` 的 247 条真实用量反推，实际比值是：
-#:
-#:     token/字符：中位 0.383、P99 0.511、**最大 0.530**
-#:
-#: 也就是说 1.2 系统性高估了 **3.1 倍**。原因有两条：
-#:
-#: 1. 上下文里**大部分字符是 JSON**（工具 schema、工具返回），JSON 的引号、
-#:    逗号、括号 tokenize 得极省，实测只有 ~0.43 token/字符；
-#: 2. 中文正文也不到 1 token/字符。
-#:
-#: 取 **0.7**：对实测最大值 0.530 仍留 **32% 余量**（预扣必须偏高——低估会让真实
-#: 花费突破额度上限，而扣减没有退款路径）。同时把容量从"约 3.1 倍高估"降到
-#: "约 1.3~1.8 倍偏高"，**同样的额度能覆盖约 1.7 倍的回合**。
-#:
-#: 改这个系数必须同步改 `MIN_TURN_EST_IN` 与 `config/llm.yaml` 的注释口径，
-#: 否则三者会对不上（见 `tests/agent/test_est_calibration.py`）。
-CHARS_TO_TOKENS = 0.7
 
 
 def _est_in(msgs: list[dict], tools: list[dict] | None = None) -> int:

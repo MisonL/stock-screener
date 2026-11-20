@@ -18,7 +18,7 @@ from typing import Callable, Literal
 from core.clock import SH, TradingCalendar
 
 AlertKind = Literal["agent_down", "jobs_down", "agent_stalled", "llm_down",
-                    "agent_churn"]
+                    "agent_churn", "budget_under_reserved"]
 
 STALE_S = 120                  # 心跳超过这么久没更新 → 判死
 CHECK_EVERY_S = 30             # 与 api/main.py 的调度周期一致
@@ -58,6 +58,19 @@ AGENT_TURN_CHURN_PER_HOUR = 1000
 #: v0.2.97 改成直接取消之后，这段噪声消失。也就是说 114 不是"合法忙碌逼近阈值"，
 #: 而是**快线差点抓住一个真 bug**——留在这里作为阈值不该再调低的证据。
 AGENT_TURN_CHURN_PER_5MIN = 120
+
+#: 预扣预算相对**真实用量**的余量下限（v0.2.103）。
+#:
+#: 预算是硬上限：低估会让真实花费突破额度，而扣减没有退款路径。所以
+#: `agent/loop.py::CHARS_TO_TOKENS` 是**实测校准**出来的（0.7，对 11-20 的
+#: 实测最大 0.530 token/字符留 32% 余量），不是拍脑袋。
+#:
+#: 但样本之外永远可能更糟——中文密集的长段落 token/字符 会高于 JSON 密集的。
+#: 这条规则就是这个风险的探针：取最近 N 次 attempt 的
+#: `real_in / reserve_in` 中位值，超过本阈值就说明**预扣快不够了**，
+#: 该把系数调高。它不会自动改系数（钱的事不自动决定），只负责别让它悄悄漂。
+BUDGET_RESERVE_MARGIN_MIN = 0.85
+BUDGET_MARGIN_WINDOW = 50
 
 
 def in_watch_window(now: datetime) -> bool:
@@ -162,6 +175,31 @@ def check(conn, clock, dispatcher, *, cfg=None, agent_turn_stale_min: int | None
                   f"最近 5 分钟 {burst} 个回合（正常日约 5~8、暴跌日峰值约 20，"
                   f"阈值 {AGENT_TURN_CHURN_PER_5MIN}），疑似空转死循环", now):
             fired.append("agent_churn")
+
+    # **预扣余量探针**：真实用量逼近预扣值时报警（v0.2.103）。
+    # 系数是按 11-20 的实测校准的；样本之外若出现中文更密集的回合，
+    # `real_in / reserve_in` 会升高。中位值超过 BUDGET_RESERVE_MARGIN_MIN
+    # 说明余量已经不足以覆盖波动，该调高 `CHARS_TO_TOKENS` 了。
+    # **必须限定 `pool='agent'`**（第六轮评审 S1）：chat 池的 real/reserve 比
+    # 与 agent 池不同（它历史更短、正文占比更高），混进来会把中位值往下拉，
+    # 于是 agent 真的低估时反而报不出来——而这是这次改动**唯一**的运行时钱粮守卫。
+    #
+    # **`ts <= now` 上界**（评审 L1）：churn 规则当初就是踩了这个坑才加的注释。
+    # 离线回放/干跑时有"未来"的行，不加会把复盘结论带偏。
+    margin_rows = conn.execute(
+        "SELECT real_in, reserve_in FROM token_audit"
+        " WHERE pool = 'agent' AND real_in > 0 AND reserve_in > 0 AND ts <= ?"
+        " ORDER BY id DESC LIMIT ?", (now.isoformat(), BUDGET_MARGIN_WINDOW)).fetchall()
+    if len(margin_rows) >= BUDGET_MARGIN_WINDOW // 2:
+        ratios = sorted(r[0] / r[1] for r in margin_rows)
+        median_ratio = ratios[len(ratios) // 2]
+        if median_ratio > BUDGET_RESERVE_MARGIN_MIN:
+            if _alert(conn, clock, dispatcher, "budget_under_reserved",
+                      f"最近 {len(ratios)} 次调用的真实用量已达预扣的 "
+                      f"{median_ratio * 100:.0f}%（阈值 "
+                      f"{BUDGET_RESERVE_MARGIN_MIN * 100:.0f}%），"
+                      f"预算余量不足，请调高 agent/loop.py::CHARS_TO_TOKENS", now):
+                fired.append("budget_under_reserved")
 
     # 心跳本身断了就只判心跳：心跳陈旧时 `loop_last_tick_at` 必然也旧，
     # 两个判据同时命中只会让文案在「进程死了」和「循环卡了」之间反复横跳。

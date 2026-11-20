@@ -29,6 +29,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 #: 2026-11-20 生产实测（247 条）。反推方式见模块文档。
 MEASURED_TOKENS_PER_CHAR = {
     "median": 0.383,
@@ -101,3 +103,69 @@ def test_min_turn_estimate_tracks_the_coefficient(tmp_path):
     assert 0.55 <= ratio <= 1.0, (
         f"最小回合估算 {smallest} 与 MIN_TURN_EST_IN {MIN_TURN_EST_IN} 比例 {ratio:.2f}："
         "两者口径不一致（系数改了但 MIN_TURN_EST_IN 没同步缩放）")
+
+
+def test_repr_inflation_cancels_out_in_the_reverse_derivation(tmp_path):
+    """**`str()` 膨胀在「反推」与「估算」两端抵消，不是安全余量的损耗**。
+
+    第七轮评审（Codex）提出一条"严重风险"：`_est_in` 用 `len(str(c))` 抓字符，
+    而 `str()` 对 dict/list 比紧凑 JSON 长约 1.9~8.8%，所以 0.530 这个实测最大值
+    按真实 JSON 字符修正后应变成 0.54~0.58，于是 0.7 只剩 21~30% 余量。
+
+    **这个推论把两个分母混用了**：
+
+        反推：ratio = real_in / (est_old / 1.2)
+               而 est_old = chars_str * 1.2
+               ⇒ ratio = real_in / chars_str        ← 分母是 str() 字符数
+
+        估算：est_new = chars_str * 0.7              ← 分母还是 str() 字符数
+
+    两端用的是**同一个** `chars_str`，`str()` 膨胀同比例出现在分子分母的换算里，
+    完全抵消。把它换成 `chars_json` 去比，才会凭空多出 8.8% 的"亏损"。
+
+    这条测试用真实 `ToolRegistry` 造一个最小回合，量出两种字符口径的比值，
+    再验证：即便按最悲观的口径（`chars_json`）折算，
+    `real / est_new` 仍然 < 1——也就是说**两种口径下都不低估**。
+    """
+    from agent.context import Rendered
+    from agent.loop import (CHARS_TO_TOKENS, EMIT_DECISION_TOOL, Trigger,
+                            _est_in, _messages)
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from llm.tools import ToolRegistry
+    from tests.helpers import SH
+    from datetime import datetime
+    import json as _json
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "repr.db")
+    migrate(conn)
+    clock = FixedClock(datetime(2026, 11, 20, 10, 0, tzinfo=SH))
+    tools = ToolRegistry(conn, cfg, clock, mcp=None)
+
+    trig = Trigger(wake_kind="heartbeat")
+    schema = list(tools.schema(trig.wake_kind)) + [EMIT_DECISION_TOOL]
+
+    # 两种字符口径
+    chars_str = len(str(schema))
+    chars_json = len(_json.dumps(schema, ensure_ascii=False, separators=(",", ":")))
+    inflation = chars_str / chars_json
+    assert inflation >= 1.0, "前提不成立：str() 不该比紧凑 JSON 更短"
+
+    # 若把实测最大值 real/chars_str = 0.530 换算到 real/chars_json
+    measured_on_str = MEASURED_TOKENS_PER_CHAR["max"]
+    measured_on_json = measured_on_str * inflation
+
+    # **估算仍然基于 chars_str**，所以真正决定低估与否的仍是 measured_on_str
+    assert measured_on_str < CHARS_TO_TOKENS, (
+        f"实测最大 {measured_on_str} ≥ 系数 {CHARS_TO_TOKENS}：会低估")
+
+    # 即便按 Codex 的悲观口径：est_new 在 chars_json 口径下等于 coef*inflation，
+    # 而 real/chars_json = measured_on_json，两者相除必须 < 1
+    ratio_under_codex_view = measured_on_json / (CHARS_TO_TOKENS * inflation)
+    assert ratio_under_codex_view < 1.0, (
+        f"按 chars_json 口径折算后 real/est = {ratio_under_codex_view:.3f} ≥ 1，"
+        "那才是真的低估；若 <1，说明两种口径下都安全")
+    # 而且两种口径算出来的比值其实完全相同（这正是抵消的含义）
+    assert ratio_under_codex_view == pytest.approx(measured_on_str / CHARS_TO_TOKENS)

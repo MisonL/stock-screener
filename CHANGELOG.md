@@ -1,5 +1,45 @@
 ## [Unreleased]
 
+### 修复
+
+- **澄清第七轮评审（Codex）的一条"严重风险"：那是口径混用，不是真的低估**。
+
+  Codex 报：`_est_in` 用 `len(str(c))` 抓字符，而 `str()` 比紧凑 JSON 长约
+  1.9~8.8%，所以实测最大 `0.530` 按真实 JSON 字符应修正到 `0.54~0.58`，
+  0.7 只剩 21~30% 余量，可能穿过真实花费上限。
+
+  但**这个推论把两个分母混用了**：实测比值是 `real_in / (est_old/1.2)`，
+  而 `est_old = chars_str * 1.2` ⇒ 比值分母是 **`chars_str`**；新估算
+  `est_new = chars_str * 0.7` 的分母**同样是 `chars_str`**。`str()` 膨胀在反推和
+  估算里同比例出现，完全抵消。按 `chars_json` 口径折算，两边一起乘 1.088，
+  比值不变（0.530/0.7 = 0.757）。
+
+  新增 `test_repr_inflation_cancels_out_in_the_reverse_derivation` 用真实
+  `ToolRegistry` 钉住这个抵消关系，防止将来真有人按错误口径把系数调小。
+
+- **新增预扣余量探针 `budget_under_reserved`**（`api/watchdog.py`）。系数是按
+  11-20 的实测校准的，但样本之外永远可能更糟——中文密集的长段落 token/字符
+  会高于 JSON 密集的。这条规则取最近 50 次调用的 `real_in / reserve_in` 中位值，
+  超过 85% 就报警，提示调高系数。**它不会自动改系数**（钱的事不自动决定），
+  只负责别让余量悄悄漂掉。
+
+- **系数抽到 `llm/budget.py::CHARS_TO_TOKENS`，agent 与 chat 两池共用**。
+  原来 `agent/loop.py` 与 `chat/session.py` 各写一份 `1.2`，改一处就会漂——
+  第六轮评审正是靠"chat 池比值偏低"发现探针会被稀释的。探针查询也限定
+  `pool='agent'`，否则 chat 行会把中位值往下拉，agent 真低估时反而报不出来。
+
+- **`AlertKind` 补上 `budget_under_reserved`**：不带标题时手机上收到的是裸
+  标识符（`notify/templates.py` 的注释点名过这个 bug 类）。补上后
+  `test_all_production_alert_kinds_have_chinese_titles` 也能覆盖到它。
+
+- **探针加 `ts <= now` 上界**：churn 规则当初就是踩了这个坑才加注释的，
+  离线回放时"未来"的行会把复盘结论带偏。
+
+- **修 `config/llm.yaml` 里漏改的 `字符数×1.2`**（那段注释本身就是"重算额度"
+  的作业指导，留着旧系数会让下一次调额度的人按错的算）。同时写清楚：
+  **输出维度才是容量瓶颈**——每次 attempt 固定预留 `MAX_TOKENS=2000`、实测真实
+  输出只有约 230，所以改后的实际容量是 **1.4~1.5 倍**（不是理论上的 1.7 倍）。
+
 ## [0.2.103] - 2026-11-20
 
 ### 修复

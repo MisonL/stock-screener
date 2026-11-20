@@ -533,3 +533,93 @@ def test_short_window_does_not_fire_on_a_normal_busy_day(conn):
     check(conn, clock, d)
     assert not [a for a in d.alerts if a[0] == "agent_churn"], (
         "暴跌日正常的每 5 分钟 20 个回合被误报成 churn")
+
+
+def _clock_103():
+    from core.clock import FixedClock
+    from tests.helpers import SH
+    from datetime import datetime
+    return FixedClock(datetime(2026, 11, 20, 10, 30, tzinfo=SH))
+
+
+def test_budget_margin_probe_fires_when_reserve_is_too_thin(conn):
+    """**预扣余量不足要报警**（v0.2.103）。
+
+    `CHARS_TO_TOKENS` 是按 11-20 的实测校准的（0.7，对实测最大 0.530
+    token/字符留 32% 余量）。样本之外永远可能更糟（中文更密集的段落），
+    而预算低估 = 真实花费突破额度上限、且扣减没有退款路径。
+
+    这条规则不会自动改系数——钱的事不自动决定——只负责在余量被吃掉时
+    喊一声，别让它悄悄漂。
+    """
+    import api.watchdog as w
+
+    clock = _clock_103()
+    # 40 次调用：真实用量已经达到预扣的 95% —— 余量几乎没有了
+    for _ in range(40):
+        conn.execute(
+            "INSERT INTO token_audit(ts, pool, real_in, real_out, estimated,"
+            " reserve_in, reserve_out, attempt_seq) VALUES (?,?,?,?,?,?,?,?)",
+            (clock.now().isoformat(), "agent", 9500, 200, 0, 10000, 2000, 1))
+    conn.commit()
+
+    fired = w.check(conn, clock, Disp())
+    assert "budget_under_reserved" in fired, (
+        f"真实用量已达预扣的 95% 却没报警：预算会悄悄低估，真实花费突破上限（{fired}）")
+
+
+def test_budget_margin_probe_stays_quiet_with_healthy_margin(conn):
+    """**余量健康时不该报警**——这条规则只在真出问题时响。
+
+    系数 0.7 下，11-20 实测的 `real_in / reserve_in` 是
+    `0.383 / 0.7 = 0.547`（预扣约为真实的 1.83 倍），远低于 0.85 阈值。
+    如果正常情况就报警，规则会被静音，等于没有。
+
+    **注意这个基线跟系数绑死**：系数改了这里要跟着改，否则测的是过期基线。
+    """
+    import api.watchdog as w
+
+    clock = _clock_103()
+    for _ in range(40):
+        conn.execute(
+            "INSERT INTO token_audit(ts, pool, real_in, real_out, estimated,"
+            " reserve_in, reserve_out, attempt_seq) VALUES (?,?,?,?,?,?,?,?)",
+            (clock.now().isoformat(), "agent", 5470, 200, 0, 10000, 2000, 1))
+    conn.commit()
+
+    fired = w.check(conn, clock, Disp())
+    assert "budget_under_reserved" not in fired, (
+        f"预扣是真实的 1.8 倍却报警：规则会在正常日就响，等于没有（{fired}）")
+
+
+def test_margin_probe_ignores_the_chat_pool(conn):
+    """**chat 池的行不能稀释 agent 池的中位值**（第六轮评审 S1）。
+
+    探针是这次"钱"改动**唯一**的运行时守卫。如果把 chat 的行也算进来，
+    agent 真低估时可能报不出来——chat 池的正文占比更高、历史更长，
+    `real/reserve` 与 agent 池不同。
+
+    这里造 60 条 chat 行（比值极低）+ 26 条 agent 行（比值 0.95），
+    探针必须只看 agent 那一半。
+    """
+    import api.watchdog as w
+
+    clock = _clock_103()
+    # **顺序很重要**：探针取的是 `ORDER BY id DESC LIMIT 50`。
+    # 先插 agent、再插 chat，窗口里就全是 chat 行——不限定 pool 时中位值是 0.1，
+    # 探针沉默。反过来插的话两种实现都会响，测了个寂寞（第一版就是）。
+    for _ in range(26):
+        conn.execute(
+            "INSERT INTO token_audit(ts, pool, real_in, real_out, estimated,"
+            " reserve_in, reserve_out, attempt_seq) VALUES (?,?,?,?,?,?,?,?)",
+            (clock.now().isoformat(), "agent", 9500, 200, 0, 10000, 2000, 1))
+    for _ in range(60):
+        conn.execute(
+            "INSERT INTO token_audit(ts, pool, real_in, real_out, estimated,"
+            " reserve_in, reserve_out, attempt_seq) VALUES (?,?,?,?,?,?,?,?)",
+            (clock.now().isoformat(), "chat", 1000, 100, 0, 10000, 2000, 1))
+    conn.commit()
+
+    fired = w.check(conn, clock, Disp())
+    assert "budget_under_reserved" in fired, (
+        f"agent 池 26 条都是 0.95 却被 chat 池的 0.1 稀释掉了：探针会永久沉默（{fired}）")

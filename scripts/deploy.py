@@ -70,6 +70,14 @@ PRESERVE_ON_TARGET = (
 _DRIFT_KEYS = (
     ("config/agent.yaml", "shadow_mode"),
     ("config/llm.yaml", "agent:"),
+    # v0.2.105：这三处从"死配置"变成了真生效，站点若还是旧值，
+    # 行为会和仓库默认值不同 —— 必须让运维看见。
+    # `max_tokens`：站点 800、仓库 1000（重写路径会被悄悄截断）。
+    ("config/llm.yaml", "max_tokens"),
+    # `p1_score`：站点 60、仓库 0（60 会把低分突破降级成 P2）。
+    ("config/notify.yaml", "p1_score"),
+    # `own_history_trim`：已删除，站点若还有就是个死键。
+    ("config/agent.yaml", "own_history_trim"),
 )
 
 

@@ -1,5 +1,18 @@
 ## [Unreleased]
 
+### 修复
+
+- **预算门控的输出侧写死了 `MAX_TOKENS`，与实发量脱钩**（Codex 复核）。
+  `agent/main.py::_budget_exhausted_now()` 判的是 `rem_out < MAX_TOKENS`（2000），
+  而请求真正发的是 `_max_out(deps)`（读 `llm.max_tokens.tools`）。
+  配置改成 1000、余额剩 1500 时，请求**发得出去**却被判成"额度耗尽"，
+  agent 整个下午不再开口——正是这次事故要消灭的那种"还有额度却停摆"。
+  现在两侧都走 `_max_out(deps)`。
+
+- **`jobs/main.py` 两处 `trust_env=False` 也接线**。上一版只接了行情/LLM/推送/MCP
+  四个出口，自检与上游探活这两处仍是字面量——同样会让
+  `direct_connection` 变成"配置说走代理、实际只有一部分听"。
+
 ## [0.2.106] - 2026-11-21
 
 ### 修复

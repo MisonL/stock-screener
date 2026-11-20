@@ -18,8 +18,8 @@ from datetime import datetime, timedelta
 from agent.attention import AttentionLayer
 from agent.heartbeat import Heartbeat
 from agent.journal import record as journal_record
-from agent.loop import (BUDGET_EXHAUSTED_WHY, ROUNDS_EXHAUSTED_WHY, Deps, Trigger,
-                        render_trigger, run_with_deadline)
+from agent.loop import (BUDGET_EXHAUSTED_WHY, BUDGET_TOO_LARGE_WHY, ROUNDS_EXHAUSTED_WHY,
+                        Deps, Trigger, render_trigger, run_with_deadline)
 from agent.schedule import (after_alarm, due_alarms, next_heartbeat, release_alarm, schedule_alarm,
                             set_fired_turn)
 from core.clock import SH, SystemClock, TradingCalendar
@@ -270,6 +270,21 @@ class AgentMain:
                 # 和「静默 pending 再烧 18 轮」是同一个毛病，只是这次省了钱。
                 # 每条闹钟只推一次（取消是单向的，不会重复），走低优先级便签。
                 self._notify_alarm_give_up(trigger)
+            elif getattr(result, "why", "") == BUDGET_TOO_LARGE_WHY:
+                # **"本次请求超出剩余额度"不能退回重试**（v0.2.97，生产实测回归）。
+                #
+                # v0.2.96 为了修「差 1 个 token 就锁死整天」，把它和"额度真用完"
+                # 分开了——但退回重试是错的处理：额度**只会更少**，同一条闹钟
+                # 隔 60 秒再跑必然还是太大。
+                #
+                # 实测代价（11-20 13:20–13:40，额度剩 9056 / 5.5M）：35 条闹钟
+                # 各退回 3 次，写了 **105 行 `rounds=0, latency_ms=0, decision=error`**
+                # 的空转记录——正是 11-19 事故的记录形状，只是有 3 次上限兜着，
+                # 不会无限转。但 10 分钟 105 行照样把日志冲垮、把 churn 快线顶到 114。
+                #
+                # 正确处理：**这条闹钟今天跑不动了，直接取消并记原因**。
+                # 不 latch 整天（心跳/事件可能更小、还跑得动），也不重试。
+                self._cancel_alarm(trigger.alarm_id, "额度不足（请求超出剩余额度）")
             elif result.decision.kind in ("error", "invalid", "timeout"):
                 exhausted = getattr(result, "why", "") == BUDGET_EXHAUSTED_WHY
                 if exhausted:

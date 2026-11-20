@@ -2265,3 +2265,73 @@ async def test_oversized_request_does_not_latch_the_whole_day(tmp_path):
     assert budget.allow(est_in=0, est_out=0) is True   # 额度表本身没坏
     assert budget_shortfall(deps, MIN_TURN_EST_IN, MAX_TOKENS) == BUDGET_EXHAUSTED_WHY, (
         "连最小请求都放不下却没判成'额度用完'：会一直重试到收盘")
+
+
+async def test_too_large_alarm_is_cancelled_not_retried(tmp_path):
+    """**"本次请求超出剩余额度"不能退回重试**（v0.2.97，生产实测的回归）。
+
+    v0.2.96 为了修「差 1 个 token 锁死整天」，把它和"额度真用完"分开了。
+    但当时仍然走 `release_alarm` 退回重试——而额度**只会更少**，
+    隔 60 秒再跑必然还是太大。
+
+    实测代价（11-20 13:20–13:40，额度剩 9056 / 5.5M）：35 条闹钟各退回 3 次，
+    写了 **105 行 `rounds=0, latency_ms=0, decision=error`** 的空转记录——
+    正是 11-19 事故的记录形状，只是有 3 次上限兜着不会无限转。
+    但 10 分钟 105 行照样把日志冲垮、把 churn 5 分钟快线顶到 **114**（阈值 120）。
+
+    正确处理：**这条闹钟今天跑不动了，直接取消并记原因**。
+    不 latch 整天（心跳/事件上下文更小，可能还跑得动），也不重试。
+    """
+    from agent.main import AgentMain
+    from agent.schedule import due_alarms, schedule_alarm
+    from agent.decision import TurnDecision
+    from agent.loop import BUDGET_TOO_LARGE_WHY, TurnResult
+    import agent.main as m_mod
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from tests.helpers import SH
+    from datetime import datetime, timedelta
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "toolarge.db")
+    migrate(conn)
+    now = datetime(2026, 11, 20, 13, 27, tzinfo=SH)
+    clock = FixedClock(now)
+    schedule_alarm(conn, turn_id=1, due_at=now.isoformat(), market="cn_main",
+                   target="sh600519", note="回访", now=now)
+    alarm = due_alarms(conn, now)[0]
+    conn.execute("UPDATE agent_schedule SET status='fired' WHERE id=?", (alarm["id"],))
+    conn.commit()
+
+    class _Deps:
+        def __init__(self):
+            self.conn = conn
+            self.cfg = cfg
+            self.clock = clock
+            self.pusher = None
+
+    main = AgentMain(_Deps(), clock)
+
+    async def _fake(*a, **k):
+        return TurnResult(decision=TurnDecision.error(BUDGET_TOO_LARGE_WHY),
+                          rounds=0, tool_calls=[], rendered=None, usage=None,
+                          fallback=0, latency_ms=0, why=BUDGET_TOO_LARGE_WHY)
+
+    with __import__("pytest").MonkeyPatch.context() as mp:
+        mp.setattr(m_mod, "run_with_deadline", _fake)
+        trig = main._trigger("alarm", rounds=6, deadline=0, alarm_id=alarm["id"],
+                             target="sh600519", note="回访")
+        await main._run(trig)
+
+    row = conn.execute("SELECT status, attempts, cancelled_reason FROM agent_schedule"
+                       " WHERE id=?", (alarm["id"],)).fetchone()
+    assert row[0] == "cancelled", (
+        f"闹钟仍 {row[0]!r}：额度只会更少，退回重试必然再失败，"
+        "每次写一行空转——10 分钟能写上百行")
+    assert "额度不足" in row[2], f"取消原因没记清楚：{row[2]!r}"
+
+    # 第二次也不能再被取出来
+    clock._t = now + timedelta(seconds=120)
+    assert not [a for a in due_alarms(conn, clock.now()) if a["id"] == alarm["id"]], (
+        "取消后仍被 due_alarms 取出：还会再写空转行")

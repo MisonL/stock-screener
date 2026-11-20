@@ -2335,3 +2335,125 @@ async def test_too_large_alarm_is_cancelled_not_retried(tmp_path):
     clock._t = now + timedelta(seconds=120)
     assert not [a for a in due_alarms(conn, clock.now()) if a["id"] == alarm["id"]], (
         "取消后仍被 due_alarms 取出：还会再写空转行")
+
+
+async def test_budget_tail_noise_stops_after_consecutive_failures(tmp_path):
+    """**额度尾巴上的空转要在几次之后停下来**（v0.2.98，生产实测）。
+
+    11-20 13:48–13:58 实际观察（v0.2.97 部署后）：额度剩 9056 / 5.5M，
+    典型请求要 21888，于是**每个心跳/事件回合各写一行**
+    `rounds=0, latency_ms=0, decision=error`：
+
+        13:52:00 heartbeat error    13:52:09 event error  ×2
+        13:57:00 heartbeat error
+
+    每 5 分钟一行不算事故，但正是 11-19 那种记录形状，纯粹是噪声。
+
+    **不能靠调大 `MIN_TURN_EST_IN` 解决**：那会把 Codex 实测的场景
+    （剩 41366、大请求 41367、但心跳只需 8913 完全跑得动）又锁成"今天没了"。
+    判定必须看**连续性**——连续 3 次都跑不动才停；中途成功一次就清零。
+    """
+    from agent.main import BUDGET_FAIL_STREAK_TO_LATCH, AgentMain
+    from agent.decision import TurnDecision
+    from agent.loop import BUDGET_EXHAUSTED_WHY, BUDGET_TOO_LARGE_WHY, TurnResult
+    import agent.main as m_mod
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from tests.helpers import SH
+    from datetime import datetime
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "tail.db")
+    migrate(conn)
+    now = datetime(2026, 11, 20, 13, 52, tzinfo=SH)
+    clock = FixedClock(now)
+
+    class _Deps:
+        def __init__(self):
+            self.conn = conn
+            self.cfg = cfg
+            self.clock = clock
+            self.pusher = None
+
+    main = AgentMain(_Deps(), clock)
+    be = main._budget_unavailable()
+    assert be is False
+
+    async def _too_large(*a, **k):
+        return TurnResult(decision=TurnDecision.error(BUDGET_TOO_LARGE_WHY),
+                          rounds=0, tool_calls=[], rendered=None, usage=None,
+                          fallback=0, latency_ms=0, why=BUDGET_TOO_LARGE_WHY)
+
+    async def _ok(*a, **k):
+        return TurnResult(decision=TurnDecision(kind="silent", speak=False,
+                                                why_silent="无事"),
+                          rounds=1, tool_calls=[], rendered=None, usage=None,
+                          fallback=0, latency_ms=3000, why=None)
+
+    trig = main._trigger("heartbeat", rounds=3, deadline=0)
+
+    with __import__("pytest").MonkeyPatch.context() as mp:
+        mp.setattr(m_mod, "run_with_deadline", _too_large)
+        for i in range(BUDGET_FAIL_STREAK_TO_LATCH - 1):
+            await main._run(trig)
+            assert main._quota_exhausted is False, (
+                f"第 {i+1} 次失败就 latch 了：单次'太大'不该等于'今天没了'"
+                "（Codex 实测场景：剩 41366、大请求 41367、心跳 8913 跑得动）")
+
+        # 中途成功一次 → 计数清零，不该 latch
+        mp.setattr(m_mod, "run_with_deadline", _ok)
+        await main._run(trig)
+        assert main._quota_exhausted is False
+        assert main._budget_fail_streak == 0, "成功之后失败计数没有清零"
+
+        # 再连续失败到上限 → 应当停止尝试
+        mp.setattr(m_mod, "run_with_deadline", _too_large)
+        for _ in range(BUDGET_FAIL_STREAK_TO_LATCH):
+            await main._run(trig)
+        assert main._quota_exhausted is True, (
+            f"连续 {BUDGET_FAIL_STREAK_TO_LATCH} 次都因额度失败仍不 latch："
+            "额度尾巴上会每 5 分钟写一行空转，直到收盘")
+
+
+async def test_exhausted_why_latches_immediately(tmp_path):
+    """**"连最小请求都放不下"要立即 latch，不能也等 3 次**。
+
+    它和"这次太大"的区别是：最小请求都放不下，说明无论上下文多小都跑不动，
+    等 3 次只会白写两行。
+    """
+    from agent.main import AgentMain
+    from agent.decision import TurnDecision
+    from agent.loop import BUDGET_EXHAUSTED_WHY, TurnResult
+    import agent.main as m_mod
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from tests.helpers import SH
+    from datetime import datetime
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "imm.db")
+    migrate(conn)
+    clock = FixedClock(datetime(2026, 11, 20, 14, 0, tzinfo=SH))
+
+    class _Deps:
+        def __init__(self):
+            self.conn = conn
+            self.cfg = cfg
+            self.clock = clock
+            self.pusher = None
+
+    main = AgentMain(_Deps(), clock)
+
+    async def _exhausted(*a, **k):
+        return TurnResult(decision=TurnDecision.error(BUDGET_EXHAUSTED_WHY),
+                          rounds=0, tool_calls=[], rendered=None, usage=None,
+                          fallback=0, latency_ms=0, why=BUDGET_EXHAUSTED_WHY)
+
+    with __import__("pytest").MonkeyPatch.context() as mp:
+        mp.setattr(m_mod, "run_with_deadline", _exhausted)
+        await main._run(main._trigger("heartbeat", rounds=3, deadline=0))
+
+    assert main._quota_exhausted is True, (
+        "连最小请求都放不下却没立即 latch：还会再白写两行")

@@ -50,6 +50,21 @@ CONFIRM_EXPIRE_H = 24
 #: 作废扫描的最小间隔（秒）。每轮 `_once()`（2 秒）都扫一次没必要，
 #: 但也不能像原来那样"一天只扫一次"——那样同日积压扫不到。
 ALARM_SWEEP_EVERY_S = 60
+#: 连续多少个回合因额度失败，才认定"今天额度真的用完了"并 latch。
+#:
+#: 为什么需要这个：`budget_shortfall()` 把"这次请求太大"和"今天没了"分开后，
+#: 额度**接近**用完的那段尾巴（实测剩 9056 / 5.5M 而典型请求要 21888）
+#: 会让每个心跳/事件回合各写一行 `rounds=0, latency_ms=0, decision=error`。
+#: 每次 5 分钟一行不算事故，但它是**纯粹的噪声**，而且正好是这个项目最怕的
+#: 那种记录形状（11-19 事故就是这种行）。
+#:
+#: 为什么不直接把 `MIN_TURN_EST_IN` 调大：那会把 Codex 实测的场景
+#: （剩 41366、大请求 41367、但心跳只需 8913 完全跑得动）又锁成"今天没了"。
+#: 判定必须看**连续性**，不能看单次估算——单次估算永远可能乐观或保守。
+#:
+#: 连续 3 次都因额度失败 = 这段尾巴里所有回合都跑不动了，可以停止尝试；
+#: 中途只要有一次成功（哪怕是最小的心跳），计数清零，不 latch。
+BUDGET_FAIL_STREAK_TO_LATCH = 3
 #: 单轮 `_once()` 最多跑几个闹钟回合。宕机后积压十几条同时到期时，
 #: 一口气串行跑完会连着烧掉上百轮 LLM；每轮限 2 条，积压照样被消化。
 ALARM_MAX_PER_ONCE = 2
@@ -198,6 +213,8 @@ class AgentMain:
         self.budget_exhausted = False
         # 今日额度是否用完（跨日复位；与"记账写库坏了"是两回事，见 `_once()`）
         self._quota_exhausted = False
+        # 连续因额度失败的回合数（见 BUDGET_FAIL_STREAK_TO_LATCH）
+        self._budget_fail_streak = 0
         self._last_day = self.clock.today()
         # 上一次扫过期闹钟的时刻（见 `_once()` 里的闹钟循环）
         self._alarm_swept_at = None
@@ -308,10 +325,22 @@ class AgentMain:
                            getattr(trigger, "target", None) or _first_target(trigger),
                            result.decision.schedule_note or "",
                            now=self.clock.now())
-        if getattr(result, "why", None) == BUDGET_EXHAUSTED_WHY:
-            # 额度用完：**跨日才恢复**，所以单独记一个 latch，别被下面的重读清掉
+        why = getattr(result, "why", None)
+        if why == BUDGET_EXHAUSTED_WHY:
+            # 连"最小请求"都放不下 —— 真的没了，立即 latch
             self._quota_exhausted = True
             self.budget_exhausted = True
+            self._budget_fail_streak = BUDGET_FAIL_STREAK_TO_LATCH
+        elif why == BUDGET_TOO_LARGE_WHY:
+            # "这次太大"——可能是额度尾巴，也可能只是这个回合上下文大。
+            # **看连续性，不看单次**：连续 N 次都失败才认为今天跑不动了。
+            self._budget_fail_streak += 1
+            if self._budget_fail_streak >= BUDGET_FAIL_STREAK_TO_LATCH:
+                self._quota_exhausted = True
+                self.budget_exhausted = True
+        else:
+            # 任何一次成功（哪怕最小的心跳）都证明额度还在
+            self._budget_fail_streak = 0
         # **这里刻意不再镜像 `budget_exhausted`**（第四轮评审发现第 6 次假绿的
         # 副产品）：`_once()` 在**闹钟与开盘回合之前**无条件重算一次
         # `budget_exhausted = _quota_exhausted or _budget_unavailable()`，
@@ -517,6 +546,7 @@ class AgentMain:
             self._last_day = self.clock.today()
             self.budget_exhausted = False
             self._quota_exhausted = False
+            self._budget_fail_streak = 0
             self._open_attempts = 0
         if self.next_heartbeat_at is None:
             self.next_heartbeat_at = next_heartbeat(now)

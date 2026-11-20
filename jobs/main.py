@@ -34,6 +34,7 @@ from jobs.cleanup import cleanup
 from jobs.intraday import IntradayTick
 from jobs.snapshot import SnapshotLoops, calls_by_scope
 from core.clock import SH, SystemClock, TradingCalendar
+from core.http import direct_http as _direct_http
 
 HEARTBEAT_S = 30
 def _null_lock():                                  # pragma: no cover - 无锁测试兜底
@@ -446,7 +447,8 @@ def self_check(cfg, conn, clock, reg=None, http=None) -> dict[str, bool]:
     try:
         import httpx
 
-        resp = httpx.get(f"{cfg.notify.ntfy_url}/v1/health", timeout=10, trust_env=False)
+        resp = httpx.get(f"{cfg.notify.ntfy_url}/v1/health", timeout=10,
+                  trust_env=not _direct_http())
         out["ntfy"] = resp.status_code == 200 and (resp.json() or {}).get("healthy") is True
     except Exception:                              # noqa: BLE001
         out["ntfy"] = False
@@ -498,7 +500,8 @@ def _llm_probe(cfg) -> bool:                       # pragma: no cover - 网络�
              or getattr(getattr(cfg, "llm", None), "model", None) or "").strip()
     if not model:
         return False
-    resp = httpx.post(f"{url.rstrip('/')}/chat/completions", timeout=10, trust_env=False,
+    resp = httpx.post(f"{url.rstrip('/')}/chat/completions", timeout=10,
+               trust_env=not _direct_http(),
                       headers=headers,
                       json={"model": model, "messages": [{"role": "user", "content": "ping"}],
                             "max_tokens": 1})

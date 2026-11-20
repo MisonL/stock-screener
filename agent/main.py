@@ -20,6 +20,7 @@ from agent.heartbeat import Heartbeat
 from agent.journal import record as journal_record
 from agent.loop import (BUDGET_EXHAUSTED_WHY, BUDGET_TOO_LARGE_WHY,
                         MAX_TOKENS, MIN_TURN_EST_IN, ROUNDS_EXHAUSTED_WHY,
+                     _max_out,
                         Deps, Trigger, render_trigger, run_with_deadline)
 from agent.schedule import (after_alarm, due_alarms, next_heartbeat, release_alarm, schedule_alarm,
                             set_fired_turn)
@@ -453,7 +454,11 @@ class AgentMain:
         """
         try:
             rem_in, rem_out = self.deps.budget.remaining()
-            if rem_in < MIN_TURN_EST_IN or rem_out < MAX_TOKENS:
+            # **输出侧要跟配置走**（v0.2.106，Codex 复核）：这里曾写死 `MAX_TOKENS`，
+            # 而实际发请求用的是 `_max_out(deps)`（读 `llm.max_tokens.tools`）。
+            # 配置改成 1000、余额剩 1500 时，真实请求发得出去，
+            # 却被这道门判成"额度耗尽"而停摆——门控与实发量脱钩。
+            if rem_in < MIN_TURN_EST_IN or rem_out < _max_out(self.deps):
                 return True
         except Exception:                                  # noqa: BLE001
             logging.getLogger("agent").warning(

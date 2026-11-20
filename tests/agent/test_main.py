@@ -396,3 +396,31 @@ def test_max_tokens_config_reaches_the_real_request(env):
     assert env.llm.sent_max_tokens[0] == 3333, (
         f"实发 max_tokens={env.llm.sent_max_tokens[0]}，配置里是 3333："
         "调用点没走配置")
+
+
+def test_budget_gate_uses_the_configured_max_tokens(env):
+    """**预算门控的输出侧必须跟配置走**（v0.2.106，Codex 复核）。
+
+    这里曾写死 `MAX_TOKENS`（2000），而实发请求用的是 `_max_out(deps)`
+    （读 `llm.max_tokens.tools`）。把配置改成 1000、余额剩 1500 时：
+    真实请求**发得出去**，却被这道门判成"额度耗尽"而停摆——
+    门控与实发量脱钩，正是"还有额度却整个下午不说话"的形状。
+    """
+    from types import SimpleNamespace
+
+    # 配置 tools=1000
+    llm_d = dict(env.cfg.llm._d)
+    llm_d["max_tokens"] = SimpleNamespace(tools=1000, plain=1000)
+    object.__setattr__(env.cfg.llm, "_d", llm_d)
+
+    # 余额：输入充足、输出只剩 1500（够发 1000，不够发 2000）
+    from llm.budget import Budget
+    b = Budget(env.conn, "agent", env.cfg.llm.budget.agent, clock=env.clock)
+    lim_in, lim_out = b.limit_in, b.limit_out
+    env.conn.execute(
+        "INSERT OR REPLACE INTO llm_budget(day, pool, tokens_in, tokens_out)"
+        " VALUES (?, 'agent', ?, ?)", (b.day, lim_in - 500_000, lim_out - 1500))
+    env.conn.commit()
+
+    assert env.main._budget_exhausted_now() is False, (
+        "输出剩 1500、实发只要 1000，却判成额度耗尽：门控没跟配置走")

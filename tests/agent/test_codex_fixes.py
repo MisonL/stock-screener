@@ -2457,3 +2457,67 @@ async def test_exhausted_why_latches_immediately(tmp_path):
 
     assert main._quota_exhausted is True, (
         "连最小请求都放不下却没立即 latch：还会再白写两行")
+
+
+async def test_budget_exhausted_skips_event_poll_entirely(tmp_path, monkeypatch):
+    """**预算耗尽时连 `poll()` 都不该做**（v0.2.99，生产实测）。
+
+    `poll()` 会把事件从 `new` 标成 `escalated`，然后每组跑一个回合。
+    预算耗尽时那些回合必然在预检里返回 `rounds=0, latency_ms=0` 的 error——
+    白写一行。实测 11-20 14:20:42 一轮 poll 返回 8 组，**同一秒写了 8 行**空转。
+
+    更关键的是**状态污染**：跳过 `_run` 但已经标了 `escalated`，事件就卡在
+    "已升级但没人跑"的中间态。不如不 poll —— 事件保持 `new`，
+    跨日由 `heartbeat_housekeeping()` 标 `expired`，语义干净。
+    """
+    from agent.main import AgentMain
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from tests.helpers import SH
+    from datetime import datetime, timedelta
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "evskip.db")
+    migrate(conn)
+    now = datetime(2026, 11, 20, 14, 20, tzinfo=SH)
+    clock = FixedClock(now)
+
+    # 8 条待处理事件（复刻那一轮的规模）
+    for i in range(8):
+        conn.execute(
+            "INSERT INTO event_log(ts, trade_date, market, kind, scope, target,"
+            " payload, salience, escalated, agent_status, dedupe_key)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (now.isoformat(), 20261120, "cn_main", "breakdown", "target",
+             f"sh60001{i}", "{}", 0.45, 0, "new", f"ev-{i}"))
+    conn.commit()
+
+    class _Deps:
+        def __init__(self):
+            self.conn = conn
+            self.cfg = cfg
+            self.clock = clock
+            self.pusher = None
+
+    main = AgentMain(_Deps(), clock)
+    main._quota_exhausted = True
+    main.budget_exhausted = True
+    main._last_day = clock.today()
+    main.next_heartbeat_at = now + timedelta(hours=1)
+    # 开盘回合先占掉，聚焦事件路径
+    conn.execute("INSERT INTO agent_turn(ts, wake_kind, context_digest, rounds, decision,"
+                 " fallback, market) VALUES (?,?,?,?,?,?,?)",
+                 (now.isoformat(), "open", "占位", 1, "silent", 0, "cn_main"))
+    conn.commit()
+
+    await main._once()
+
+    # ① 一行空转都不该写
+    runs = conn.execute("SELECT count(*) FROM agent_turn WHERE wake_kind='event'").fetchone()[0]
+    assert runs == 0, f"预算耗尽仍跑了 {runs} 个事件回合（每个都会写一行空转）"
+
+    # ② 事件状态不该被改成 escalated（那是"已升级但没人跑"的中间态）
+    st = dict(conn.execute("SELECT agent_status, count(*) FROM event_log GROUP BY agent_status"))
+    assert st.get("escalated", 0) == 0, f"事件被标成 escalated 却没跑：{st}"
+    assert st.get("new", 0) == 8, f"事件状态被污染：{st}"

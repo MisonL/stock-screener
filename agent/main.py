@@ -557,12 +557,27 @@ class AgentMain:
         # `_once()` 整体抛出、被 `run()` 吞掉 → 心跳、闹钟、开盘回合**全部停摆**。
         # 这与 v0.2.93 修的 housekeeping 是同一类错误，只是位置更早、后果更重。
         # 事件处理失败只该影响事件，不该影响调度。
-        try:
-            polled = self.attention.poll()
-        except Exception:                                  # noqa: BLE001
-            logging.getLogger("agent").warning(
-                "attention.poll 失败（本轮跳过事件）", exc_info=True)
+        # **预算耗尽时连 poll 都不做**（v0.2.99，生产实测）。
+        #
+        # `poll()` 会把事件从 `new` 标成 `escalated`，然后下面每组跑一个回合。
+        # 预算耗尽时那些回合必然在预检里返回 `rounds=0, latency_ms=0` 的 error——
+        # 白写一行。实测 11-20 14:20:42 一轮 poll 返回 8 组，**同一秒写了 8 行**
+        # 空转；这些事件又从 `escalated` 被回收到 `pending_retry`、再失败转
+        # `gave_up`，一条事件最多折腾两轮。
+        #
+        # 更关键的是**状态污染**：跳过 `_run` 但已经标了 `escalated`，
+        # 事件就卡在一个"已升级但没人跑"的中间态。不如不 poll——
+        # 事件保持 `new`，跨日由 `heartbeat_housekeeping()` 标 `expired`，
+        # 语义干净，也不会留下半截状态。
+        if self.budget_exhausted:
             polled = []
+        else:
+            try:
+                polled = self.attention.poll()
+            except Exception:                              # noqa: BLE001
+                logging.getLogger("agent").warning(
+                    "attention.poll 失败（本轮跳过事件）", exc_info=True)
+                polled = []
         for group in polled:
             events = sorted(group.events, key=lambda e: e.id)
             group.events = events

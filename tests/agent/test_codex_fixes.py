@@ -10,6 +10,22 @@ import pytest
 from llm.client import LlmResult
 
 
+def _exhaust_budget(conn, cfg, clock, *, out_left: int | None = None) -> None:
+    """**把 `llm_budget` 真的写到用完**（走库，不手设内存变量）。
+
+    v0.2.100 起 `budget_exhausted` 完全由库推导，所以测试也必须从库出发。
+    手设 `main.budget_exhausted = True` 正是第 7 次假绿的形状：
+    它绕过 `_budget_exhausted_now()`，真实的重启场景根本不会成立。
+    """
+    from llm.budget import Budget
+    b = Budget(conn, "agent", cfg.llm.budget.agent, clock=clock)
+    used_out = 0 if out_left is None else max(0, b.limit_out - out_left)
+    conn.execute(
+        "INSERT OR REPLACE INTO llm_budget(day, pool, tokens_in, tokens_out)"
+        " VALUES (?, 'agent', ?, ?)", (b.day, b.limit_in, used_out))
+    conn.commit()
+
+
 # ---- P1-2：真实 SDK 返回的是 message，调用方读 result.content ----
 
 
@@ -761,7 +777,7 @@ async def test_budget_exhausted_does_not_rerun_alarms(tmp_path):
                 attempts=1, usage=None)
 
     deps = Deps(conn=conn, cfg=cfg, clock=clock, llm=_SilentLlm(),
-                budget=Budget(conn, "agent", cfg.llm.budget.agent),
+                budget=Budget(conn, "agent", cfg.llm.budget.agent, clock=clock),
                 tools=ToolRegistry(conn, cfg, clock, mcp=None),
                 render=lambda t: Rendered("…", 1, False, {}),
                 pusher=None, memory=None, westock=None)
@@ -769,11 +785,10 @@ async def test_budget_exhausted_does_not_rerun_alarms(tmp_path):
     deps.alert = lambda *a, **k: None
 
     main = AgentMain(deps, clock)
-    # **走真实路径置位**，不要直接写 `budget_exhausted`：
-    # v0.2.95 把它改成每轮重算的派生值（额度 latch ∨ 记账标志），
-    # 直接赋值会被 `_once()` 覆盖掉。这里让一次回合真的因预算耗尽失败。
-    main._quota_exhausted = True
-    main.budget_exhausted = True
+    # **从库把额度写到用完**（v0.2.100 的生产路径）。
+    # 手设 `main.budget_exhausted = True` 会被 `_once()` 开头的
+    # `_budget_exhausted_now()` 覆盖 —— 那正是第 7 次假绿的形状。
+    _exhaust_budget(conn, cfg, clock)
     main._last_day = clock.today()
     main.next_heartbeat_at = clock.now() + timedelta(hours=1)   # 避开心跳路径
     # 开盘回合先占掉：本测试只关心闹钟，不该被 09:26 之后的开盘回合干扰
@@ -894,7 +909,7 @@ async def test_stale_alarms_are_cancelled_before_the_alarm_loop(tmp_path):
 
     llm = FakeLlm([_silent("盘前无变化"), _silent("回访完成")])
     deps = Deps(conn=conn, cfg=cfg, clock=clock, llm=llm,
-                budget=Budget(conn, "agent", cfg.llm.budget.agent),
+                budget=Budget(conn, "agent", cfg.llm.budget.agent, clock=clock),
                 tools=ToolRegistry(conn, cfg, clock, mcp=None),
                 render=lambda t: Rendered("…", 1, False, {}),
                 pusher=AgentPusher(conn, FakeNtfy(), cfg, clock),
@@ -1073,7 +1088,7 @@ async def test_event_retry_terminates_via_gave_up(tmp_path):
             raise RuntimeError("LLM 挂了")
 
     deps = Deps(conn=conn, cfg=cfg, clock=clock, llm=_BoomLlm(),
-                budget=Budget(conn, "agent", cfg.llm.budget.agent),
+                budget=Budget(conn, "agent", cfg.llm.budget.agent, clock=clock),
                 tools=ToolRegistry(conn, cfg, clock, mcp=None),
                 render=lambda t: Rendered("…", 1, False, {}),
                 pusher=None, memory=None, westock=None)
@@ -1081,7 +1096,9 @@ async def test_event_retry_terminates_via_gave_up(tmp_path):
     deps.alert = lambda *a, **k: None
 
     main = AgentMain(deps, clock)
-    main.budget_exhausted = True                 # 与事故当天同状态
+    # 这条测的是"积压逐轮消化"，**不是**预算耗尽路径：不写满额度。
+    # 原来它手设 `budget_exhausted=True`，v0.2.100 之后那会被库推导覆盖——
+    # 也说明它当初设那个变量是为了别的目的，不是本意。
 
     # 逼着心跳每轮都到期，让事件重试路径**每轮都真的跑一次**
     counts = []
@@ -1215,7 +1232,7 @@ async def test_heartbeat_advances_even_when_a_post_journal_step_raises(
                                    attempts=1, usage=step.usage)
 
     deps = Deps(conn=conn, cfg=cfg, clock=clock, llm=_ScheduleLlm(),
-                budget=Budget(conn, "agent", cfg.llm.budget.agent),
+                budget=Budget(conn, "agent", cfg.llm.budget.agent, clock=clock),
                 tools=ToolRegistry(conn, cfg, clock, mcp=None),
                 render=lambda t: Rendered("…", 1, False, {}),
                 pusher=None, memory=None, westock=None)
@@ -1292,7 +1309,7 @@ async def test_open_turn_has_attempt_cap(tmp_path, monkeypatch):
                 attempts=1, usage=None)
 
     deps = Deps(conn=conn, cfg=cfg, clock=clock, llm=_SilentLlm(),
-                budget=Budget(conn, "agent", cfg.llm.budget.agent),
+                budget=Budget(conn, "agent", cfg.llm.budget.agent, clock=clock),
                 tools=ToolRegistry(conn, cfg, clock, mcp=None),
                 render=lambda t: Rendered("…", 1, False, {}),
                 pusher=None, memory=None, westock=None)
@@ -1468,7 +1485,7 @@ async def test_housekeeping_failure_does_not_stall_the_scheduler(tmp_path, monke
                 attempts=1, usage=None)
 
     deps = Deps(conn=conn, cfg=cfg, clock=clock, llm=_SilentLlm(),
-                budget=Budget(conn, "agent", cfg.llm.budget.agent),
+                budget=Budget(conn, "agent", cfg.llm.budget.agent, clock=clock),
                 tools=ToolRegistry(conn, cfg, clock, mcp=None),
                 render=lambda t: Rendered("…", 1, False, {}),
                 pusher=None, memory=None, westock=None)
@@ -1546,7 +1563,7 @@ async def test_long_turn_does_not_cause_back_to_back_heartbeats(tmp_path, monkey
                 attempts=1, usage=None)
 
     deps = Deps(conn=conn, cfg=cfg, clock=clock, llm=_SilentLlm(),
-                budget=Budget(conn, "agent", cfg.llm.budget.agent),
+                budget=Budget(conn, "agent", cfg.llm.budget.agent, clock=clock),
                 tools=ToolRegistry(conn, cfg, clock, mcp=None),
                 render=lambda t: Rendered("…", 1, False, {}),
                 pusher=None, memory=None, westock=None)
@@ -1624,7 +1641,7 @@ async def test_heartbeat_reanchor_never_shortens_the_planned_gap(tmp_path):
                 attempts=1, usage=None)
 
     deps = Deps(conn=conn, cfg=cfg, clock=clock, llm=_SlowLlm(),
-                budget=Budget(conn, "agent", cfg.llm.budget.agent),
+                budget=Budget(conn, "agent", cfg.llm.budget.agent, clock=clock),
                 tools=ToolRegistry(conn, cfg, clock, mcp=None),
                 render=lambda t: Rendered("…", 1, False, {}),
                 pusher=None, memory=None, westock=None)
@@ -1744,6 +1761,10 @@ async def test_backlog_of_alarms_is_drained_gradually(tmp_path):
             self.cfg = cfg
             self.clock = clock
             self.pusher = None
+            # **必须给 budget**：`_budget_exhausted_now()` 读不到余额时
+            # fail-closed 返回 True，会把闹钟全跳过——测试就测不到积压消化了。
+            from llm.budget import Budget
+            self.budget = Budget(conn, "agent", cfg.llm.budget.agent, clock=clock)
 
     main = AgentMain(_Deps(), clock)
     claimed = {"n": 0}
@@ -1877,7 +1898,7 @@ async def test_budget_exhausted_flag_follows_the_db_flag(tmp_path):
                 attempts=1, usage=None)
 
     deps = Deps(conn=conn, cfg=cfg, clock=clock, llm=_ExhaustedLlm(),
-                budget=Budget(conn, "agent", cfg.llm.budget.agent),
+                budget=Budget(conn, "agent", cfg.llm.budget.agent, clock=clock),
                 tools=ToolRegistry(conn, cfg, clock, mcp=None),
                 render=lambda t: Rendered("…", 1, False, {}),
                 pusher=None, memory=None, westock=None)
@@ -1949,7 +1970,7 @@ async def test_poll_failure_does_not_stall_the_scheduler(tmp_path, monkeypatch):
     clock = FixedClock(now)
 
     deps = Deps(conn=conn, cfg=cfg, clock=clock, llm=None,
-                budget=Budget(conn, "agent", cfg.llm.budget.agent),
+                budget=Budget(conn, "agent", cfg.llm.budget.agent, clock=clock),
                 tools=ToolRegistry(conn, cfg, clock, mcp=None),
                 render=lambda t: Rendered("…", 1, False, {}),
                 pusher=None, memory=None, westock=None)
@@ -2016,73 +2037,179 @@ def test_failing_alarm_does_not_starve_the_backlog(tmp_path):
 
 
 async def test_restart_with_exhausted_quota_does_not_churn(tmp_path):
-    """**进程重启后额度仍用完，只能浪费有限几轮，不能回到死循环**（第四轮自查）。
+    """**重启后额度仍用完，不能写任何空转行**（第 7 次假绿的正身）。
 
-    `_quota_exhausted` 是内存变量，重启就丢。如果所以它丢了就恢复空转，
-    那 11-19 的事故只要重启一次就会重演。
+    第五轮评审实测：`budget_exhausted` 原来是**纯内存**状态，进程重启就清零，
+    而**每次盘中部署都会重启**。于是重启后第一轮 `_once()` 照常 poll 出 8 个
+    事件组、每组跑一个回合、各写一行 `rounds=0, latency_ms=0, decision=error`
+    ——正是 11-20 14:16–14:20 那 8 行。v0.2.99 的 poll 门控因此形同虚设。
 
-    实际不会：`run_with_deadline()` 开头有 `deps.budget.allow()` 预检
-    （`agent/loop.py:398`），额度不够时**直接返回 `BUDGET_EXHAUSTED_WHY`、不调模型**；
-    `_run()` 读到这个 why 就重新置上 `_quota_exhausted`。
+    修法：判定完全由库推导（`_budget_exhausted_now()` 读 `llm_budget.remaining()`），
+    重启后第一次调用就是真相，不需要谁记得置位。
 
-    所以重启的代价是 **一轮 `_once()` 里最多 `ALARM_MAX_PER_ONCE` 个空转回合**，
-    然后就重新 latch 住。这条测试把这个上界钉死——否则一次重构把预检挪走，
-    就会静默回到一天上万行。
+    这条测试**必须用一个新实例**（模拟重启），且**从库出发**——
+    手设 `main.budget_exhausted = True` 就是假绿的形状。
     """
-    import agent.main as m_mod
-    from agent.main import ALARM_MAX_PER_ONCE, AgentMain
-    from agent.schedule import due_alarms, schedule_alarm
-    from agent.loop import BUDGET_EXHAUSTED_WHY, TurnResult
-    from agent.decision import TurnDecision
+    from agent.context import Rendered
+    from agent.loop import Deps
+    from agent.main import AgentMain
     from core.clock import FixedClock
     from core.config import load_config
     from core.db import connect, migrate
+    from llm.budget import Budget
+    from llm.tools import ToolRegistry
     from tests.helpers import SH
     from datetime import datetime
 
     cfg = load_config(Path("config"))
-    conn = connect(tmp_path / "restart.db")
+    conn = connect(tmp_path / "restart2.db")
     migrate(conn)
-    now = datetime(2026, 11, 19, 10, 30, tzinfo=SH)
+    now = datetime(2026, 11, 20, 14, 20, tzinfo=SH)
     clock = FixedClock(now)
-    for i in range(10):
-        schedule_alarm(conn, turn_id=i + 1, due_at=now.isoformat(), market="cn_main",
-                       target="sh600519", note=f"回访{i}", now=now)
+
+    # 库里的额度真的用完了
+    _exhaust_budget(conn, cfg, clock)
+    # 8 条待处理事件（复刻那 8 行）
+    for i in range(8):
+        conn.execute(
+            "INSERT INTO event_log(ts, trade_date, market, kind, scope, target,"
+            " payload, salience, escalated, agent_status, dedupe_key)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (now.isoformat(), 20261120, "cn_main", "breakdown", "target",
+             f"sh60001{i}", "{}", 0.45, 0, "new", f"ev-{i}"))
+    conn.commit()
 
     class _Deps:
         def __init__(self):
             self.conn = conn
             self.cfg = cfg
             self.clock = clock
+            self.llm = None
+            self.budget = Budget(conn, "agent", cfg.llm.budget.agent, clock=clock)
+            self.tools = ToolRegistry(conn, cfg, clock, mcp=None)
+            self.render = lambda t: Rendered("…", 1, False, {})
             self.pusher = None
+            self.memory = None
+            self.westock = None
 
-    main = AgentMain(_Deps(), clock)
-    main.next_heartbeat_at = now.replace(hour=12)
+    deps = _Deps()
+    deps.conn_factory = lambda: conn
+    deps.alert = lambda *a, **k: None
 
-    # 预检拦住的形态：不调模型，直接返回预算耗尽
-    async def _exhausted(*a, **k):
-        return TurnResult(decision=TurnDecision.error(BUDGET_EXHAUSTED_WHY),
-                          rounds=0, tool_calls=[], rendered=None, usage=None,
-                          fallback=0, latency_ms=0, why=BUDGET_EXHAUSTED_WHY)
+    # **全新实例 = 重启**：没有任何内存 latch 可继承
+    fresh = AgentMain(deps, clock)
+    fresh.next_heartbeat_at = now      # 心跳也立即到期，把这条路径一起覆盖
 
-    with __import__("pytest").MonkeyPatch.context() as mp:
-        mp.setattr(m_mod, "run_with_deadline", _exhausted)
-        await main._once()
-        wasted = conn.execute(
-            "SELECT count(*) FROM agent_turn WHERE wake_kind='alarm'").fetchone()[0]
-        assert wasted <= ALARM_MAX_PER_ONCE, (
-            f"重启后第一轮跑了 {wasted} 个空转闹钟回合（上限 {ALARM_MAX_PER_ONCE}）")
-        assert main._quota_exhausted is True, "没有重新 latch，下一轮还会继续空转"
+    await fresh._once()
 
-        # 第二轮：已经 latch，一个都不该跑
-        before = conn.execute("SELECT count(*) FROM agent_turn").fetchone()[0]
-        await main._once()
-        after = conn.execute("SELECT count(*) FROM agent_turn").fetchone()[0]
-        assert after == before, (
-            f"latch 之后又跑了 {after - before} 个空转回合：这就是 11-19 的死循环")
+    rows = conn.execute("SELECT count(*) FROM agent_turn").fetchone()[0]
+    assert rows == 0, (
+        f"重启后第一轮写了 {rows} 行回合（额度已经用完）："
+        "这正是每次盘中部署都会复现的 8 行空转")
 
-    # 剩下的闹钟没有被吞掉，只是暂停
-    assert len(due_alarms(conn, now)) >= 8, "闹钟被跳过时不该被改成 fired"
+    st = dict(conn.execute("SELECT agent_status, count(*) FROM event_log GROUP BY agent_status"))
+    assert st == {"new": 8}, f"事件被标成中间态却没跑：{st}"
+
+
+async def test_budget_tail_stops_without_writing_rows(tmp_path):
+    """**额度尾巴（剩余不够最小回合）应该一行都不写**（第五轮评审 M1+M2）。
+
+    实测：11-20 额度剩 9056 / 5.5M，而真实最小回合（心跳：`tools` 6793 字符 +
+    `SYSTEM_PROMPT` 603 字符）的 `_est_in` = **8911**。原来 `MIN_TURN_EST_IN`
+    拍成 2000，于是判定说"还能跑"，实际每个回合都要失败——尾巴上每 5 分钟一行。
+
+    现在 `MIN_TURN_EST_IN = 12000`（实测 8911 再留 35% 余量），
+    并且这个值与判定**自洽**：剩余 >= 12000 时最小回合一定能跑，
+    所以不会出现"门控说能跑、实际全失败"的尾巴。
+    """
+    from agent.context import Rendered
+    from agent.loop import Deps
+    from agent.main import AgentMain
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from llm.budget import Budget
+    from llm.tools import ToolRegistry
+    from tests.helpers import SH
+    from datetime import datetime
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "tail2.db")
+    migrate(conn)
+    now = datetime(2026, 11, 20, 13, 52, tzinfo=SH)
+    clock = FixedClock(now)
+
+    # 剩余输入 9056（与生产实测一致），已用 = 上限 - 9056
+    from llm.budget import Budget as _B
+    b = _B(conn, "agent", cfg.llm.budget.agent, clock=clock)
+    conn.execute("INSERT OR REPLACE INTO llm_budget(day, pool, tokens_in, tokens_out)"
+                 " VALUES (?, 'agent', ?, 0)", (b.day, b.limit_in - 9056))
+    conn.commit()
+
+    class _Deps:
+        def __init__(self):
+            self.conn = conn
+            self.cfg = cfg
+            self.clock = clock
+            self.llm = None
+            self.budget = b
+            self.tools = ToolRegistry(conn, cfg, clock, mcp=None)
+            self.render = lambda t: Rendered("…", 1, False, {})
+            self.pusher = None
+            self.memory = None
+            self.westock = None
+
+    deps = _Deps()
+    deps.conn_factory = lambda: conn
+    deps.alert = lambda *a, **k: None
+
+    main = AgentMain(deps, clock)
+    main.next_heartbeat_at = now       # 心跳立即到期
+
+    await main._once()
+    assert main.budget_exhausted is True, "剩余 9056 却判成还能跑"
+    rows = conn.execute("SELECT count(*) FROM agent_turn").fetchone()[0]
+    assert rows == 0, f"额度尾巴上写了 {rows} 行空转"
+
+
+async def test_min_turn_estimate_matches_the_real_heartbeat_request(tmp_path):
+    """**`MIN_TURN_EST_IN` 必须覆盖真实最小回合的估算**（第五轮评审 M1）。
+
+    评审实测：真实 `ToolRegistry` 下最小的心跳回合 `_est_in` = 8911。
+    原来这个常量拍的是 2000，差 4.5 倍——判定说"最小请求放得下"，
+    实际每个回合都要失败，于是尾巴上每 5 分钟写一行。
+
+    这条测试把常量和真实估算**绑在一起**：将来系统提示或工具 schema 变胖，
+    常量跟不上就立刻转红，而不是等生产上又出现空转尾巴。
+    """
+    from agent.loop import (_est_in, _messages, EMIT_DECISION_TOOL, MAX_TOKENS,
+                            MIN_TURN_EST_IN, Trigger, _call_timeout)
+    from agent.context import Rendered
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from llm.tools import ToolRegistry
+    from tests.helpers import SH
+    from datetime import datetime
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "minest.db")
+    migrate(conn)
+    clock = FixedClock(datetime(2026, 11, 20, 10, 0, tzinfo=SH))
+    tools = ToolRegistry(conn, cfg, clock, mcp=None)
+
+    trig = Trigger(wake_kind="heartbeat")
+    rendered = Rendered("…", 1, False, {})
+    msgs = _messages(trig, rendered)
+    schema = list(tools.schema(trig.wake_kind)) + [EMIT_DECISION_TOOL]
+    real = _est_in(msgs, schema)
+
+    assert real <= MIN_TURN_EST_IN, (
+        f"最小心跳回合实际要 {real} 输入 token，而 MIN_TURN_EST_IN = {MIN_TURN_EST_IN}："
+        "判定的下限比真实需求还低，额度尾巴上会不停写空转")
+    assert real >= MIN_TURN_EST_IN * 0.6, (
+        f"MIN_TURN_EST_IN = {MIN_TURN_EST_IN} 远大于实测 {real}："
+        "会把还有额度的正常日误判成用完")
 
 
 async def test_rounds_exhausted_push_notification_reaches_user(tmp_path):
@@ -2143,17 +2270,22 @@ async def test_rounds_exhausted_push_notification_reaches_user(tmp_path):
                                       alarm_id=alarm["id"], target="sh600519",
                                       note="看是否收复 4.97"))
 
-    notes = main.deps.pusher.notes
-    assert len(notes) == 1, f"轮数用尽没有通知用户（推送 {len(notes)} 条）"
-    body, target = notes[0]
-    assert "sh600519" in body and "没有得出结论" in body, f"通知正文不合预期：{body}"
-    assert "4.97" in body, "通知里没带原定的关注点，用户对不上是哪次回访"
-    assert target == "sh600519"
-
     row = conn.execute("SELECT status, cancelled_reason FROM agent_schedule WHERE id=?",
                        (alarm["id"],)).fetchone()
     assert row[0] == "cancelled" and "轮数用尽" in row[1], (
         f"取消原因没落库：{tuple(row)}——事后区分不了'按时没跑成'和'跑了没跑出来'")
+
+    # 通知在 `_once()` 末尾的 flush 里发（合并，避免逐条挤占推送额度）
+    async def _noop(trigger):
+        return None
+
+    main._run = _noop
+    main._alarm_swept_at = None
+    await main._once()
+    notes = main.deps.pusher.notes
+    assert len(notes) == 1, f"轮数用尽没有通知用户（推送 {len(notes)} 条）"
+    body, _target = notes[0]
+    assert "模型未收敛" in body and "1 条" in body, f"通知正文不合预期：{body}"
 
 
 async def test_give_up_push_failure_does_not_break_the_turn(tmp_path):
@@ -2239,11 +2371,12 @@ async def test_oversized_request_does_not_latch_the_whole_day(tmp_path):
     clock = FixedClock(datetime(2026, 11, 19, 10, 30, tzinfo=SH))
     conn = connect(tmp_path / "oversize.db")
     migrate(conn)
-    # 输入上限 41366；已用 31366 → 剩余 10000。够最小请求（2000），不够大请求。
+    # 输入上限 41366；已用 20000 → 剩余 21366。
+    # 够最小回合（MIN_TURN_EST_IN = 12000），不够一个 21367 的大请求。
     limits = (41_366, 1_000_000)
     budget = Budget(conn, "agent", limits, clock=clock)
     conn.execute("INSERT INTO llm_budget(day, pool, tokens_in, tokens_out) VALUES (?,?,?,0)",
-                 (budget.day, "agent", 31_366))
+                 (budget.day, "agent", 20_000))
     conn.commit()
 
     class _Deps:
@@ -2253,7 +2386,7 @@ async def test_oversized_request_does_not_latch_the_whole_day(tmp_path):
     deps = _Deps()
 
     # ① 大请求放不下，但最小请求放得下 → 只是"这次太大"
-    big = budget.limit_in - 31_366 + 1          # 剩余 10000，差 1 个 token
+    big = budget.limit_in - 20_000 + 1          # 剩余 21366，差 1 个 token
     assert big > MIN_TURN_EST_IN, "前提不成立：大请求应远大于最小请求"
     assert budget_shortfall(deps, big, MAX_TOKENS) == BUDGET_TOO_LARGE_WHY, (
         "大请求被误判成'今天额度用完'：会把当天所有回访锁死")
@@ -2265,6 +2398,35 @@ async def test_oversized_request_does_not_latch_the_whole_day(tmp_path):
     assert budget.allow(est_in=0, est_out=0) is True   # 额度表本身没坏
     assert budget_shortfall(deps, MIN_TURN_EST_IN, MAX_TOKENS) == BUDGET_EXHAUSTED_WHY, (
         "连最小请求都放不下却没判成'额度用完'：会一直重试到收盘")
+
+    # ③ **判定的持久性**：`_budget_exhausted_now()` 必须从库重建。
+    # v0.2.100 之前它是内存 latch，进程重启（= 每次盘中部署）就清零。
+    from agent.context import Rendered
+    from agent.loop import Deps
+    from agent.main import AgentMain
+    from core.config import load_config
+    from llm.tools import ToolRegistry
+
+    class _Deps2:
+        def __init__(self):
+            self.conn = conn
+            self.cfg = load_config(Path("config"))
+            self.clock = clock
+            self.llm = None
+            self.budget = budget
+            self.tools = ToolRegistry(conn, self.cfg, clock, mcp=None)
+            self.render = lambda t: Rendered("…", 1, False, {})
+            self.pusher = None
+            self.memory = None
+            self.westock = None
+
+    d2 = _Deps2()
+    d2.conn_factory = lambda: conn
+    d2.alert = lambda *a, **k: None
+    fresh = AgentMain(d2, clock)          # 模拟重启后的新实例
+    assert fresh._budget_exhausted_now() is True, (
+        "重启后新实例读不出'额度已用完'：库里的 llm_budget 明明是满的，"
+        "说明判定还依赖内存状态")
 
 
 async def test_too_large_alarm_is_cancelled_not_retried(tmp_path):
@@ -2337,126 +2499,12 @@ async def test_too_large_alarm_is_cancelled_not_retried(tmp_path):
         "取消后仍被 due_alarms 取出：还会再写空转行")
 
 
-async def test_budget_tail_noise_stops_after_consecutive_failures(tmp_path):
-    """**额度尾巴上的空转要在几次之后停下来**（v0.2.98，生产实测）。
-
-    11-20 13:48–13:58 实际观察（v0.2.97 部署后）：额度剩 9056 / 5.5M，
-    典型请求要 21888，于是**每个心跳/事件回合各写一行**
-    `rounds=0, latency_ms=0, decision=error`：
-
-        13:52:00 heartbeat error    13:52:09 event error  ×2
-        13:57:00 heartbeat error
-
-    每 5 分钟一行不算事故，但正是 11-19 那种记录形状，纯粹是噪声。
-
-    **不能靠调大 `MIN_TURN_EST_IN` 解决**：那会把 Codex 实测的场景
-    （剩 41366、大请求 41367、但心跳只需 8913 完全跑得动）又锁成"今天没了"。
-    判定必须看**连续性**——连续 3 次都跑不动才停；中途成功一次就清零。
-    """
-    from agent.main import BUDGET_FAIL_STREAK_TO_LATCH, AgentMain
-    from agent.decision import TurnDecision
-    from agent.loop import BUDGET_EXHAUSTED_WHY, BUDGET_TOO_LARGE_WHY, TurnResult
-    import agent.main as m_mod
-    from core.clock import FixedClock
-    from core.config import load_config
-    from core.db import connect, migrate
-    from tests.helpers import SH
-    from datetime import datetime
-
-    cfg = load_config(Path("config"))
-    conn = connect(tmp_path / "tail.db")
-    migrate(conn)
-    now = datetime(2026, 11, 20, 13, 52, tzinfo=SH)
-    clock = FixedClock(now)
-
-    class _Deps:
-        def __init__(self):
-            self.conn = conn
-            self.cfg = cfg
-            self.clock = clock
-            self.pusher = None
-
-    main = AgentMain(_Deps(), clock)
-    be = main._budget_unavailable()
-    assert be is False
-
-    async def _too_large(*a, **k):
-        return TurnResult(decision=TurnDecision.error(BUDGET_TOO_LARGE_WHY),
-                          rounds=0, tool_calls=[], rendered=None, usage=None,
-                          fallback=0, latency_ms=0, why=BUDGET_TOO_LARGE_WHY)
-
-    async def _ok(*a, **k):
-        return TurnResult(decision=TurnDecision(kind="silent", speak=False,
-                                                why_silent="无事"),
-                          rounds=1, tool_calls=[], rendered=None, usage=None,
-                          fallback=0, latency_ms=3000, why=None)
-
-    trig = main._trigger("heartbeat", rounds=3, deadline=0)
-
-    with __import__("pytest").MonkeyPatch.context() as mp:
-        mp.setattr(m_mod, "run_with_deadline", _too_large)
-        for i in range(BUDGET_FAIL_STREAK_TO_LATCH - 1):
-            await main._run(trig)
-            assert main._quota_exhausted is False, (
-                f"第 {i+1} 次失败就 latch 了：单次'太大'不该等于'今天没了'"
-                "（Codex 实测场景：剩 41366、大请求 41367、心跳 8913 跑得动）")
-
-        # 中途成功一次 → 计数清零，不该 latch
-        mp.setattr(m_mod, "run_with_deadline", _ok)
-        await main._run(trig)
-        assert main._quota_exhausted is False
-        assert main._budget_fail_streak == 0, "成功之后失败计数没有清零"
-
-        # 再连续失败到上限 → 应当停止尝试
-        mp.setattr(m_mod, "run_with_deadline", _too_large)
-        for _ in range(BUDGET_FAIL_STREAK_TO_LATCH):
-            await main._run(trig)
-        assert main._quota_exhausted is True, (
-            f"连续 {BUDGET_FAIL_STREAK_TO_LATCH} 次都因额度失败仍不 latch："
-            "额度尾巴上会每 5 分钟写一行空转，直到收盘")
+async def _placeholder_tail():
+    """已被 test_budget_tail_stops_without_writing_rows 取代。"""
 
 
-async def test_exhausted_why_latches_immediately(tmp_path):
-    """**"连最小请求都放不下"要立即 latch，不能也等 3 次**。
-
-    它和"这次太大"的区别是：最小请求都放不下，说明无论上下文多小都跑不动，
-    等 3 次只会白写两行。
-    """
-    from agent.main import AgentMain
-    from agent.decision import TurnDecision
-    from agent.loop import BUDGET_EXHAUSTED_WHY, TurnResult
-    import agent.main as m_mod
-    from core.clock import FixedClock
-    from core.config import load_config
-    from core.db import connect, migrate
-    from tests.helpers import SH
-    from datetime import datetime
-
-    cfg = load_config(Path("config"))
-    conn = connect(tmp_path / "imm.db")
-    migrate(conn)
-    clock = FixedClock(datetime(2026, 11, 20, 14, 0, tzinfo=SH))
-
-    class _Deps:
-        def __init__(self):
-            self.conn = conn
-            self.cfg = cfg
-            self.clock = clock
-            self.pusher = None
-
-    main = AgentMain(_Deps(), clock)
-
-    async def _exhausted(*a, **k):
-        return TurnResult(decision=TurnDecision.error(BUDGET_EXHAUSTED_WHY),
-                          rounds=0, tool_calls=[], rendered=None, usage=None,
-                          fallback=0, latency_ms=0, why=BUDGET_EXHAUSTED_WHY)
-
-    with __import__("pytest").MonkeyPatch.context() as mp:
-        mp.setattr(m_mod, "run_with_deadline", _exhausted)
-        await main._run(main._trigger("heartbeat", rounds=3, deadline=0))
-
-    assert main._quota_exhausted is True, (
-        "连最小请求都放不下却没立即 latch：还会再白写两行")
+async def _placeholder_latch():
+    """已被 test_budget_tail_stops_without_writing_rows 取代。"""
 
 
 async def test_budget_exhausted_skips_event_poll_entirely(tmp_path, monkeypatch):
@@ -2521,3 +2569,113 @@ async def test_budget_exhausted_skips_event_poll_entirely(tmp_path, monkeypatch)
     st = dict(conn.execute("SELECT agent_status, count(*) FROM event_log GROUP BY agent_status"))
     assert st.get("escalated", 0) == 0, f"事件被标成 escalated 却没跑：{st}"
     assert st.get("new", 0) == 8, f"事件状态被污染：{st}"
+
+
+async def test_budget_cancelled_alarms_notify_the_user_once(tmp_path):
+    """**额度不足取消的闹钟必须让用户知道，但只推一条**（第五轮评审 M3 + D.3）。
+
+    11-20 那天因额度不足取消了 35 条闹钟，`_cancel_alarm` 之后**一声不响**——
+    用户以为"30 分钟后回来看"，实际什么都没有。这和轮数用尽静默取消是同一个毛病。
+
+    但不能逐条推：`channel_b_daily_cap` 只有 15 条，35 条里 20 条会被压掉，
+    而被压时 `_audit_cap()` 还会再写一行 `agent_turn` —— 通知失败又制造噪声。
+
+    所以合并成一条，且**每天最多一条**（`job_state` 里有幂等键）。
+    """
+    from agent.main import AgentMain
+    from agent.decision import TurnDecision
+    from agent.loop import BUDGET_TOO_LARGE_WHY, TurnResult
+    import agent.main as m_mod
+    from agent.schedule import after_alarm, due_alarms, schedule_alarm
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from tests.helpers import SH
+    from datetime import datetime
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "merge.db")
+    migrate(conn)
+    now = datetime(2026, 11, 20, 13, 27, tzinfo=SH)
+    clock = FixedClock(now)
+    for i in range(5):
+        schedule_alarm(conn, turn_id=i + 1, due_at=now.isoformat(), market="cn_main",
+                       target=f"sh60001{i}", note=f"回访{i}", now=now)
+
+    class _Pusher:
+        def __init__(self):
+            self.notes = []
+
+        def agent_note(self, decision, grounded, code=None, target=None):
+            self.notes.append(getattr(decision, "body", ""))
+            return "seq-1"
+
+    class _Deps:
+        def __init__(self):
+            self.conn = conn
+            self.cfg = cfg
+            self.clock = clock
+            self.pusher = _Pusher()
+            from llm.budget import Budget
+            self.budget = Budget(conn, "agent", cfg.llm.budget.agent, clock=clock)
+
+    deps = _Deps()
+    main = AgentMain(deps, clock)
+    main.next_heartbeat_at = now.replace(hour=23)
+
+    async def _too_large(trigger):
+        # 真实形状：该条闹钟因额度跑不动 → `_run` 里取消
+        main._budget_cancels += 1
+        main._cancel_alarm(trigger.alarm_id, "额度不足（请求超出剩余额度）")
+
+    main._run = _too_large
+
+    await main._once()
+    notes = deps.pusher.notes
+    assert len(notes) == 1, f"应该合并成 1 条通知，实际 {len(notes)} 条"
+    assert "额度用完" in notes[0] and "回访" in notes[0], f"通知正文不合预期：{notes[0]}"
+
+    # 第二轮又取消几条 → 今天已经推过，不该再吵
+    main._run = _too_large
+    main._alarm_swept_at = None
+    await main._once()
+    assert len(deps.pusher.notes) == 1, (
+        f"同一天推了 {len(deps.pusher.notes)} 条：会把 channel_b 的 15 条上限挤爆")
+
+
+async def test_cancelling_an_already_cancelled_one_does_not_notify(tmp_path):
+    """**取消没生效时不能发通知**（第五轮评审 D.2）。
+
+    `_cancel_alarm` 用 `WHERE status='fired'` 条件更新。如果这条闹钟已经被取消，
+    UPDATE 影响 0 行——此时再推一条通知就是**重复通知**。
+
+    现在"只推一次"靠的是取消的原子性（`rowcount == 1`），不是靠"现在正好不会重入"。
+    """
+    from agent.main import AgentMain
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from tests.helpers import SH
+    from datetime import datetime
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "rowcount.db")
+    migrate(conn)
+    clock = FixedClock(datetime(2026, 11, 20, 10, 0, tzinfo=SH))
+    conn.execute(
+        "INSERT INTO agent_schedule(created_at, due_at, market, target, note, status)"
+        " VALUES (?,?,?,?,?, 'cancelled')",
+        (clock.now().isoformat(), clock.now().isoformat(), "cn_main", "sh600519", "回访"))
+    conn.commit()
+    alarm_id = conn.execute("SELECT id FROM agent_schedule").fetchone()[0]
+
+    class _Deps:
+        def __init__(self):
+            self.conn = conn
+            self.cfg = cfg
+            self.clock = clock
+            self.pusher = None
+
+    main = AgentMain(_Deps(), clock)
+    assert main._cancel_alarm(alarm_id, "轮数用尽") is False, (
+        "已经 cancelled 的闹钟再取消仍然报告成功：会重复发通知")

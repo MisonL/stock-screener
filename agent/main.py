@@ -18,7 +18,8 @@ from datetime import datetime, timedelta
 from agent.attention import AttentionLayer
 from agent.heartbeat import Heartbeat
 from agent.journal import record as journal_record
-from agent.loop import (BUDGET_EXHAUSTED_WHY, BUDGET_TOO_LARGE_WHY, ROUNDS_EXHAUSTED_WHY,
+from agent.loop import (BUDGET_EXHAUSTED_WHY, BUDGET_TOO_LARGE_WHY,
+                        MAX_TOKENS, MIN_TURN_EST_IN, ROUNDS_EXHAUSTED_WHY,
                         Deps, Trigger, render_trigger, run_with_deadline)
 from agent.schedule import (after_alarm, due_alarms, next_heartbeat, release_alarm, schedule_alarm,
                             set_fired_turn)
@@ -50,21 +51,6 @@ CONFIRM_EXPIRE_H = 24
 #: 作废扫描的最小间隔（秒）。每轮 `_once()`（2 秒）都扫一次没必要，
 #: 但也不能像原来那样"一天只扫一次"——那样同日积压扫不到。
 ALARM_SWEEP_EVERY_S = 60
-#: 连续多少个回合因额度失败，才认定"今天额度真的用完了"并 latch。
-#:
-#: 为什么需要这个：`budget_shortfall()` 把"这次请求太大"和"今天没了"分开后，
-#: 额度**接近**用完的那段尾巴（实测剩 9056 / 5.5M 而典型请求要 21888）
-#: 会让每个心跳/事件回合各写一行 `rounds=0, latency_ms=0, decision=error`。
-#: 每次 5 分钟一行不算事故，但它是**纯粹的噪声**，而且正好是这个项目最怕的
-#: 那种记录形状（11-19 事故就是这种行）。
-#:
-#: 为什么不直接把 `MIN_TURN_EST_IN` 调大：那会把 Codex 实测的场景
-#: （剩 41366、大请求 41367、但心跳只需 8913 完全跑得动）又锁成"今天没了"。
-#: 判定必须看**连续性**，不能看单次估算——单次估算永远可能乐观或保守。
-#:
-#: 连续 3 次都因额度失败 = 这段尾巴里所有回合都跑不动了，可以停止尝试；
-#: 中途只要有一次成功（哪怕是最小的心跳），计数清零，不 latch。
-BUDGET_FAIL_STREAK_TO_LATCH = 3
 #: 单轮 `_once()` 最多跑几个闹钟回合。宕机后积压十几条同时到期时，
 #: 一口气串行跑完会连着烧掉上百轮 LLM；每轮限 2 条，积压照样被消化。
 ALARM_MAX_PER_ONCE = 2
@@ -136,6 +122,19 @@ def should_wake(conn, now: datetime) -> bool:
         return TradingCalendar(conn).is_trading_day(int(now.astimezone(SH).strftime("%Y%m%d")))
     except (LookupError, ValueError):
         return False
+
+
+def _give_up_decision(reason: str, n: int):
+    """放弃回访的合并通知正文。"""
+    from agent.decision import TurnDecision
+
+    if reason == "额度不足":
+        tail = "今天额度用完了，这些回访不会补跑——需要的话明天开盘重新安排。"
+    else:
+        tail = "模型在轮数上限内没得出结论，重试也会同样用尽，所以没再跑。"
+    return TurnDecision(
+        kind="speak", speak=True, level="P2",
+        body=f"有 {n} 条回访被放弃（{reason}）。{tail}")
 
 
 def _first_target(trigger):
@@ -210,11 +209,22 @@ class AgentMain:
         self.other_rounds, self.other_deadline = _turn_budget(
             deps.cfg, "heartbeat_turn", OTHER_ROUNDS_BUDGET, OTHER_DEADLINE_S)
         self.next_heartbeat_at = None
+        # **`budget_exhausted` 不再有任何内存 latch**（v0.2.100，第 7 次假绿）。
+        #
+        # 原来它是 `_quota_exhausted`（内存）+ 连续失败计数的组合。评审实测：
+        # 进程重启后两个都丢，而**每次盘中部署都会重启**——于是重启后第一轮
+        # `_once()` 照常 poll 出事件组、每组跑一个回合、各写一行
+        # `rounds=0, latency_ms=0, decision=error`（实测 8 行）。
+        # v0.2.99 的 poll 门控因此形同虚设。
+        #
+        # 现在它**完全由数据库推导**（`_budget_exhausted_now()`），
+        # 跨进程重启自动重建，不依赖谁记得置位或复位。
         self.budget_exhausted = False
-        # 今日额度是否用完（跨日复位；与"记账写库坏了"是两回事，见 `_once()`）
-        self._quota_exhausted = False
-        # 连续因额度失败的回合数（见 BUDGET_FAIL_STREAK_TO_LATCH）
-        self._budget_fail_streak = 0
+        # 今天被放弃的闹钟数，按原因分开计（各自合并成一条通知，
+        # 见 `_flush_give_up`）。**合并的理由**：`channel_b_daily_cap` 只有 15，
+        # 逐条推会大面积被压，而被压时 `_audit_cap()` 还会再写一行 `agent_turn`。
+        self._budget_cancels = 0
+        self._rounds_cancels = 0
         self._last_day = self.clock.today()
         # 上一次扫过期闹钟的时刻（见 `_once()` 里的闹钟循环）
         self._alarm_swept_at = None
@@ -279,14 +289,14 @@ class AgentMain:
             # 直接 cancelled，把这次回访明确记为放弃。
             rounds_exhausted = getattr(result, "why", "") == ROUNDS_EXHAUSTED_WHY
             if rounds_exhausted:
-                self._cancel_alarm(trigger.alarm_id, "轮数用尽（模型未收敛）")
+                cancelled = self._cancel_alarm(trigger.alarm_id, "轮数用尽（模型未收敛）")
                 # **必须让用户知道这次回访没发生**（v0.2.96，评审建议）。
                 # 闹钟是用户看得见的承诺（「我 30 分钟后回来看」），
                 # `agent_turn` 里的 `decision=timeout, why=轮数用尽` 只有运维在看。
                 # 不推的话，用户以为 30 分钟后会有结论，实际静默丢了——
                 # 和「静默 pending 再烧 18 轮」是同一个毛病，只是这次省了钱。
-                # 每条闹钟只推一次（取消是单向的，不会重复），走低优先级便签。
-                self._notify_alarm_give_up(trigger)
+                if cancelled:
+                    self._rounds_cancels += 1
             elif getattr(result, "why", "") == BUDGET_TOO_LARGE_WHY:
                 # **"本次请求超出剩余额度"不能退回重试**（v0.2.97，生产实测回归）。
                 #
@@ -301,11 +311,14 @@ class AgentMain:
                 #
                 # 正确处理：**这条闹钟今天跑不动了，直接取消并记原因**。
                 # 不 latch 整天（心跳/事件可能更小、还跑得动），也不重试。
-                self._cancel_alarm(trigger.alarm_id, "额度不足（请求超出剩余额度）")
+                if self._cancel_alarm(trigger.alarm_id,
+                                      "额度不足（请求超出剩余额度）"):
+                    self._budget_cancels += 1
             elif result.decision.kind in ("error", "invalid", "timeout"):
                 exhausted = getattr(result, "why", "") == BUDGET_EXHAUSTED_WHY
                 if exhausted:
-                    self._cancel_alarm(trigger.alarm_id, "预算耗尽")
+                    if self._cancel_alarm(trigger.alarm_id, "预算耗尽"):
+                        self._budget_cancels += 1
                 else:
                     release_alarm(self.deps.conn, trigger.alarm_id, now=self.clock.now())
         if result.decision.pending_action and self.deps.pusher is not None:
@@ -325,68 +338,70 @@ class AgentMain:
                            getattr(trigger, "target", None) or _first_target(trigger),
                            result.decision.schedule_note or "",
                            now=self.clock.now())
-        why = getattr(result, "why", None)
-        if why == BUDGET_EXHAUSTED_WHY:
-            # 连"最小请求"都放不下 —— 真的没了，立即 latch
-            self._quota_exhausted = True
-            self.budget_exhausted = True
-            self._budget_fail_streak = BUDGET_FAIL_STREAK_TO_LATCH
-        elif why == BUDGET_TOO_LARGE_WHY:
-            # "这次太大"——可能是额度尾巴，也可能只是这个回合上下文大。
-            # **看连续性，不看单次**：连续 N 次都失败才认为今天跑不动了。
-            self._budget_fail_streak += 1
-            if self._budget_fail_streak >= BUDGET_FAIL_STREAK_TO_LATCH:
-                self._quota_exhausted = True
-                self.budget_exhausted = True
-        else:
-            # 任何一次成功（哪怕最小的心跳）都证明额度还在
-            self._budget_fail_streak = 0
-        # **这里刻意不再镜像 `budget_exhausted`**（第四轮评审发现第 6 次假绿的
-        # 副产品）：`_once()` 在**闹钟与开盘回合之前**无条件重算一次
-        # `budget_exhausted = _quota_exhausted or _budget_unavailable()`，
-        # 所以这里再写一遍是**冗余的、且测不到的**——评审实测：把这段删掉，
-        # 全部测试照样绿，因为它永远被 `_once()` 那一行覆盖。
-        #
-        # 与其留一段无覆盖的代码冒充"修复"，不如删掉，让 `_once()` 那行成为
-        # **唯一**的判定点。上面 `_quota_exhausted = True` 的 latch 仍然必要：
-        # 它跨回合保存"今天额度用完了"这个不可自愈的事实。
+        # **这里刻意不写任何预算状态**（v0.2.100）：判定只在
+        # `_once()` 开头由 `_budget_exhausted_now()` 从库里重算一次。
+        # 回合结束再写一遍是冗余且测不到的（第四轮评审实测：删掉照样全绿）。
         return turn_id
 
-    def _cancel_alarm(self, alarm_id: int, reason: str) -> None:
-        """把已认领的闹钟转 `cancelled`，并记下原因（见 008 迁移）。"""
-        self.deps.conn.execute(
+    def _cancel_alarm(self, alarm_id: int, reason: str) -> bool:
+        """把已认领的闹钟转 `cancelled`，并记下原因（见 008 迁移）。
+
+        **返回是否真的改到了行**（第五轮评审 D.2）：通知只在"这次取消确实生效"
+        时发，否则将来一旦出现重入/补跑，同一条闹钟会被重复推送。
+        "只推一次"应该靠取消的原子性保证，而不是靠"现在正好不会重入"。
+        """
+        cur = self.deps.conn.execute(
             "UPDATE agent_schedule SET status = 'cancelled', fired_turn = NULL,"
             " cancelled_reason = ? WHERE id = ? AND status = 'fired'",
             (reason, alarm_id))
         self.deps.conn.commit()
+        return bool(cur.rowcount)
 
-    def _notify_alarm_give_up(self, trigger) -> None:
-        """告诉用户"这次回访放弃了"（轮数用尽）。
+    def _flush_give_up(self) -> None:
+        """把"今天放弃了哪些回访"**合并成至多两条**通知推给用户。
 
-        **只在真有推送通道时做**，且任何异常都不能影响调度——
-        一条通知失败不值得让整个回合链路崩掉。
+        为什么合并：`channel_b_daily_cap` 只有 15 条、`notify.daily_cap` 60 条。
+        11-20 那天因额度取消 35 条，逐条推会有 20 条被压掉，而被压时
+        `_audit_cap()` 还会再写一行 `agent_turn` —— 通知失败又制造噪声，
+        还会挤占真正重要的行情提醒的额度。
+
+        合并成每个原因一条、每天最多两条：既不吵，也把上限留给 P1。
+        具体是哪些闹钟，`agent_schedule.cancelled_reason` + `target` 都记着，
+        日志页可查。
         """
+        items = (("额度不足", self._budget_cancels),
+                 ("模型未收敛", self._rounds_cancels))
+        if not any(n for _, n in items):
+            return
+        self._budget_cancels = 0
+        self._rounds_cancels = 0
         pusher = getattr(self.deps, "pusher", None)
         if pusher is None:
             return
-        try:
-            target = getattr(trigger, "target", None) or ""
-            note = getattr(trigger, "note", "") or ""
-            body = (f"放弃了 {target or '这次'} 的回访：模型 6 轮内没有得出结论。"
-                    f"原定关注：{note or '（无备注）'}")
-            from agent.decision import TurnDecision
-            decision = TurnDecision(kind="speak", speak=True, body=body, level="P2")
-            pusher.agent_note(decision, None, None, target)
-        except Exception:                                  # noqa: BLE001
-            logging.getLogger("agent").warning(
-                "回访放弃通知发送失败", exc_info=True)
+        for reason, n in items:
+            if n <= 0:
+                continue
+            key = f"alarm_give_up.{reason}.{self.clock.today()}"
+            try:
+                if self.deps.conn.execute("SELECT 1 FROM job_state WHERE name = ?",
+                                          (key,)).fetchone() is not None:
+                    continue                # 今天这个原因已经推过，只累计不再吵
+                pusher.agent_note(_give_up_decision(reason, n), None, None, None)
+                self.deps.conn.execute(
+                    "INSERT OR REPLACE INTO job_state(name, value) VALUES (?, '1')",
+                    (key,))
+                self.deps.conn.commit()
+            except Exception:                              # noqa: BLE001
+                logging.getLogger("agent").warning(
+                    "%s的合并通知失败", reason, exc_info=True)
+
 
     def _budget_unavailable(self) -> bool:
-        """预算是否不可用：**只看数据库标志**，每轮重读。
+        """**记账写库坏了**：只看数据库标志，每轮重读。
 
         `llm/budget.py::_try_deduct` 成功扣减时会删掉这个键，于是这里下一轮
-        就自动复位——不需要谁记得去清 `self.budget_exhausted`。
-        读不到时 fail-closed 返回 True（宁可少跑一轮回访，不要反复撞锁）。
+        就自动复位——不需要谁记得去清。
+        读不到时 fail-closed 返回 True（宁可少跑几轮回访，不要反复撞锁）。
         """
         try:
             row = self.deps.conn.execute(
@@ -395,6 +410,28 @@ class AgentMain:
             return bool(row and row[0])
         except Exception:                                  # noqa: BLE001
             return True
+
+    def _budget_exhausted_now(self) -> bool:
+        """**预算现在跑不动了吗**——从 `llm_budget` 直接推导，可跨进程重建。
+
+        两个来源：
+          · 今天剩余额度连最小回合（`MIN_TURN_EST_IN`）都放不下 → 真没了
+          · 记账写库坏了（`budget.write_failed:agent`）→ 暂时不可用（会自愈）
+
+        **为什么必须从库推导，而不是记在内存里**（v0.2.100，第 7 次假绿）：
+        内存 latch 在进程重启后清零，而每次盘中部署都会重启。评审实测：
+        重启后第一轮 `_once()` 照常 poll 出 8 个事件组、各写一行空转。
+        库里 `llm_budget` 是权威且持久的，读一次就是真相。
+        """
+        try:
+            rem_in, rem_out = self.deps.budget.remaining()
+            if rem_in < MIN_TURN_EST_IN or rem_out < MAX_TOKENS:
+                return True
+        except Exception:                                  # noqa: BLE001
+            logging.getLogger("agent").warning(
+                "读预算余额失败（本轮按不可用处理）", exc_info=True)
+            return True
+        return self._budget_unavailable()
 
     def heartbeat_housekeeping(self):
         conn = self.deps.conn
@@ -544,9 +581,9 @@ class AgentMain:
         now = self.clock.now()
         if self.clock.today() != self._last_day:
             self._last_day = self.clock.today()
+            # 预算状态由库推导，跨日自然跟着 `llm_budget` 的 day 走，
+            # 不需要在这里复位任何内存变量。
             self.budget_exhausted = False
-            self._quota_exhausted = False
-            self._budget_fail_streak = 0
             self._open_attempts = 0
         if self.next_heartbeat_at is None:
             self.next_heartbeat_at = next_heartbeat(now)
@@ -569,6 +606,9 @@ class AgentMain:
         # 事件就卡在一个"已升级但没人跑"的中间态。不如不 poll——
         # 事件保持 `new`，跨日由 `heartbeat_housekeeping()` 标 `expired`，
         # 语义干净，也不会留下半截状态。
+        # **预算判定必须在 poll 之前**（第五轮评审指出原来在 poll 之后，
+        # 用的是上一轮的值——重启后第一轮就是 False，门控失效）。
+        self.budget_exhausted = self._budget_exhausted_now()
         if self.budget_exhausted:
             polled = []
         else:
@@ -629,9 +669,13 @@ class AgentMain:
                 # 本次接手再失败必须转 gave_up——见 journal.record 的注释
                 for ev in retry:
                     ev.agent_status = "pending_retry"
-                await self._run(self._trigger("heartbeat", events=retry,
-                                              rounds=self.other_rounds,
-                                              deadline=self.other_deadline))
+                # **心跳回合同样要门控**（第五轮评审 M2）：latch 之后心跳照跑，
+                # 每次在预检里立刻失败、写一行 `rounds=0, latency_ms=0`。
+                # 按 5 分钟节奏，额度尾巴的两个小时能写 20 行。
+                if not self.budget_exhausted:
+                    await self._run(self._trigger("heartbeat", events=retry,
+                                                  rounds=self.other_rounds,
+                                                  deadline=self.other_deadline))
             # **回合跑完再按墙钟补正一次**（v0.2.93 修的 M-b）。
             # 上面那个 `nxt` 是用 `_once()` 开头的 `now` 算的，而回合可能跑几分钟
             # （上游慢时单轮 23–31 秒、6 轮回合 3 分钟是常态）。回合结束时 `nxt`
@@ -677,7 +721,6 @@ class AgentMain:
         # 混成一个变量会二选一地出错：缓存它，"记账坏了"就永不复位（S1 的 latch）；
         # 每轮重读它，"额度用完"就会被清掉 —— **而额度用完正是 11-19 事故的成因**，
         # 清掉之后闹钟恢复空转，一天又是上万行。
-        self.budget_exhausted = self._quota_exhausted or self._budget_unavailable()
         # **单轮最多跑 `ALARM_MAX_PER_ONCE` 个闹钟回合**（v0.2.93 修的 M-d）。
         # 按日期作废把"同日迟到"的闹钟都保住了（对：语境有效），但也失去了原来
         # "同日过期 1 小时"顺手提供的泄压：宕机到 13:00 恢复时，上午积压的
@@ -705,6 +748,9 @@ class AgentMain:
                                           target=alarm.get("target"),
                                           note=alarm.get("note") or ""))
 
+        # 额度不足取消的闹钟合并成一条通知（理由见 `_flush_budget_give_up`）
+        self._flush_give_up()
+
         # **开盘回合也要有次数上限**（v0.2.90 的 S2 同源问题）：
         # `_open_turn_done()` 判断的是"当天有没有 open 行"，而回合若在
         # `journal_record` **之前**就抛异常，那一行永远写不出来 ——
@@ -714,7 +760,12 @@ class AgentMain:
                 and not self._open_turn_done(now.date().isoformat())
                 and self._open_attempts < OPEN_TURN_MAX_ATTEMPTS):
             self._open_attempts += 1
-            if self.shadow_mode:
+            if self.budget_exhausted:
+                # **开盘回合也要门控**（v0.2.100）：额度用完时它同样只会在预检里
+                # 立刻失败、写一行 `rounds=0, latency_ms=0`。一次只有一行，
+                # 但没有任何价值，而且正是这套记录形状。
+                pass
+            elif self.shadow_mode:
                 self._shadow_turn("open", f"trade_date={now.date().isoformat()}")
             else:
                 await self._run(self._trigger("open", rounds=self.other_rounds,
@@ -767,7 +818,7 @@ def main(conn_factory=None, clock=None, every_s: int = 30) -> None:
 
     pusher = AgentPusher(conn, ntfy, cfg, clock)
     deps = Deps(conn=conn, cfg=cfg, clock=clock, llm=_LC(cfg),
-                budget=_B(conn, "agent", cfg.llm.budget.agent),
+                budget=_B(conn, "agent", cfg.llm.budget.agent, clock=clock),
                 tools=_TR(conn, cfg, clock, mcp=westock),
                 render=lambda t: render_trigger(t, conn, clock, cfg),
                 pusher=pusher, memory=memory, westock=westock)
@@ -786,9 +837,8 @@ def main(conn_factory=None, clock=None, every_s: int = 30) -> None:
                   # 同样会 fail-closed 置 True，那会被误当成"额度用完"，
                   # 把「卡死」的告警一起静音。分开报：额度用完才静音，
                   # 记账坏了单独可观测（运维能查，但不影响告警）。
-                  "budget_exhausted": boss._quota_exhausted,
-                  "budget_write_failed": boss._budget_unavailable()
-                  if boss._quota_exhausted is False else False,
+                  "budget_exhausted": boss._budget_exhausted_now(),
+                  "budget_write_failed": boss._budget_unavailable(),
               }).start()
     # **`run()` 是协程**：不 `asyncio.run` 的话这里只是建了个协程对象，
     # 进程立刻退出，容器反复重启，而所有单测都绿。

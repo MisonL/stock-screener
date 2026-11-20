@@ -170,9 +170,16 @@ BUDGET_EXHAUSTED_WHY = "agent 日预算已用完"
 #: 可实际上紧接着只需 8913 的心跳、单票回访完全跑得动。
 #: Codex 用同进程新建 `AgentMain` 实例验证过：latch 一清，那条闹钟立刻完成。
 BUDGET_TOO_LARGE_WHY = "本次请求超出剩余额度"
-#: 判定"额度真的没了"时用的最小请求输入估算：连最省的提示词都放不下，
-#: 才叫额度耗尽。系统提示 + 工具 schema 大约就是这个量级。
-MIN_TURN_EST_IN = 2000
+#: 判定"额度真的没了"时用的最小请求输入估算。
+#:
+#: **实测值，不是拍脑袋**（第五轮评审指出原来的 2000 与真实差 4.5 倍）：
+#: 用真实 `ToolRegistry` 构造最小的心跳回合，`tools` 字符串 6793 字符、
+#: `SYSTEM_PROMPT` 603 字符，`_est_in(msgs, tools)` = **8911**。
+#: 取 12000 = 8911 再留 ~35% 余量（重试事件会带更长的历史）。
+#:
+#: 这个值同时是**自洽性保证**：只要剩余额度 >= 12000，最小回合（8911）就一定能跑，
+#: 于是不会出现"门控说还能跑、实际每个回合都失败写空转"的尾巴。
+MIN_TURN_EST_IN = 12000
 #: "轮数用尽"的 why 文案。**必须与 `agent/main.py` 的判定同源**：
 #: 它是"模型自己在 N 轮内没有收敛"，重试必然再次用尽，不该退回闹钟重跑。
 ROUNDS_EXHAUSTED_WHY = "轮数用尽"
@@ -424,14 +431,16 @@ async def run_turn(trigger: Trigger, deps: Deps, rendered: Rendered,
 async def run_with_deadline(trigger: Trigger, deps: Deps) -> TurnResult:
     """整回合硬截止。`rendered` 与 `state` 必须在这里建并传进去（见模块文档）。"""
     rendered = deps.render(trigger)
-    # **必须区分"今天没了"与"这次太大"**（v0.2.96，Codex 实测）：合并事件组
-    # 需要 41367 token 而剩余 41366 时，差 1 个 token 就把整天回访锁死了。
-    short = budget_shortfall(deps, math.ceil(rendered.chars / 2) + 800, MAX_TOKENS)
-    if short is not None:
-        return TurnResult(decision=TurnDecision(kind="error", speak=False,
-                                                why=short, why_silent=short),
-                          rounds=0, rendered=rendered, why=short,
-                          grounded=GroundedText(text="", ungrounded=False, failed=False))
+    # **这里刻意不做预算预检**（v0.2.100，第五轮评审 M1）。
+    #
+    # 原来这里用 `ceil(rendered.chars / 2) + 800` 估一次。评审实测同一最小心跳：
+    # 预检算出 **807**，而 `run_turn()` 轮内用的是 `_est_in(msgs, tools)` = **8911**
+    # —— 差 **11 倍**。预检几乎永远放行，真正的门一直是轮内那个。
+    # 两个口径同时存在时，"到底是'今天没了'还是'这次太大'"实际上由两个不同的
+    # 分母分别决定，边界行为不可预测。
+    #
+    # `run_turn()` 的第一轮循环开头就在这里往下几行做同一个判断（用的是正确口径），
+    # 所以预检不但口径错，还是**冗余**的。删掉它，让预算判定只有一个落点。
     state: dict = {"rounds": 0, "usage": None}
     started = time.monotonic()
     # **`deadline_s <= 0` 表示不设"正常"时长上限**，但仍然套一层**兜底硬上限**

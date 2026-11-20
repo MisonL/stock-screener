@@ -117,7 +117,8 @@ class ChatSession:
         self.llm = llm or LlmClient(cfg)
         # **池级子配置 `budget.chat`**：Budget 只认 tokens_in/out 两个限值，
         # 把整个 cfg.llm.budget 传进去会 KeyError
-        self.budget = budget or Budget(conn, "chat", cfg.llm.budget.chat)
+        self.budget = budget or Budget(conn, "chat", cfg.llm.budget.chat,
+                                       clock=clock)
         if tools is not None:
             self.tools = tools
         else:

@@ -2139,11 +2139,14 @@ async def test_budget_tail_stops_without_writing_rows(tmp_path):
     now = datetime(2026, 11, 20, 13, 52, tzinfo=SH)
     clock = FixedClock(now)
 
-    # 剩余输入 9056（与生产实测一致），已用 = 上限 - 9056
+    # 剩余输入 **5283**：这是生产实测 9056 按系数**同口径换算**后的值
+    # （9056 × 0.7 / 1.2）。系数从 1.2 改成 0.7 后，同一个真实剩余额度在预扣里
+    # 变小了，所以测试数字也要跟着换算——否则测的就不再是那个事故场景。
+    # 5283 仍低于 MIN_TURN_EST_IN(7000)，所以应当判成"跑不动"。
     from llm.budget import Budget as _B
     b = _B(conn, "agent", cfg.llm.budget.agent, clock=clock)
     conn.execute("INSERT OR REPLACE INTO llm_budget(day, pool, tokens_in, tokens_out)"
-                 " VALUES (?, 'agent', ?, 0)", (b.day, b.limit_in - 9056))
+                 " VALUES (?, 'agent', ?, 0)", (b.day, b.limit_in - 5283))
     conn.commit()
 
     class _Deps:
@@ -2167,7 +2170,7 @@ async def test_budget_tail_stops_without_writing_rows(tmp_path):
     main.next_heartbeat_at = now       # 心跳立即到期
 
     await main._once()
-    assert main.budget_exhausted is True, "剩余 9056 却判成还能跑"
+    assert main.budget_exhausted is True, "剩余 5283 却判成还能跑"
     rows = conn.execute("SELECT count(*) FROM agent_turn").fetchone()[0]
     assert rows == 0, f"额度尾巴上写了 {rows} 行空转"
 

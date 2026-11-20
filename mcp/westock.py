@@ -31,6 +31,7 @@ from core.clock import SH
 from core.http import RateLimiter
 from core.market import classify_market
 from llm.schemas import MCP_TOOL_SCHEMAS, envelope
+from core.http import direct_http as _direct_http
 
 log = logging.getLogger("mcp.westock")
 
@@ -83,7 +84,7 @@ class WestockMcp:
         if self._http is None:
             import httpx
 
-            self._http = httpx.Client(trust_env=False, timeout=TIMEOUT_S)
+            self._http = httpx.Client(trust_env=not _direct_http(), timeout=TIMEOUT_S)
         return self._http
 
     def _as_of(self) -> str:

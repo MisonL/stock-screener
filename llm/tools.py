@@ -129,18 +129,8 @@ class ToolRegistry:
         self.westock_limiter = RateLimiter(WESTOCK_MIN_INTERVAL_S)
         self._snap = SnapshotCache(lambda: conn)
         self._cache: OrderedDict[tuple, tuple[float, dict]] = OrderedDict()
-        self._returns: dict[str, list[dict]] = {}
 
-    # ---- 回合与查询 -------------------------------------------------------
-
-    def begin_turn(self) -> None:
-        """新回合开始：清空本轮返回记录（Task 10 的回合循环在回合开头调）。"""
-        self._returns.clear()
-
-    @property
-    def returns_this_turn(self) -> dict[str, list[dict]]:
-        """本轮每个工具的全部返回信封（Task 5 出处校验按它取值）。"""
-        return {name: list(envs) for name, envs in self._returns.items()}
+    # ---- 查询 -------------------------------------------------------------
 
     def schema(self, kind: str) -> list[dict]:
         if kind not in KINDS:
@@ -169,7 +159,6 @@ class ToolRegistry:
             env = self._dispatch(name, dict(raw_args), now)
         except Exception as exc:                          # noqa: BLE001 —— 兜底，不抛给调用方
             env = envelope(ok=False, reason=f"tool_error:{type(exc).__name__}", as_of=now)
-        self._returns.setdefault(name, []).append(env)
         return env
 
     def _dispatch(self, name: str, args: dict, now: str) -> dict:

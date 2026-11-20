@@ -26,8 +26,40 @@ from llm.budget import CHARS_TO_TOKENS
 from llm.grounding import GroundedText, enforce
 
 MAX_TOOL_CALLS_PER_ROUND = 6
+#: `max_tokens` 的**兜底值**。真实来源是 `config/llm.yaml::llm.max_tokens`
+#: （`tools` / `plain`），由 `_max_out()` 解析。
+#:
+#: **2026-11-20 的审计发现这两个配置键曾是死配置**：三个 `llm.chat()` 调用点
+#: 全部显式传值（这里是 2000 和 1000，`chat/session.py` 也是 2000），而
+#: `LlmClient.default_max_tokens()` 只在 `max_tokens` 为假时才生效——
+#: 于是改 YAML 里的 `max_tokens` **完全没有效果**。遇到"空正文 /
+#: `finish_reason=length` / JSON 截断"时，第一反应就是去调那个值，
+#: 改了却不生效，最费时间。
 MAX_TOKENS = 2000
 REWRITE_MAX_TOKENS = 1000
+
+
+def _max_out(deps, *, tools: bool = True) -> int:
+    """本次请求实际要发的 `max_tokens`：**配置优先**，缺省回退模块常量。
+
+    预算的 `est_out` 也用同一个函数取，否则"扣多少"和"发多少"会脱钩。
+    """
+    llm_cfg = getattr(getattr(deps, "cfg", None), "llm", None)
+    mt = getattr(llm_cfg, "max_tokens", None)
+    val = getattr(mt, "tools" if tools else "plain", None)
+    try:
+        if val and not isinstance(val, bool):      # `int(True)` 会变成 1
+            got = int(val)
+            # **必须校验正数**：`tools: -5` 会直接发出非法 `max_tokens`，
+            # `tools: yes` 会被 `int(True)` 变成 1（每次空正文 → 一直重试）。
+            # `_limit()` 那边有同类校验，这里以前漏了（第七轮评审 L7）。
+            # 只接受**整数**：`2.9` 会被 `int()` 截成 2，
+            # 那是个没人会想要的 max_tokens（每次只够发 2 个 token）。
+            if got > 0 and float(val) == got:
+                return got
+    except (TypeError, ValueError):
+        pass
+    return MAX_TOKENS if tools else REWRITE_MAX_TOKENS
 
 
 @dataclass
@@ -136,10 +168,11 @@ def make_rewriter(deps: Deps, state: dict) -> Callable[[str, list], Awaitable[st
                 {"role": "user", "content": f"{text}\n\n以下数字与工具返回不一致：\n{wrong}\n"
                                             "请改正这些数字后只输出正文。"}]
         # 重写也是一次真实调用：额度不够就不发（否则「预算已耗尽仍能靠重写超支」）
-        if not deps.budget.allow(est_in=_est_in(msgs), est_out=REWRITE_MAX_TOKENS):
+        rewrite_out = _max_out(deps, tools=False)
+        if not deps.budget.allow(est_in=_est_in(msgs), est_out=rewrite_out):
             return text
         try:
-            result = await deps.llm.chat(msgs, max_tokens=REWRITE_MAX_TOKENS, timeout_s=10,
+            result = await deps.llm.chat(msgs, max_tokens=rewrite_out, timeout_s=10,
                                          deduct=_deduct(deps, state), est_in=_est_in(msgs),
                                          on_attempt=_make_auditor(deps, state))
         except (asyncio.CancelledError, GeneratorExit):
@@ -347,7 +380,7 @@ async def run_turn(trigger: Trigger, deps: Deps, rendered: Rendered,
                                   trigger.deadline_s, started)
         # **每一轮都查**：只在回合开头查的话，首轮把额度用光后，后续工具轮与
         # grounding 重写仍然继续调用中转站——日预算是硬上限，不是软提示
-        short = budget_shortfall(deps, _est_in(msgs, tools), MAX_TOKENS)
+        short = budget_shortfall(deps, _est_in(msgs, tools), _max_out(deps))
         if short is not None:
             # **这里不加轮数**：一次 LLM 都没发出去，记成 1 轮会把 F-34 的
             # 「一轮收场」占比虚高到 1.0。
@@ -370,7 +403,7 @@ async def run_turn(trigger: Trigger, deps: Deps, rendered: Rendered,
         # usage 挂在异常上带出来。
         result = None
         try:
-            result = await deps.llm.chat(msgs, tools, max_tokens=MAX_TOKENS,
+            result = await deps.llm.chat(msgs, tools, max_tokens=_max_out(deps),
                                          timeout_s=timeout_s, deduct=_deduct(deps, state),
                                          est_in=_est_in(msgs, tools),
                                          on_attempt=_make_auditor(deps, state))

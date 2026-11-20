@@ -3,7 +3,8 @@
 四条约束：
 
 1. **SDK 自带重试必须关掉**（`max_retries=0`）：它和我们自己的 3 次相乘，一次 502 会变成 9 个请求。
-2. **`thinking` 无条件注入**：这是唯一落地 `thinking: disabled` 的地方。漏注入会先烧推理
+2. **`thinking` 注入**：值来自 `config/llm.yaml::llm.thinking`（v0.2.105 接线），
+   缺省 `disabled`。漏注入会先烧推理
    token，`max_tokens` 给小还会返回空正文 + `finish_reason=length`——与「空 body 可重试」
    的判据叠加就成了无限重试。
 3. **`base_url` / `api_key` 允许环境变量覆盖**：故障演练用 `LLM_BASE_URL=http://blackhole:1`
@@ -21,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import httpx
+from core.http import direct_http as _direct_http
 
 # **`openai` 不在顶层导入**：它自己一条 `import` 要 10 秒（大量 pydantic 模型：
 # openai.types.* 上百个模块）。`agent.main()` 启动路径上就会构造 `LlmClient`，
@@ -223,7 +225,7 @@ class LlmClient:
                 # 单次调用的超时由 `default_timeout()` 每次决定（配置 0 时用
                 # `SAFETY_TIMEOUT_S` 兜底）。这里给 `None` 是为了**不让 client
                 # 级默认值盖掉每次请求传的值**；真正生效的是请求上的 timeout。
-                http_client=self._http_client or httpx.AsyncClient(trust_env=False, timeout=None),
+                http_client=self._http_client or httpx.AsyncClient(trust_env=not _direct_http(), timeout=None),
             )
         return self._client
 
@@ -238,6 +240,19 @@ class LlmClient:
 
     async def __aexit__(self, *exc) -> None:
         await self.aclose()
+
+    def _thinking_type(self) -> str:
+        """`llm.thinking` 的取值（`disabled` / `enabled`）。
+
+        **v0.2.105 之前这个键全仓零读取**，`extra_body` 注入的是字面量
+        `"disabled"`——改 YAML 没有任何变化，而这里的注释还教人"要开时
+        max_tokens 须 ≥2000"，等于指着一个改不动的开关。
+
+        兼容两种配置写法：字符串 `disabled`，或带 `.value` 的枚举对象。
+        """
+        val = getattr(getattr(self.cfg, "llm", None), "thinking", None)
+        val = getattr(val, "value", val)
+        return str(val) if val else "disabled"
 
     def default_max_tokens(self, tools: list[dict] | None) -> int:
         if tools:
@@ -340,7 +355,9 @@ class LlmClient:
             "messages": messages,
             "max_tokens": max_tokens,
             # 唯一注入点：漏了它就会先烧推理 token，还会让 max_tokens 小的请求返回空正文
-            "extra_body": {"thinking": {"type": "disabled"}},
+            # **`llm.thinking` 配置真的生效**（v0.2.105）：审计发现这个键全仓零读取，
+            # 注入的是**字面量** "disabled"，改 YAML 不会有任何变化。
+            "extra_body": {"thinking": {"type": self._thinking_type()}},
         }
         if tools:
             body["tools"] = tools

@@ -18,6 +18,7 @@ from __future__ import annotations
 import httpx
 
 from notify.templates import Message, NtfyAction
+from core.http import direct_http as _direct_http
 
 
 def _action(value: NtfyAction) -> str:
@@ -45,7 +46,7 @@ class NtfyClient:
         self.base_url = base_url.rstrip("/")
         self.topic = topic
         self.token = token
-        self.http = http or httpx.Client(trust_env=False, timeout=10.0)
+        self.http = http or httpx.Client(trust_env=not _direct_http(), timeout=10.0)
 
     def publish(self, m: Message) -> str:
         """发一条通知，返回服务端 `id`；非 2xx 抛 `httpx.HTTPStatusError`（由 Dispatcher 计失败）。"""

@@ -23,6 +23,7 @@ from llm.tools import ToolRegistry
 
 HISTORY_KEEP = 10                 # 最近 10 轮
 ROUNDS = 6
+#: 兜底值；真实来源是 `config/llm.yaml::llm.max_tokens.tools`（v0.2.105 接线）。
 MAX_TOKENS = 2000
 DEADLINE_S = 60
 STALE_S = 60                      # 数据超过 60 秒且盘中 → 回答首行标注截止时刻                      # 数据超过 60 秒且盘中 → 回答首行标注截止时刻
@@ -109,6 +110,25 @@ def context_snapshot(conn, clock) -> str:
 class ChatSession:
     """api 进程里的对话会话。**单例**：由 `create_app` 构造一次并注入路由。"""
 
+
+    def _max_out(self) -> int:
+        """对话这次请求实际要发的 `max_tokens`：**配置优先**（v0.2.105）。
+
+        此前三个 `llm.chat()` 调用点全部显式传 2000，而 YAML 里的
+        `max_tokens.tools/plain` 从来没人读——改了完全不生效。
+        """
+        mt = getattr(getattr(self.cfg, "llm", None), "max_tokens", None)
+        try:
+            val = getattr(mt, "tools", None)
+            if val and not isinstance(val, bool):
+                got = int(val)
+                # 与 `agent/loop.py::_max_out` 同样的校验：正数 + 整数
+                if got > 0 and float(val) == got:
+                    return got
+        except (TypeError, ValueError):
+            pass
+        return MAX_TOKENS
+
     def __init__(self, conn, cfg, clock, llm=None, budget=None, tools=None,
                  ntfy=None, mcp=None):
         self.conn = conn
@@ -172,7 +192,8 @@ class ChatSession:
 
         # 首轮就查一次：额度不够时不必进循环
         chat_tools = self.tools.schema("chat")
-        if not self.budget.allow(est_in=_est_in(messages, chat_tools), est_out=MAX_TOKENS):
+        out_tokens = self._max_out()
+        if not self.budget.allow(est_in=_est_in(messages, chat_tools), est_out=out_tokens):
             return self._fallback(session_id, text, "对话额度已用完")
 
         started = time.monotonic()
@@ -188,10 +209,10 @@ class ChatSession:
                 # **每一轮都要查**：只在回合开始时查的话，首轮就把额度用光后，
                 # 后续工具轮仍然继续发请求（预算形同虚设）
                 if not self.budget.allow(est_in=_est_in(messages, self.tools.schema("chat")),
-                                 est_out=MAX_TOKENS):
+                                 est_out=out_tokens):
                     return self._fallback(session_id, text, "对话额度已用完")
                 result = await self.llm.chat(
-                    messages, tools, max_tokens=MAX_TOKENS,
+                    messages, tools, max_tokens=out_tokens,
                     # 配置为 0 表示不限单次调用时长：此时只用本轮的剩余时间，
                     # 不能把 0 传下去（SDK 会当成"立刻超时"）。
                     timeout_s=_call_timeout(remaining, self.cfg.llm.timeouts.chat_s),

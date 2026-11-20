@@ -145,7 +145,10 @@ async def test_tools_default_max_tokens_is_tools_budget():
 async def test_plain_default_max_tokens_is_plain_budget():
     mock = Mock(ok_body(content="好"))
     await mock.client().chat([{"role": "user", "content": "hi"}])
-    assert mock.sent_max_tokens == [800]
+    # **1000 不是 800**：v0.2.105 把 `llm.max_tokens` 接上真了，而
+    # `agent/loop.py::REWRITE_MAX_TOKENS`（grounding 重写实际用的值）一直是 1000。
+    # 接线时把配置从 800 改成 1000，才保证"接线不改变运行时行为"。
+    assert mock.sent_max_tokens == [1000]
 
 
 async def test_doubling_happens_at_most_once():
@@ -453,3 +456,75 @@ async def test_actual_request_carries_the_configured_timeout():
     # **绝不能让 0 或 None 落到 httpx**：0 = 立刻超时，None = 永远等
     assert seen[0] is not None and seen[0] > 0, (
         f"read timeout 是 {seen[0]}：0 会让请求立刻失败，None 会让它永久挂住")
+
+
+def test_thinking_config_is_actually_injected():
+    """**`llm.thinking` 必须真的生效**（v0.2.105）。
+
+    审计发现这个键全仓零读取：`extra_body` 里注入的是**字面量**
+    `{"thinking": {"type": "disabled"}}`。运维照着注释改成 `enabled`
+    不会有任何变化——而 `llm/client.py` 的注释明说"要开时 max_tokens 须 ≥2000"，
+    等于教人去改一个改不动的开关。
+    """
+    from llm.client import LlmClient
+    from core.config import load_config
+    from types import SimpleNamespace
+    from pathlib import Path as _P
+
+    cfg = load_config(_P("config"))
+
+    def _client_with(thinking):
+        cfg2 = SimpleNamespace(llm=SimpleNamespace(
+            thinking=thinking, base_url=cfg.llm.base_url, model=cfg.llm.model,
+            api_key_env=cfg.llm.api_key_env))
+        return LlmClient(cfg2)
+
+    assert _client_with("disabled")._thinking_type() == "disabled", (
+        "默认配置没读到 thinking")
+    assert _client_with("enabled")._thinking_type() == "enabled", (
+        "把 thinking 改成 enabled 没生效")
+    assert _client_with(None)._thinking_type() == "disabled", (
+        "缺配置时没回退到 disabled（安全侧）")
+
+
+def test_thinking_type_reaches_extra_body():
+    """光有 `_thinking_type()` 是假绿：必须验到它**真的进到请求里**。
+
+    第一版只测了这个方法本身——把 `extra_body` 改回字面量照样绿。
+    """
+    from llm.client import LlmClient
+    from core.config import load_config
+    from types import SimpleNamespace
+    from pathlib import Path as _P
+    import asyncio
+
+    cfg = load_config(_P("config"))
+    seen = {}
+
+    class _FakeCompletions:
+        async def create(self, **kw):
+            seen.update(kw)
+            raise RuntimeError("stop here")
+
+    class _FakeChat:
+        completions = _FakeCompletions()
+
+    # 直接把真实 llm 配置拿来用，只覆盖 thinking —— 手搓 SimpleNamespace
+    # 容易漏字段（第一次就漏了 retry，导致 fake 根本没被调用，断言看不出原因）
+    # `_NS` 是 `__slots__` 的只读视图，`vars()` 取不到；按字段手工兜底即可，
+    # 但要把 `_once` 真正读到的字段都带上（第一次漏了 retry，fake 根本没被调用）。
+    llm_ns = SimpleNamespace(
+        thinking="enabled", base_url=cfg.llm.base_url, model=cfg.llm.model,
+        api_key_env=cfg.llm.api_key_env, max_tokens=cfg.llm.max_tokens,
+        timeouts=cfg.llm.timeouts)
+    # **`LlmClient.cfg` 是根配置**（它读 `cfg.retry.*`、`cfg.pricing.*`），
+    # 不是 `cfg.llm` —— 第一次就错在这里，fake 根本没被调用。
+    cfg2 = SimpleNamespace(llm=llm_ns, retry=cfg.retry)
+    c = LlmClient(cfg2)
+    c._client = SimpleNamespace(chat=_FakeChat())   # 属性缓存的就是这个
+    try:
+        asyncio.run(c.chat([{"role": "user", "content": "hi"}], max_tokens=100))
+    except Exception:                                   # noqa: BLE001
+        pass
+    assert seen.get("extra_body", {}).get("thinking", {}).get("type") == "enabled", (
+        f"thinking 没进到请求体：{seen.get('extra_body')}")

@@ -473,17 +473,30 @@ def test_sector_history_local_fallback(conn):
     assert closes == pytest.approx([15.0, 18.0])             # (10+20)/2, (11+25)/2
 
 
-def test_returns_this_turn_per_tool(conn):
+def test_registry_does_not_accumulate_tool_returns(conn):
+    """**`ToolRegistry` 不能跨回合攒工具返回**（v0.2.105）。
+
+    原来有 `_returns` + `begin_turn()` + `returns_this_turn` 三件套，但
+    `begin_turn()` 在**生产里零调用**——`agent/loop.py` 早就不用它了
+    （那里明确注释"`_returns` 是跨回合累计的"，所以另建了回合级
+    `tool_returns` 局部变量）。
+
+    后果是真实的：agent 进程里 `ToolRegistry` 是**全程单例**，而
+    `invoke()` 每次都 `self._returns[name].append(env)`，**没有任何上限**
+    （对比 `_cache` 有 `CACHE_LIMIT=256`）。一个交易日所有工具返回信封
+    （含 K 线、板块历史这些大 payload）在内存里只增不减。
+
+    所以这里断言的是"**没有**这个累加器"，而不是给它加个上限——
+    生产路径本来就用回合级局部变量，留着它只有坏处。
+    """
     seed_snap(conn, "pool", [quote_row("sh600519", 32.9)])
     reg = make_reg(conn)
-    reg.invoke("get_quote", {"code": "sh600519"}, kind="chat")
-    reg.invoke("get_quote", {"code": "sh600519"}, kind="chat")
-    reg.invoke("get_pool", {}, kind="chat")
-    rets = reg.returns_this_turn
-    assert len(rets["get_quote"]) == 2 and len(rets["get_pool"]) == 1
-    assert rets["get_quote"][0]["ok"] is True
-    reg.begin_turn()
-    assert reg.returns_this_turn == {}
+    for _ in range(5):
+        reg.invoke("get_quote", {"code": "sh600519"}, kind="chat")
+    assert not hasattr(reg, "_returns"), (
+        "ToolRegistry 又在攒工具返回了：生产单例会整个交易日只增不减")
+    assert not hasattr(reg, "returns_this_turn"), (
+        "`returns_this_turn` 回来了：它的唯一配套 `begin_turn()` 生产零调用")
 
 
 # ---------------------------------------------------------------- envelope 单元

@@ -9,9 +9,15 @@ from datetime import datetime, timedelta
 
 from core.clock import SH  # noqa: F401 —— `Deps` 组装点需要 `SH`
 
-# 09:15–10:00 与 14:30–15:00：2 分钟密集
-# 11:00–11:30 与 13:00–13:30：10 分钟放松
-# 其余 5 分钟；任何情况下 ≤ 10 分钟；午休与 15:05 之后不排
+#: 心跳节奏的**默认值**。真实来源是 `config/agent.yaml::heartbeat`，
+#: 由 `next_heartbeat(now, hb)` 的 `hb` 参数传入；这些常量只是"没传就用它们"，
+#: 供测试与不读配置的调用方（如 `api/watchdog.py` 的推算）使用。
+#:
+#: **2026-11-20 的审计发现这里曾是死配置**：`agent.yaml` 的
+#: `heartbeat.base_min/tight_min/max_min/tight/relaxed` 五个键**全仓零读取**，
+#: 真值写死在这三个常量里，而两者数值恰好相等（2/5/10 min ↔ 120/300/600s）
+#: ——所以改配置不生效却完全看不出来。这与当天修掉的"死配置 #2"是同一个形状。
+#: 现在 `agent/main.py` 把 `cfg.agent.heartbeat` 传进来。
 _DENSE = 120         # 2 min
 _LOOSE = 600         # 10 min
 _NORMAL = 300        # 5 min
@@ -21,13 +27,65 @@ def _hm(dt: datetime) -> str:
     return dt.strftime("%H:%M")
 
 
-def next_heartbeat(now: datetime) -> datetime:
+#: 默认时段表（`config/agent.yaml::heartbeat.tight / relaxed` 的等价物）。
+#: 只有 `hb is None` 时才用——生产走配置。
+_DEFAULT_TIGHT = (("09:15", "10:00"), ("14:30", "15:00"))
+_DEFAULT_RELAXED = (("11:00", "11:30"), ("13:00", "13:30"))
+
+
+def _profile(hb) -> tuple[tuple, tuple, dict[str, int]]:
+    """把 `cfg.agent.heartbeat` 翻成 (密集区间, 放松区间, {档位: 秒})。
+
+    `hb is None` 时退回模块常量——保持既有调用方与测试的行为不变。
+    """
+    default = (_DEFAULT_TIGHT, _DEFAULT_RELAXED,
+               {"tight": _DENSE, "relaxed": _LOOSE, "base": _NORMAL})
+    if hb is None:
+        return default
+    # **配置坏了也不能抛**：`agent/main.py::_once()` 在心跳推进前裸调用本函数，
+    # 而 `run()` 会吞掉异常重试——一次类型错误就会让心跳/闹钟/开盘回合全部停摆
+    # （v0.2.93 修过同一个形状）。所以这里退回默认节奏，宁可慢一点也别停。
+    try:
+        tight = tuple((str(a), str(b)) for a, b in hb.tight)
+        relaxed = tuple((str(a), str(b)) for a, b in hb.relaxed)
+        iv = {"tight": int(hb.tight_min) * 60,
+              "relaxed": int(hb.max_min) * 60,
+              "base": int(hb.base_min) * 60}
+        if not tight or not relaxed or min(iv.values()) <= 0:
+            return default
+        return tight, relaxed, iv
+    except (AttributeError, TypeError, ValueError):
+        import logging
+        logging.getLogger(__name__).warning(
+            "heartbeat 配置非法（%r），退回默认节奏", hb, exc_info=True)
+        return default
+
+
+def _step_for(hm: str, tight, relaxed, iv) -> int:
+    """当前时刻属于哪一档，返回该档的间隔秒数。都不在区间内 → base。"""
+    for lo, hi in tight:
+        if lo <= hm < hi:
+            return iv["tight"]
+    for lo, hi in relaxed:
+        if lo <= hm < hi:
+            return iv["relaxed"]
+    return iv["base"]
+
+
+def next_heartbeat(now: datetime, hb=None) -> datetime:
     """下次心跳时间。跳过午休（11:30–13:00）与盘后（>15:00）。
 
-    午休 95 分钟不排心跳，但 `next_heartbeat` 不能把间隔算成 95 分钟——间隔
-    最大值就是 10 分钟（`_LOOSE`），所以午休期间调用时返回 13:00。
+    午休 95 分钟不排心跳，但 `next_heartbeat` 不能把间隔算成 95 分钟——
+    间隔最大值就是 `relaxed` 档（默认 10 分钟），所以午休期间调用时返回 13:00。
+
+    **档位与时段都来自 `cfg.agent.heartbeat`**（v0.2.105）：此前五个键
+    （`base_min/tight_min/max_min/tight/relaxed`）全仓零读取，真值写死在这里，
+    而数值恰好相等——改配置不生效却看不出来。现在 `hb` 由 `agent/main.py` 传入，
+    传 `None` 时退回模块默认值。
     """
     minute = now.replace(second=0, microsecond=0)
+    tight, relaxed, iv = _profile(hb)
+    hm = _hm(now)
 
     def clamp(when):
         """排出来的时间不能落进午休（11:30–13:00）或盘后（>15:00）。
@@ -35,30 +93,22 @@ def next_heartbeat(now: datetime) -> datetime:
         午休没有心跳消费者：11:29 加上 10 分钟得到的 11:39 落进午休，就该直接跳到
         13:00；否则这次心跳永远不发生（`pending_retry` 无人接手、确认卡无人过期）。
         """
-        hm = _hm(when)
-        if "11:30" <= hm < "13:00":
+        h = _hm(when)
+        if "11:30" <= h < "13:00":
             return when.replace(hour=13, minute=0)
-        if hm >= "15:00":
+        if h >= "15:00":
             tomorrow = when + timedelta(days=1)
             return tomorrow.replace(hour=9, minute=15, second=0, microsecond=0)
         return when
 
-    if _hm(now) < "09:15":
+    if hm < "09:15":
         return minute.replace(hour=9, minute=15)
-    if _hm(now) < "10:00":
-        return clamp(minute + timedelta(seconds=_DENSE))
-    if _hm(now) < "11:00":
-        return clamp(minute + timedelta(seconds=_NORMAL))
-    if _hm(now) < "11:30":
-        return clamp(minute + timedelta(seconds=_LOOSE))
-    if _hm(now) < "13:00":
+    if hm < "11:30":
+        return clamp(minute + timedelta(seconds=_step_for(hm, tight, relaxed, iv)))
+    if hm < "13:00":
         return minute.replace(hour=13, minute=0)      # 午休直接跳到 13:00
-    if _hm(now) < "13:30":
-        return clamp(minute + timedelta(seconds=_LOOSE))
-    if _hm(now) < "14:30":
-        return clamp(minute + timedelta(seconds=_NORMAL))
-    if _hm(now) < "15:00":
-        return clamp(minute + timedelta(seconds=_DENSE))
+    if hm < "15:00":
+        return clamp(minute + timedelta(seconds=_step_for(hm, tight, relaxed, iv)))
     # > 15:00：盘后不排；次日 09:15
     tomorrow = now + timedelta(days=1)
     return tomorrow.replace(hour=9, minute=15, second=0, microsecond=0)

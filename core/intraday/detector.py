@@ -46,7 +46,15 @@ def level_for(det: Detection, cfg) -> str:
         multiple = det.payload.get("box_vol_multiple") or 0.0
         if score >= p0.score and multiple >= p0.vol:
             return "P0"
-        return "P1"
+        # **`notify.p1_score` 真的生效**（v0.2.105）：审计发现这个键全仓零读取，
+        # 旧实现是"非 P0 的突破一律 P1"，60 分这个闸门完全不存在——
+        # 运维以为 P1 有分数门槛，实际不分青红皂白全 P1，
+        # 直接放大 `p1_merge` 的合并压力与"该不该响"的误判。
+        #
+        # 默认 **0 = 不设闸门**，与旧行为完全一致（接线不改变运行时行为）；
+        # 真要求闸门时把 `p1_score` 改成 60 之类即可。
+        p1 = getattr(cfg.notify, "p1_score", 0) or 0
+        return "P1" if score >= p1 else "P2"
     return "P2"
 
 

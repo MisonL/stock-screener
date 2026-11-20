@@ -32,7 +32,9 @@ context:
   max_chars: 6000
   sector_events: 8
   own_history: 10
-  own_history_trim: 5
+  # `own_history_trim` 已删除（v0.2.105）：它从来没有读取点，也没有明确的语义
+  #——"历史超预算时保留几条"最终由 `context.max_chars` 的整体裁剪决定。
+  # 与 `memory.*` 三键同样处理：留着键却没有实现，比删掉更容易误导。
 
 channel_b_daily_cap: 15        # 通道 B（agent 主动开口）的日上限；通道 A 不计入
 

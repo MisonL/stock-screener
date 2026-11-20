@@ -19,9 +19,14 @@ from datetime import datetime, timedelta
 from agent.memory import recall
 
 DEFAULT_MAX_CHARS = 6000
+#: **兜底值**。真实来源是 `config/agent.yaml::context.*`（v0.2.105 接线）。
+#:
+#: 审计发现 `context.sector_events / own_history` 两个键全仓零读取，真值写死在
+#: 这里，而同一段的 `context.max_chars` 却是真读的
+#: ——同一段配置里一半生效一半不生效，是最难查的一种。
+#: `OWN_HISTORY_TAIL` 更是连代码里都没人用，已删除。
 SECTOR_EVENTS = 8
 OWN_HISTORY = 10
-OWN_HISTORY_TAIL = 5
 MEMORY_LIMIT = 3
 BOX_BARS = 3
 
@@ -94,8 +99,26 @@ def _has_push_log(conn) -> bool:
                         ).fetchone() is not None
 
 
-def _sector_block(conn, group, anchor: int) -> tuple[str, list[dict]]:
-    """同板块/同时段其它事件：按 salience 取最高 8 条（不是按时间）。"""
+def _limit(cfg, name: str, fallback: int) -> int:
+    """从 `cfg.agent.context.<name>` 取一个正整数上限，取不到用兜底值。
+
+    **`context.sector_events` / `context.own_history` 曾经是死配置**
+    （v0.2.105 之前全仓零读取，真值写死在模块常量里），而同一段的
+    `context.max_chars` 却是真读的——一半生效一半不生效最难查。
+    """
+    try:
+        val = getattr(getattr(cfg, "agent", None), "context", None)
+        val = getattr(val, name, None)
+        if val is not None and int(val) > 0:
+            return int(val)
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return fallback
+
+
+def _sector_block(conn, group, anchor: int, cfg=None) -> tuple[str, list[dict]]:
+    """同板块/同时段其它事件：按 salience 取最高 N 条（不是按时间）。"""
+    limit = _limit(cfg, "sector_events", SECTOR_EVENTS)
     industries = {e.industry for e in group.events if getattr(e, "industry", None)}
     seen = {e.id for e in group.events}
     rows = []
@@ -103,7 +126,7 @@ def _sector_block(conn, group, anchor: int) -> tuple[str, list[dict]]:
         for r in conn.execute(
                 "SELECT id, ts, target, kind, payload, salience FROM event_log"
                 " WHERE trade_date = ? AND kind = ? ORDER BY salience DESC LIMIT ?",
-                (anchor, group.events[0].kind, SECTOR_EVENTS * 2)):
+                (anchor, group.events[0].kind, limit * 2)):
             if r[0] in seen:
                 continue
             try:
@@ -115,7 +138,7 @@ def _sector_block(conn, group, anchor: int) -> tuple[str, list[dict]]:
             rows.append({"id": r[0], "ts": r[1], "code": r[2], "kind": r[3],
                          "industry": ind, "salience": float(r[5])})
     rows.sort(key=lambda d: d["salience"], reverse=True)
-    rows = rows[:SECTOR_EVENTS]
+    rows = rows[:limit]
     if not rows:
         return "", []
     lines = ["【同板块事件】"]
@@ -203,9 +226,10 @@ def render_event(group, conn, clock, cfg) -> Rendered:
     bars_block, bars_ctx = _bars_block(conn, group, anchor)
 
     first_two = head + "\n" + e_block + "\n\n" + bars_block
-    sec_block, sec_rows = _sector_block(conn, group, anchor)
+    sec_block, sec_rows = _sector_block(conn, group, anchor, cfg)
     mem_block, mem_rows = _memory_block(conn, group, now)
-    hist_block, hist_rows = _history_block(conn, now, OWN_HISTORY)
+    hist_block, hist_rows = _history_block(
+        conn, now, _limit(cfg, "own_history", OWN_HISTORY))
 
     conf_block, conf_rows = _confirm_block(conn, now)
     rest = "\n\n".join(b for b in (conf_block, sec_block, mem_block, hist_block) if b)
@@ -252,7 +276,8 @@ def render_heartbeat(window_start, conn, clock, cfg) -> Rendered:
     conf_block, conf_rows = _confirm_block(conn, now)
     if conf_block:
         parts.append(conf_block)
-    hist_block, hist_rows = _history_block(conn, now, OWN_HISTORY)
+    hist_block, hist_rows = _history_block(
+        conn, now, _limit(cfg, "own_history", OWN_HISTORY))
     if hist_block:
         parts.append(hist_block)
 

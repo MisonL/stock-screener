@@ -238,3 +238,29 @@ def test_price_kind_cooldown_survives_restart(tmp_db, CFG):
     d2.ingest([], _focus_of)          # 空 tick：本可以重新武装
     evs = d2.ingest([mk("breakout", score=90, box_vol_multiple=3.0)], _focus_of)
     assert evs == [], "重启后冷却被清零，同一只票又被报了一次"
+
+
+def test_p1_score_gate_actually_reads_the_config(conn):
+    """**`notify.p1_score` 必须真的生效**（v0.2.105）。
+
+    审计发现这个键全仓零读取：旧实现是"非 P0 的突破一律 P1"，60 分这个闸门
+    完全不存在。运维以为 P1 有分数门槛，实际不分青红皂白全 P1——
+    进而放大 `p1_merge` 的合并压力与"该不该响"的误判。
+
+    接线**不改变默认行为**：默认 0 = 不设闸门，与旧实现一致。
+    """
+    from core.intraday.detector import Detection, level_for
+    from types import SimpleNamespace
+
+    def cfg(p1_score):
+        return SimpleNamespace(notify=SimpleNamespace(
+            p0=SimpleNamespace(score=80, vol=2.5), p1_score=p1_score))
+
+    # 分数 65 的突破，不是 P0（没到 80）
+    det = Detection(kind="breakout", code="sh600519", extended=False,
+                    payload={"score": 65, "box_vol_multiple": 1.0})
+
+    assert level_for(det, cfg(0)) == "P1", "默认 0 应当不设闸门（与旧行为一致）"
+    assert level_for(det, cfg(60)) == "P1", "65 分过了 60 的闸门，仍该是 P1"
+    assert level_for(det, cfg(70)) == "P2", (
+        "65 分没过 70 的闸门，应为 P2——闸门没接线")

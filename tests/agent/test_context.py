@@ -146,3 +146,76 @@ def test_chat_prompt_does_not_demand_emit_decision():
 def test_prompts_share_hard_rules():
     for rule in ("出处标记", "不复权", "阿拉伯数字", "不确定"):
         assert rule in SYSTEM_PROMPT and rule in CHAT_SYSTEM_PROMPT
+
+
+def test_sector_events_config_reaches_the_rendered_output(conn):
+    """**`context.sector_events` 必须真的影响渲染结果**（v0.2.105）。
+
+    第七轮评审：`_limit()` 本身有测试，但 `render_event` 里
+    `_sector_block(..., cfg)` 这个**生产调用点**没测——把它改回不传 cfg，
+    11 个测试全绿。假绿形状与 heartbeat / max_tokens 完全一致。
+    """
+    from types import SimpleNamespace
+    from core.clock import FixedClock
+    from tests.helpers import SH
+    from datetime import datetime
+    import agent.context as C
+
+    now = datetime(2026, 11, 20, 10, 0, tzinfo=SH)
+    clock = FixedClock(now)
+
+    # 造 6 条同板块其它事件（用现成的 `_ev` / `_insert` / `WakeGroup`）
+    group_ev = _ev(0)
+    _insert(conn, group_ev)
+    for i in range(1, 7):
+        _insert(conn, _ev(i, salience=1.0 - i * 0.01))   # 默认 industry=半导体，与 group_ev 同板块
+
+    group = WakeGroup(id="g", market="cn_main", kind="merged", events=[group_ev],
+                      channel="A", salience=0.585)
+
+    cfg = SimpleNamespace(agent=SimpleNamespace(context=SimpleNamespace(
+        sector_events=2, own_history=10, max_chars=6000)))
+
+    # **必须走 `render_event`**：直接调 `_sector_block` 验不到生产调用点
+    # （把 `render_event` 里那行改回不传 cfg，直调版本照样绿——实测过）。
+    out = render_event(group, conn, FixedClock(T0), cfg)
+    assert len(out.ctx["sector_events"]) <= 2, (
+        f"配置 sector_events=2 但渲染了 {len(out.ctx['sector_events'])} 条")
+
+    # 生产配置（8）应当拿到更多
+    out8 = render_event(group, conn, FixedClock(T0), CFG)
+    assert len(out8.ctx["sector_events"]) > len(out.ctx["sector_events"]), (
+        "生产配置应当取到比 2 条更多")
+
+
+def test_own_history_config_reaches_the_rendered_output(conn):
+    """**`context.own_history` 必须真的影响渲染结果**（v0.2.105）。
+
+    与 sector_events 同批接线；同样必须走 `render_event`——
+    把 `render_event` 里那行改回 `OWN_HISTORY` 常量，直调 `_history_block`
+    的版本照样绿。
+    """
+    from types import SimpleNamespace
+
+    # 造 10 条"我说过"的回合
+    for i in range(10):
+        conn.execute(
+            "INSERT INTO agent_turn(ts, wake_kind, context_digest, rounds, decision,"
+            " fallback, market, why) VALUES (?, 'heartbeat', 'd', 1, 'silent', 0,"
+            " 'cn_main', ?)", (T0.isoformat(), f"我说过第 {i} 句"))
+    conn.commit()
+
+    group_ev = _ev(0)
+    _insert(conn, group_ev)
+    group = WakeGroup(id="g", market="cn_main", kind="event",
+                      events=[group_ev], channel="A", salience=0.9)
+
+    cfg = SimpleNamespace(agent=SimpleNamespace(context=SimpleNamespace(
+        sector_events=8, own_history=3, max_chars=6000)))
+    out = render_event(group, conn, FixedClock(T0), cfg)
+    assert len(out.ctx["own_history"]) == 3, (
+        f"配置 own_history=3 但渲染了 {len(out.ctx['own_history'])} 条")
+
+    out8 = render_event(group, conn, FixedClock(T0), CFG)
+    assert len(out8.ctx["own_history"]) == 10, (
+        f"生产配置（10）应当渲染 10 条，实际 {len(out8.ctx['own_history'])}")

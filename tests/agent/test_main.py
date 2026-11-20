@@ -41,6 +41,8 @@ class FakeLlm:
 
             raise BudgetExceeded("预算不足")
         self.sent.append(messages)
+        self.sent_max_tokens = getattr(self, "sent_max_tokens", [])
+        self.sent_max_tokens.append(max_tokens)
         step = self.script.pop(0) if self.script else _silent()
         return step
 
@@ -323,3 +325,74 @@ def test_budget_exhausted_flag_and_reset(env):
     env.llm.script = [_silent()]
     asyncio.run(env.main._once())
     assert env.main.budget_exhausted is False
+
+
+# ---- 第 8 次假绿的补丁：**生产调用点**必须被验到（v0.2.105）----------------
+#
+# 第七轮评审发现：`test_heartbeat_cadence_actually_reads_the_config` 直接调用
+# `next_heartbeat(t, cfg.agent.heartbeat)`，**从不经过 `AgentMain`**。
+# 把 `agent/main.py` 里三处 `next_heartbeat(now, self._hb)` 改回 `next_heartbeat(now)`
+# （也就是让配置重新变成死配置）——72 个测试全绿。
+#
+# 下面这条分两段：
+#   ① `main._hb` 必须就是 `cfg.agent.heartbeat`（证明配置被拿进来了）
+#   ② 把 `_hb` 换成一个明显不同的节奏后走真实 `_once()`，
+#      断言 `next_heartbeat_at` 真的跟着变（证明调用点真的用了它）
+
+
+def test_agent_main_passes_the_heartbeat_config(env):
+    """**`AgentMain` 必须把 heartbeat 配置传进 `next_heartbeat`**。
+
+    这是"死配置"最容易复发的地方：派生函数本身测得好好的，但生产调用点
+    把配置漏掉了，于是改了 YAML 依旧没有任何变化。
+    """
+    import asyncio
+    from datetime import datetime
+    from types import SimpleNamespace
+    from core.clock import FixedClock
+    from tests.helpers import SH
+
+    main = env.main
+    # ① 配置真的被拿进来了
+    assert main._hb is not None, "AgentMain 没把 heartbeat 配置拿进来"
+    assert int(main._hb.base_min) == int(env.cfg.agent.heartbeat.base_min), (
+        "AgentMain 拿到的 heartbeat 不是配置里的那个")
+
+    # ② 换一个明显不同的节奏（base 5 分钟 → 7 分钟），走真实 `_once()`
+    env.clock._now = datetime(2026, 11, 20, 10, 30, tzinfo=SH)     # base 档
+    main._hb = SimpleNamespace(
+        base_min=7, tight_min=2, max_min=10,
+        tight=env.cfg.agent.heartbeat.tight,
+        relaxed=env.cfg.agent.heartbeat.relaxed)
+    main.next_heartbeat_at = None
+    asyncio.run(main._once())
+
+    assert main.next_heartbeat_at is not None, "这一轮没有推进心跳"
+    assert main.next_heartbeat_at.strftime("%H:%M") == "10:37", (
+        f"生产入口排出的是 {main.next_heartbeat_at.strftime('%H:%M')}，"
+        "配置没被传进去（应为 10:37）")
+
+
+def test_max_tokens_config_reaches_the_real_request(env):
+    """**`llm.max_tokens.tools` 必须真的发到上游**（v0.2.105）。
+
+    第七轮评审发现 `_max_out()` 本身测得好好的，但**生产调用点**没测：
+    把 `agent/loop.py` 里 `_max_out(deps)` 改回常量 `MAX_TOKENS`，
+    101 个测试全绿 —— 又一个"配置接线了但调用点没接"的假绿。
+    """
+    import asyncio
+    from types import SimpleNamespace
+
+    # 把配置改成明显不同的值（`_NS` 只读，直接换掉槽里的 `_d`）
+    llm_d = dict(env.cfg.llm._d)
+    llm_d["max_tokens"] = SimpleNamespace(tools=3333, plain=1111)
+    object.__setattr__(env.cfg.llm, "_d", llm_d)
+
+    # 一个最小心跳回合
+    env.llm.script = [_silent()]
+    asyncio.run(env.main._once())
+
+    assert env.llm.sent_max_tokens, "这一轮根本没发请求"
+    assert env.llm.sent_max_tokens[0] == 3333, (
+        f"实发 max_tokens={env.llm.sent_max_tokens[0]}，配置里是 3333："
+        "调用点没走配置")

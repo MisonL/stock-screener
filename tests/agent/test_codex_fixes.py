@@ -286,7 +286,10 @@ def test_main_round_charges_real_usage():
     这件事——用 finally 时 except 分支先构造结果、后补账，导致日志 tokens 恒为 NULL。
     """
     src = Path("agent/loop.py").read_text(encoding="utf-8")
-    start = src.index("result = await deps.llm.chat(msgs, tools, max_tokens=MAX_TOKENS")
+    # **不要钉具体的 max_tokens 表达式**（v0.2.105 把它换成了 `_max_out(deps)`，
+    # 那是配置接线，跟这条测试要守护的"记账时机"无关）。
+    # 用 `result = await deps.llm.chat(msgs, tools` 做锚点即可。
+    start = src.index("result = await deps.llm.chat(msgs, tools")
     end = src.index('usage = state.get("usage") or usage')
     chat_block = src[start:end]
     # 额度在 chat 内部按 attempt 扣；审计在 on_attempt 回调里做
@@ -2763,3 +2766,197 @@ def test_give_up_note_does_not_squeeze_out_market_alerts(tmp_path):
     got2 = pusher.agent_note(d2, None, None, None)
     assert got2 is None, (
         "普通便签也豁免了总额度：那等于把日上限整体取消，会淹掉 P1")
+
+
+def test_heartbeat_cadence_actually_reads_the_config(tmp_path):
+    """**`config/agent.yaml::heartbeat` 必须真的生效**（v0.2.105）。
+
+    2026-11-20 的审计发现：那五个键（`base_min/tight_min/max_min/tight/relaxed`）
+    全仓**零读取**，真值写死在 `agent/schedule.py` 的 `_DENSE/_NORMAL/_LOOSE`，
+    而两者数值恰好相等（2/5/10 min ↔ 120/300/600 s）——
+    **改配置不生效，但完全看不出来**。这与当天修掉的"死配置 #2"是同一个形状。
+
+    这条测试把配置改成一个明显不同的值，断言节奏真的跟着变。
+    """
+    from agent.schedule import next_heartbeat
+    from core.clock import FixedClock
+    from core.config import load_config
+    from tests.helpers import SH
+    from datetime import datetime
+
+    cfg = load_config(Path("config"))
+    clock = FixedClock(datetime(2026, 11, 20, 10, 30, tzinfo=SH))
+
+    # 默认：10:30 落在 base 档（09:15–10:00 与 14:30–15:00 之间），5 分钟
+    base = next_heartbeat(clock.now(), cfg.agent.heartbeat)
+    assert base.strftime("%H:%M") == "10:35", f"默认 base 档不是 5 分钟：{base}"
+
+    # 把 base 改成 7 分钟 —— 必须真的生效
+    hb = cfg.agent.heartbeat
+    def _hb(**over):
+        base = dict(base_min=hb.base_min, tight_min=hb.tight_min,
+                    max_min=hb.max_min, tight=hb.tight, relaxed=hb.relaxed)
+        base.update(over)
+        return SimpleNamespace(**base)
+
+    patched = _hb(base_min=7)
+    got = next_heartbeat(clock.now(), patched)
+    assert got.strftime("%H:%M") == "10:37", (
+        f"把 base_min 改成 7 之后仍是 {got.strftime('%H:%M')}：配置没接线")
+
+    # tight 档也要真的生效
+    patched2 = _hb(tight_min=3)
+    dense_at = clock.now().replace(hour=9, minute=50)
+    got2 = next_heartbeat(dense_at, patched2)
+    assert got2.strftime("%H:%M") == "09:53", (
+        f"把 tight_min 改成 3 之后仍是 {got2.strftime('%H:%M')}：配置没接线")
+
+    # 时段表也要真的生效：把 10:30 划进 tight 区间，就该走 tight 档
+    patched3 = _hb(tight_min=2, tight=(("09:15", "11:00"),))
+    got3 = next_heartbeat(clock.now(), patched3)
+    assert got3.strftime("%H:%M") == "10:32", (
+        f"把 10:30 划进 tight 区间后仍是 {got3.strftime('%H:%M')}：时段表没接线")
+
+
+def test_max_tokens_actually_reads_the_config(tmp_path, monkeypatch):
+    """**`config/llm.yaml::llm.max_tokens` 必须真的生效**（v0.2.105）。
+
+    2026-11-20 的审计发现：三个 `llm.chat()` 调用点**全部显式传值**
+    （`agent/loop.py` 的 2000 与 1000、`chat/session.py` 的 2000），
+    而 `LlmClient.default_max_tokens()` 只在 `max_tokens` 为假时才生效
+    —— 于是改 YAML 里的 `max_tokens` **完全没有效果**。
+
+    这是最费时间的一类假象：遇到"空正文 / `finish_reason=length` / JSON 截断"
+    时第一反应就是调这个值，改了却不生效。
+    """
+    from agent.loop import _max_out
+    from chat.session import ChatSession
+    from core.config import load_config
+    from types import SimpleNamespace
+    from pathlib import Path as _P
+
+    cfg = load_config(_P("config"))
+
+    def _deps(mt):
+        return SimpleNamespace(cfg=SimpleNamespace(llm=SimpleNamespace(max_tokens=mt)))
+
+    mt = SimpleNamespace(tools=3000, plain=1200)
+    assert _max_out(_deps(mt)) == 3000, "走 tools 的回合没读到 max_tokens.tools"
+    assert _max_out(_deps(mt), tools=False) == 1200, "重写路径没读到 max_tokens.plain"
+
+    # 缺配置时回退模块常量（不能因为读不到就崩）
+    assert _max_out(SimpleNamespace(cfg=None)) == 2000
+    assert _max_out(SimpleNamespace(cfg=None), tools=False) == 1000
+
+    # 对话侧同样接线
+    s = ChatSession(conn=None, cfg=cfg, clock=None, budget=None, llm=None)
+    s.cfg = SimpleNamespace(llm=SimpleNamespace(max_tokens=SimpleNamespace(tools=3333, plain=1)))
+    assert s._max_out() == 3333, "对话池没读到 max_tokens.tools"
+
+
+def test_max_tokens_config_matches_what_code_used_to_hardcode():
+    """**配置值必须等于代码里原本写死的值**（v0.2.105）。
+
+    接线时最容易犯的错是"接上了，但把值改了"——那等于顺手改了一次运行时行为。
+    `llm.max_tokens.plain` 原来写 800，而 `agent/loop.py::REWRITE_MAX_TOKENS`
+    用的是 1000；接线前必须先把配置改成真实值，否则重写路径会被悄悄截断。
+
+    这条测试把两者钉在一起：改任何一边都会红。
+    """
+    from agent.loop import MAX_TOKENS, REWRITE_MAX_TOKENS
+    from core.config import load_config
+    from pathlib import Path as _P
+
+    cfg = load_config(_P("config"))
+    assert int(cfg.llm.max_tokens.tools) == MAX_TOKENS, (
+        f"配置 tools={cfg.llm.max_tokens.tools} 与代码兜底 {MAX_TOKENS} 不一致："
+        "接线会改变运行时行为")
+    assert int(cfg.llm.max_tokens.plain) == REWRITE_MAX_TOKENS, (
+        f"配置 plain={cfg.llm.max_tokens.plain} 与代码兜底 {REWRITE_MAX_TOKENS} 不一致："
+        "重写路径会被悄悄截断或放开")
+
+
+def test_context_limits_actually_read_the_config(conn):
+    """**`config/agent.yaml::context.*` 必须真的生效**（v0.2.105）。
+
+    审计发现 `sector_events / own_history` 两个键全仓零读取，真值写死在
+    `agent/context.py` 的模块常量里——而**同一段的 `context.max_chars` 却是真读的**。
+    同一段配置一半生效一半不生效，是最难查的一种。
+
+    第三个键 `own_history_trim` **删掉了**：它既没有读取点，也没有明确语义
+    （"历史超预算时保留几条"最终由 `max_chars` 整体裁剪决定）。
+    留着键却不实现，比删掉更容易误导——与 `memory.*` 三键同样处理。
+    """
+    from agent.context import _limit
+    from types import SimpleNamespace
+
+    cfg = SimpleNamespace(agent=SimpleNamespace(context=SimpleNamespace(
+        sector_events=3, own_history=6)))
+
+    assert _limit(cfg, "sector_events", 8) == 3, "sector_events 没读到配置"
+    assert _limit(cfg, "own_history", 10) == 6, "own_history 没读到配置"
+
+    # 读不到时回退兜底值，不能因为缺配置就崩
+    assert _limit(SimpleNamespace(agent=None), "sector_events", 8) == 8
+    assert _limit(None, "own_history", 10) == 10
+    # 非法值也回退（0 / 负数 / 字符串都不该让渲染崩）
+    assert _limit(SimpleNamespace(agent=SimpleNamespace(
+        context=SimpleNamespace(sector_events=0))), "sector_events", 8) == 8
+
+
+def test_broken_heartbeat_config_falls_back_instead_of_raising():
+    """**心跳配置写坏了不能抛异常**（v0.2.105）。
+
+    `agent/main.py::_once()` 在推进心跳前**裸调用** `next_heartbeat`，
+    而 `run()` 会吞掉异常重试——一次类型错误就会让心跳/闹钟/开盘回合
+    **全部停摆**（v0.2.93 修过同一个形状：`.status` 被 `or 200` 吞掉）。
+
+    `core/config.py` 只校验这五个键"存在"，不校验类型，
+    所以 `tight_min: "2min"`、`tight:` 留空这类配置真能写进去。
+    """
+    from agent.schedule import _DEFAULT_TIGHT, _profile, next_heartbeat
+    from core.clock import FixedClock
+    from tests.helpers import SH
+    from datetime import datetime
+    from types import SimpleNamespace
+
+    good = SimpleNamespace(base_min=5, tight_min=2, max_min=10,
+                           tight=(("09:15", "10:00"),), relaxed=(("11:00", "11:30"),))
+    expect = next_heartbeat(datetime(2026, 11, 20, 10, 30, tzinfo=SH), good)
+
+    broken_cases = [
+        SimpleNamespace(base_min="2min", tight_min=2, max_min=10,
+                        tight=(("09:15", "10:00"),), relaxed=(("11:00", "11:30"),)),
+        SimpleNamespace(base_min=5, tight_min=2, max_min=10,
+                        tight=None, relaxed=(("11:00", "11:30"),)),
+        SimpleNamespace(base_min=-5, tight_min=2, max_min=10,
+                        tight=(("09:15", "10:00"),), relaxed=(("11:00", "11:30"),)),
+        SimpleNamespace(),                      # 全缺
+    ]
+    for hb in broken_cases:
+        try:
+            got = next_heartbeat(datetime(2026, 11, 20, 10, 30, tzinfo=SH), hb)
+        except Exception as exc:                          # noqa: BLE001
+            raise AssertionError(f"坏配置 {hb} 抛了 {type(exc).__name__}: {exc}")
+        assert got == expect, f"坏配置 {hb} 没有退回默认节奏：{got} != {expect}"
+
+
+def test_max_out_rejects_non_positive_values():
+    """**`_max_out` 必须拒绝非正数**（v0.2.105，第七轮评审 L7）。
+
+    `tools: -5` 会直接发出非法 `max_tokens`；`tools: yes` 会被 `int(True)`
+    变成 1，于是每次请求都返回空正文、被当成可重试错误一直重试——
+    这正是 v0.2.96 那 105 行空转的形状。
+    `_limit()` 有 `> 0` 校验，`_max_out()` 原来没有。
+    """
+    from agent.loop import MAX_TOKENS, REWRITE_MAX_TOKENS, _max_out
+    from types import SimpleNamespace
+
+    def _deps(mt):
+        return SimpleNamespace(cfg=SimpleNamespace(llm=SimpleNamespace(max_tokens=mt)))
+
+    for bad in (-5, 0, True, "abc", None, 2.9):
+        got = _max_out(_deps(SimpleNamespace(tools=bad, plain=bad)))
+        assert got > 1, f"max_tokens.tools={bad!r} 被当成 {got} 发出去了"
+        assert got == MAX_TOKENS, (
+            f"max_tokens.tools={bad!r} 应当回退到 {MAX_TOKENS}，实际 {got}")

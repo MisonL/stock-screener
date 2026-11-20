@@ -230,6 +230,11 @@ class AgentMain:
         # 逐条推会大面积被压，而被压时 `_audit_cap()` 还会再写一行 `agent_turn`。
         self._budget_cancels = 0
         self._rounds_cancels = 0
+        # 心跳节奏：**真实来源是 `config/agent.yaml::heartbeat`**（v0.2.105）。
+        # 此前那五个键全仓零读取、真值写死在 `agent/schedule.py`，而数值恰好相等
+        # —— 改配置不生效却完全看不出来。`next_heartbeat(now, self._hb)` 用它。
+        self._hb = getattr(getattr(deps, "cfg", None), "agent", None)
+        self._hb = getattr(self._hb, "heartbeat", None)
         self._last_day = self.clock.today()
         # 上一次扫过期闹钟的时刻（见 `_once()` 里的闹钟循环）
         self._alarm_swept_at = None
@@ -609,7 +614,7 @@ class AgentMain:
             self.budget_exhausted = False
             self._open_attempts = 0
         if self.next_heartbeat_at is None:
-            self.next_heartbeat_at = next_heartbeat(now)
+            self.next_heartbeat_at = next_heartbeat(now, self._hb)
 
         # **`poll()` 必须包住**（v0.2.95 修的 M2）：它排在心跳推进与闹钟循环**之前**，
         # 而且内部 `if not events: return []` 会提前返回。它一旦抛异常
@@ -671,7 +676,7 @@ class AgentMain:
             # 并 commit，正是"磁盘满/写锁超时"会炸的地方；它一炸，`_once()` 整体抛出，
             # 心跳/闹钟/开盘回合**全部停摆**（虽然不写垃圾行，但比写了更糟）。
             # 家务是"尽力而为"的维护，不该有能力让调度停摆。
-            nxt = next_heartbeat(now)
+            nxt = next_heartbeat(now, self._hb)
             self.next_heartbeat_at = nxt
             # 家务与「下一跳」与影子无关：不做的话影子期 escalated 永不回收、
             # 心跳停摆，两周观测拿到的就是一堆过期事件。
@@ -707,7 +712,7 @@ class AgentMain:
             # `AGENT_TURN_CHURN_PER_HOUR` 的余量。
             # `next_heartbeat` 是纯函数、不抛异常，补这一次不会重新引入 S2。
             self.next_heartbeat_at = max(self.next_heartbeat_at,
-                                         next_heartbeat(self.clock.now()))
+                                         next_heartbeat(self.clock.now(), self._hb))
             nxt = self.next_heartbeat_at
             if (self.shadow_mode and nxt.isoformat() != self._shadow_beat_at
                     and nxt <= self.clock.now()):

@@ -224,8 +224,8 @@ _REQUIRED_AGENT = {
                   "tight": None, "relaxed": None},
     "event": {"rounds": None, "deadline_s": None},
     "heartbeat_turn": {"rounds": None, "deadline_s": None},
-    "context": {"max_chars": None, "sector_events": None, "own_history": None,
-                "own_history_trim": None},
+    "context": {"max_chars": None, "sector_events": None, "own_history": None},
+    # `context.own_history_trim` 已移除（v0.2.105）：全仓无读取点，也无明确语义
     "channel_b_daily_cap": None,
     "fatigue": {"free": None, "step": None, "raise": None},
     # memory 三键已移除（全仓无读取点），保留允许列表条目仅为兼容旧配置文件
@@ -272,7 +272,7 @@ _EMPTY_AGENT = {
     "heartbeat": {"base_min": 5, "tight_min": 2, "max_min": 10, "tight": [], "relaxed": []},
     "event": {"rounds": 3, "deadline_s": 0},
     "heartbeat_turn": {"rounds": 6, "deadline_s": 0},
-    "context": {"max_chars": 6000, "sector_events": 8, "own_history": 10, "own_history_trim": 5},
+    "context": {"max_chars": 6000, "sector_events": 8, "own_history": 10},
     "channel_b_daily_cap": 15,
     "fatigue": {"free": 10, "step": 5, "raise": 0.5},
     "memory": {"judgment_days": 5, "per_target": 3, "ignored_focus": 0.7},
@@ -286,7 +286,7 @@ _EMPTY_LLM = {
         "base_url": "", "api_key_env": "DEEPSEEK_API_KEY", "model": "", "thinking": "disabled",
         # 0 = 不设超时（默认）。见 config/llm.yaml 的说明与 RUNBOOK。
         "timeouts": {"agent_call_s": 0, "chat_s": 0},
-        "max_tokens": {"plain": 800, "tools": 2000},
+        "max_tokens": {"plain": 1000, "tools": 2000},
         "budget": {"agent": (300000, 40000), "chat": (200000, 20000)},
         "pricing": {"in_cny_per_mtok": 2.0, "out_cny_per_mtok": 8.0, "is_estimate": True},
     },

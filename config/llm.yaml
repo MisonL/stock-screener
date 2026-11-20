@@ -25,8 +25,8 @@ llm:
     agent_call_s: 0
     chat_s: 0
   max_tokens:
-    plain: 800
-    tools: 2000
+    plain: 1000        # grounding 重写路径实际用的值（原写 800，与代码不符）
+    tools: 2000        # 主回合与对话实际用的值
   # [输入上限, 输出上限]；agent 与对话两个池各算各的（对话烧爆不该让盯盘闭嘴）
   budget:
     # 预算是**保守预扣**：每个 attempt 发出前扣「字符数×0.7 + max_tokens」，

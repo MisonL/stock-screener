@@ -44,6 +44,8 @@ class FakeLlm:
     async def chat(self, messages, tools=None, max_tokens=None, timeout_s=None,
                    deduct=None, est_in=0, on_attempt=None):
         self.sent.append((messages, tools))
+        self.sent_max_tokens = getattr(self, "sent_max_tokens", [])
+        self.sent_max_tokens.append(max_tokens)
         step = self.script.pop(0) if self.script else Step(content="（没有回答）")
         if step.exc:
             raise step.exc
@@ -911,3 +913,22 @@ def test_budget_exceeded_falls_back_not_raises():
     out = asyncio.run(s.ask(None, "查一下 600519"))
     assert out.fallback is True, "额度耗尽没有走 fallback"
     assert "额度" in (out.text or ""), f"没说清是额度问题：{out.text!r}"
+
+
+async def test_max_tokens_config_reaches_the_chat_request(env):
+    """**对话池也必须真的把 `llm.max_tokens.tools` 发出去**（v0.2.105）。
+
+    第七轮评审：`ChatSession._max_out()` 本身有测试，但**生产调用点**没测。
+    把 `out_tokens = self._max_out()` 改回 `MAX_TOKENS` —— 17 个测试全绿。
+    和 agent 侧是同一个假绿形状。
+    """
+    from types import SimpleNamespace
+
+    llm_d = dict(env.session.cfg.llm._d)
+    llm_d["max_tokens"] = SimpleNamespace(tools=4321, plain=1111)
+    object.__setattr__(env.session.cfg.llm, "_d", llm_d)
+
+    await env.session.ask(None, "你好")
+    assert env.llm.sent_max_tokens, "这一轮根本没发请求"
+    assert env.llm.sent_max_tokens[0] == 4321, (
+        f"实发 max_tokens={env.llm.sent_max_tokens[0]}，配置里是 4321：调用点没走配置")

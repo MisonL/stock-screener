@@ -85,6 +85,37 @@ class RateLimiter:
             self._last = self.mono()
 
 
+#: `strategy.direct_connection` 的进程内缓存。`Http` 每次构造都要用它，
+#: 但 YAML 不会在运行期变，所以读一次就够（避免每建 client 都 load_config）。
+_DIRECT_CACHE: bool | None = None
+
+
+def direct_http() -> bool:
+    """公开别名：`strategy.direct_connection`（§6.2 的"容器不走代理"开关）。
+
+    四个出口（行情 Http、LLM、推送 ntfy、MCP westock）都读它。
+    **只接一处是半接线**：配置说"走代理"却只有行情层听，
+    LLM 仍直连——那比完全没有这个开关更误导（第七轮评审 S6）。
+    """
+    return _direct()
+
+
+def _direct() -> bool:
+    """`strategy.direct_connection` 是否为真（默认 True = 直连不走代理）。
+
+    **v0.2.105 之前这个键全仓零读取**，`trust_env` 是写死的 `False`——
+    改 YAML 完全无效。出代理事故时排查方向会被带偏（本项目专门有 §6.2）。
+    """
+    global _DIRECT_CACHE
+    if _DIRECT_CACHE is None:
+        try:
+            from core.config import load_config
+            _DIRECT_CACHE = bool(load_config().strategy.direct_connection)
+        except Exception:                              # noqa: BLE001
+            _DIRECT_CACHE = True                       # 安全侧：直连
+    return _DIRECT_CACHE
+
+
 @dataclass
 class HttpCall:
     """一次上游请求的记录（测试用它算间隔、断言 Referer 与 scope）。"""
@@ -130,7 +161,11 @@ class Http:
         self._on_request = on_request
         self.calls: list[HttpCall] = []
         self.client = httpx.Client(
-            trust_env=False,               # §6.2：永不读代理环境变量
+            # §6.2：永不读代理环境变量。**值来自 `strategy.direct_connection`**
+            # （v0.2.105 接线）— 此前这个键全仓零读取，这里是字面量 `False`，
+            # 改 YAML 完全无效，出代理事故时排查方向会被带偏。
+            # 缺配置时仍默认 `trust_env=False`（安全侧）。
+            trust_env=not _direct(),
             timeout=timeout_s,
             transport=transport,
             headers={"User-Agent": ua},

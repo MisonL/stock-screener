@@ -101,7 +101,7 @@ def env(tmp_path):
 
     cfg = _cfg(shadow=False)
     deps = Deps(conn=conn, cfg=cfg, clock=clock, llm=llm,
-                budget=Budget(conn, "agent", cfg.llm.budget.agent),
+                budget=Budget(conn, "agent", cfg.llm.budget.agent, clock=clock),
                 tools=ToolRegistry(conn, cfg, clock, mcp=None),
                 render=lambda t: Rendered("…", 1, False, {}),
                 pusher=pusher, memory=None, westock=None)
@@ -296,11 +296,23 @@ async def test_pending_retry_only_in_heartbeat_turn(env):
 # ---- 预算标记 ------------------------------------------------------------
 
 def test_budget_exhausted_flag_and_reset(env):
-    env.main.budget_exhausted = True
+    # **从库把额度写到用完**（v0.2.100 起预算判定完全由库推导）。
+    # 直接赋值 `env.main.budget_exhausted = True` 会被 `_once()` 重算覆盖，
+    # 而且那样测到的是内存状态，不是生产路径。
+    # **必须用 main 自己那个 Budget**：它是 `_budget_exhausted_now()` 实际读的对象。
+    # 另建一个 Budget 时若时钟来源不同（这里 env 的 clock 是 FixedClock），
+    # 写进去的是另一个自然日的行，读方完全看不到。
+    b = env.main.deps.budget
+    env.conn.execute(
+        "INSERT OR REPLACE INTO llm_budget(day, pool, tokens_in, tokens_out)"
+        " VALUES (?, 'agent', ?, 0)", (b.day, b.limit_in))
+    env.conn.commit()
+    derived = env.main._budget_exhausted_now()
+    assert derived is True, "前提不成立：库里的额度没写满"
     env.conn.execute("INSERT OR REPLACE INTO service_heartbeat(service, last_beat_at, detail)"
                      " VALUES ('agent', ?, ?)",
                      (env.clock.now().isoformat(),
-                      json.dumps({"budget_exhausted": env.main.budget_exhausted})))
+                      json.dumps({"budget_exhausted": derived})))
     env.conn.commit()
     row = env.conn.execute("SELECT detail FROM service_heartbeat WHERE service='agent'").fetchone()
     assert json.loads(row[0])["budget_exhausted"] is True

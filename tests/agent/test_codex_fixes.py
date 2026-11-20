@@ -2552,8 +2552,11 @@ async def test_budget_exhausted_skips_event_poll_entirely(tmp_path, monkeypatch)
             self.pusher = None
 
     main = AgentMain(_Deps(), clock)
-    main._quota_exhausted = True
-    main.budget_exhausted = True
+    # **从库把额度写到用完**（v0.2.100 之后唯一的正确姿势）。
+    # 原来这里手设 `_quota_exhausted`/`budget_exhausted`——那正是第 7 次假绿：
+    # 手设的是"当前进程的内存状态"，而真实故障是"重启后内存丢了"
+    # （每次盘中部署都会重启）。这条测试因此永远抓不到真正的问题。
+    _exhaust_budget(conn, cfg, clock)
     main._last_day = clock.today()
     main.next_heartbeat_at = now + timedelta(hours=1)
     # 开盘回合先占掉，聚焦事件路径
@@ -2616,35 +2619,42 @@ async def test_budget_cancelled_alarms_notify_the_user_once(tmp_path):
             self.exempts.append(exempt_from_total_cap)
             return "seq-1"
 
-    class _Deps:
-        def __init__(self):
-            self.conn = conn
-            self.cfg = cfg
-            self.clock = clock
-            self.pusher = _Pusher()
-            from llm.budget import Budget
-            self.budget = Budget(conn, "agent", cfg.llm.budget.agent, clock=clock)
+    # **必须走真实的 `_run()`**：手写一个 `main._run` 替身再手动 `+= 1`，
+    # 测的就是"我加的那个数"，不是"生产会不会加"。这正是假绿的形状
+    # （`tests/test_no_manual_internal_state.py` 现在会拦下这种写法）。
+    from agent.context import Rendered
+    from agent.loop import Deps
+    from llm.budget import Budget
+    from llm.tools import ToolRegistry
 
-    deps = _Deps()
+    deps = Deps(conn=conn, cfg=cfg, clock=clock, llm=None,
+                budget=Budget(conn, "agent", cfg.llm.budget.agent, clock=clock),
+                tools=ToolRegistry(conn, cfg, clock, mcp=None),
+                render=lambda t: Rendered("…", 1, False, {}),
+                pusher=_Pusher(), memory=None, westock=None)
+    deps.conn_factory = lambda: conn
+    deps.alert = lambda *a, **k: None
+
     main = AgentMain(deps, clock)
     main.next_heartbeat_at = now.replace(hour=23)
 
-    async def _too_large(trigger):
-        # 真实形状：该条闹钟因额度跑不动 → `_run` 里取消
-        main._budget_cancels += 1
-        main._cancel_alarm(trigger.alarm_id, "额度不足（请求超出剩余额度）")
+    async def _too_large(*a, **k):
+        return TurnResult(decision=TurnDecision.error(BUDGET_TOO_LARGE_WHY),
+                          rounds=0, tool_calls=[], rendered=None, usage=None,
+                          fallback=0, latency_ms=0, why=BUDGET_TOO_LARGE_WHY)
 
-    main._run = _too_large
-
-    await main._once()
+    with __import__("pytest").MonkeyPatch.context() as mp:
+        mp.setattr(m_mod, "run_with_deadline", _too_large)
+        await main._once()
     notes = deps.pusher.notes
     assert len(notes) == 1, f"应该合并成 1 条通知，实际 {len(notes)} 条"
     assert "额度用完" in notes[0] and "回访" in notes[0], f"通知正文不合预期：{notes[0]}"
 
     # 第二轮又取消几条 → 今天已经推过，不该再吵
-    main._run = _too_large
-    main._alarm_swept_at = None
-    await main._once()
+    with __import__("pytest").MonkeyPatch.context() as mp:
+        mp.setattr(m_mod, "run_with_deadline", _too_large)
+        main._alarm_swept_at = None
+        await main._once()
     assert len(deps.pusher.notes) == 1, (
         f"同一天推了 {len(deps.pusher.notes)} 条：会把 channel_b 的 15 条上限挤爆")
 

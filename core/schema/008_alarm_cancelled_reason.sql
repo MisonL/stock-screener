@@ -1,0 +1,11 @@
+-- `agent_schedule.cancelled_reason`：闹钟被取消时记下原因（v0.2.96）。
+--
+-- 四种取消来源现在混在一起，事后无从区分：
+--   · `sweep_stale_alarms()` 跨日作废 —— 语境过期，正常
+--   · 预算耗尽转 cancelled     —— 当天跑不动，正常但用户该知道
+--   · 重试用尽（attempts≥3）    —— 一直失败，异常
+--   · "轮数用尽"转 cancelled    —— 模型 6 轮没收敛，异常且用户该知道
+--
+-- 前两种是"按时没跑成"，后两种是"跑了但没跑出来"。排查和告警都需要区分。
+-- 列可空：老数据没有原因，视为未知。
+ALTER TABLE agent_schedule ADD COLUMN cancelled_reason TEXT;

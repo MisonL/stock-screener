@@ -335,7 +335,7 @@ def test_normal_turn_volume_does_not_alarm(conn):
             " fallback, market) VALUES (?,?,?,?,?,?,?)",
             ((now - timedelta(seconds=int(i * 3550 / 169))).isoformat(), "alarm", "暴跌日",
              2, "silent", 0, "cn_main"))
-    for i in range(500):                    # 窗口之外（未来）：没有上界就会被算进来
+    for i in range(1200):                   # 窗口之外（未来）：没有上界就会被算进来
         conn.execute(
             "INSERT INTO agent_turn(ts, wake_kind, context_digest, rounds, decision,"
             " fallback, market) VALUES (?,?,?,?,?,?,?)",
@@ -394,3 +394,142 @@ def test_churn_still_alerts_when_budget_exhausted(conn):
     fired, _disp = run(conn, clock)
     assert "agent_churn" in fired, (
         f"预算耗尽时把空转告警静音了：{fired}——而这正是事故当天的状态")
+
+
+def test_churn_threshold_stays_in_the_measured_corridor():
+    """**阈值必须落在实测走廊里**，不能跟着别的测试一起涨价（第四轮自查）。
+
+    另外两条规则测试写的是 `AGENT_TURN_CHURN_PER_HOUR + 50`——它们**跟着常量走**，
+    所以把阈值改成 100000 时，它们会老老实实插 100050 行、然后照样报绿。
+    也就是说「阈值被误设成天文数字」这个真实故障，现有测试**一条都抓不到**。
+
+    这个阈值错过两次（50 → 200 → 1000），两次都是**样本选错**，所以这里把
+    它钉在实测走廊内：
+      · 下界 300：暴跌日（11-20）滚动一小时实测 169，需要明显余量；
+      · 上界 5000：事故日 17998/小时，要能在几分钟内报出来。
+    走廊外就说明又有人拍脑袋了。
+    """
+    from api.watchdog import AGENT_TURN_CHURN_PER_HOUR
+
+    assert 300 <= AGENT_TURN_CHURN_PER_HOUR <= 5000, (
+        f"阈值 {AGENT_TURN_CHURN_PER_HOUR} 跑出实测走廊 [300, 5000]："
+        "低于 300 会在暴跌日误报（实测 169），高于 5000 会让事故报得太晚")
+
+
+def test_churn_fires_within_minutes_of_a_real_incident(conn):
+    """**事故要在几分钟内被抓住，而不是等一小时**（第四轮自查）。
+
+    滚动一小时的判据有个隐含延迟：事故刚起时窗口里还是空的，要等累积。
+    11-19 事故是 14:05 起每分钟约 300 个回合 —— 到 1000 需要约 3.3 分钟。
+    这个延迟可以接受（事故本身持续了一小时），但如果有人把阈值调到 5000，
+    延迟就变成 16 分钟，而 watchdog 的 `AGENT_TURN_STALE_S = 900`（15 分钟）
+    反而会先以「回合陈旧」的名义报——诊断方向就歪了。
+
+    这里直接按 300/分钟 复刻事故，断言既能在 25 分钟后报出来，
+    又不会在只有 3 分钟的量（900 个）时就误报。
+    """
+    from api.watchdog import AGENT_TURN_CHURN_PER_HOUR
+    from tests.helpers import SH as _SH
+
+    def _burst(c, end, minutes):
+        for m in range(minutes):
+            for _ in range(300):
+                c.execute(
+                    "INSERT INTO agent_turn(ts, wake_kind, context_digest, rounds,"
+                    " decision, fallback, market) VALUES (?,?,?,?,?,?,?)",
+                    ((end - timedelta(minutes=m)).isoformat(), "alarm", "事故", 2,
+                     "silent", 0, "cn_main"))
+        c.commit()
+
+    # 25 分钟的量：必须报
+    clock = FixedClock(datetime(2026, 11, 19, 14, 30, tzinfo=SH))
+    set_beat(conn, "agent", 10, clock=clock)
+    set_beat(conn, "jobs", 10, clock=clock)
+    _burst(conn, clock.now(), 25)
+    d = Disp()
+    check(conn, clock, d)
+    assert [a for a in d.alerts if a[0] == "agent_churn"], (
+        f"每分钟 300 个回合持续 25 分钟没报（阈值 {AGENT_TURN_CHURN_PER_HOUR}）")
+
+    # 3 分钟的量（900 个）：还不该报——证明判据不是"随便就报"
+    c2 = connect(":memory:")
+    migrate(c2)
+    clock2 = FixedClock(datetime(2026, 11, 19, 14, 8, tzinfo=SH))
+    set_beat(c2, "agent", 10, clock=clock2)
+    set_beat(c2, "jobs", 10, clock=clock2)
+    _burst(c2, clock2.now(), 3)
+    d2 = Disp()
+    check(c2, clock2, d2)
+    assert not [a for a in d2.alerts if a[0] == "agent_churn"], (
+        "只有 900 个回合（3 分钟）就报了：阈值调得太低，暴跌日会误报")
+
+
+def test_slow_runaway_is_caught_by_the_short_window(conn):
+    """**低速 runaway 要能在几分钟内报出来，不能等一小时累计**（第四轮评审）。
+
+    滚动一小时是累计量：每分钟 20 个（≈4800/日，正常日 131 行的 36 倍）
+    要跑满 48 分钟才越过 1000 线；`_alert` 还有 `REPEAT_S=1800` 去重，
+    真推出去可能已经一小时后。而 5 分钟窗口 3~4 分钟就能抓到。
+
+    这里复刻"每分钟 20 个、已经持续 6 分钟"（120 个），
+    它**不超过** 1000 的一小时线（120 < 1000），但必须超过 5 分钟线。
+    """
+    from api.watchdog import AGENT_TURN_CHURN_PER_5MIN
+
+    clock = FixedClock(datetime(2026, 11, 20, 10, 30, tzinfo=SH))
+    now = clock.now()
+    set_beat(conn, "agent", 10, clock=clock)
+    set_beat(conn, "jobs", 10, clock=clock)
+
+    # 7 分钟 × 每分钟 20 个 = 140 个；5 分钟窗口内 100 个 > 阈值 120？不，
+    # 所以压到每分钟 25 个：5 分钟窗口 125 > 120，一小时累计 150 << 1000
+    for m in range(6):
+        for _ in range(25):
+            conn.execute(
+                "INSERT INTO agent_turn(ts, wake_kind, context_digest, rounds,"
+                " decision, fallback, market) VALUES (?,?,?,?,?,?,?)",
+                ((now - timedelta(seconds=m * 60 + 1)).isoformat(), "alarm", "低速",
+                 2, "silent", 0, "cn_main"))
+    conn.commit()
+
+    hour_n = conn.execute("SELECT count(*) FROM agent_turn WHERE ts > ? AND ts <= ?",
+                          ((now - timedelta(hours=1)).isoformat(),
+                           now.isoformat())).fetchone()[0]
+    five_min_n = conn.execute(
+        "SELECT count(*) FROM agent_turn WHERE ts > ? AND ts <= ?",
+        ((now - timedelta(minutes=5)).isoformat(), now.isoformat())).fetchone()[0]
+    assert hour_n < 1000, f"前提不成立：一小时线本该报不出来（{hour_n} < 1000）"
+    assert five_min_n > AGENT_TURN_CHURN_PER_5MIN, (
+        f"前提不成立：5 分钟窗口 {five_min_n} 应超过阈值 {AGENT_TURN_CHURN_PER_5MIN}")
+
+    d = Disp()
+    check(conn, clock, d)
+    assert [a for a in d.alerts if a[0] == "agent_churn"], (
+        f"每分钟 25 个回合持续 6 分钟（5 分钟窗口 {five_min_n} 个）没报："
+        "低速 runaway 只能等一小时累计，发现太晚")
+
+
+def test_short_window_does_not_fire_on_a_normal_busy_day(conn):
+    """**5 分钟快线不能在暴跌日误报**（与上一条配套）。
+
+    11-20 暴跌日实测每 5 分钟窗口峰值约 20 个回合。阈值必须高到不误报。
+    这里放 3 个窗口、每窗口 20 个（共 60 个），全部低于阈值。
+    """
+    clock = FixedClock(datetime(2026, 11, 20, 10, 30, tzinfo=SH))
+    now = clock.now()
+    set_beat(conn, "agent", 10, clock=clock)
+    set_beat(conn, "jobs", 10, clock=clock)
+
+    for w in range(3):
+        for _ in range(20):
+            conn.execute(
+                "INSERT INTO agent_turn(ts, wake_kind, context_digest, rounds,"
+                " decision, fallback, market) VALUES (?,?,?,?,?,?,?)",
+                ((now - timedelta(seconds=w * 5 * 60 + 1)).isoformat(), "alarm", "暴跌日",
+                 2, "silent", 0, "cn_main"))
+    conn.commit()
+
+    d = Disp()
+    check(conn, clock, d)
+    assert not [a for a in d.alerts if a[0] == "agent_churn"], (
+        "暴跌日正常的每 5 分钟 20 个回合被误报成 churn")

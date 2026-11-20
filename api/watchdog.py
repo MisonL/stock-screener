@@ -43,6 +43,19 @@ AGENT_TURN_STALE_S = 15 * 60   # agent_turn 超过 15 分钟没有新行 → 调
 #: 真实故障与合法忙碌之间隔着两个数量级，1000 落在中间，怎么抖都掉不到一起。
 AGENT_TURN_CHURN_PER_HOUR = 1000
 
+#: 短窗快线：最近 5 分钟超过这么多个回合就报（与上面的滚动一小时**并联**）。
+#:
+#: 为什么需要第二条判据：滚动一小时是**累计量**，低速 runaway 发现太晚。
+#: 比如每分钟 20 个（≈4800/日，已是正常日 131 行的 **36 倍**），
+#: 要跑满 **48 分钟**才越过 1000 线；而 `_alert` 还有 `REPEAT_S=1800` 去重，
+#: 真正推出去可能已经一小时后。
+#:
+#: 实测基线（生产 11-20 暴跌日，每 5 分钟窗口）：全窗口内最高约 **20** 个回合。
+#: 正常日同一窗口约 5~8 个。取 120：暴跌日的 6 倍、正常日的 15 倍以上，
+#: 20/分钟的 runaway 3 分钟就报（100 个/5min 还没到线，4 分钟必到），
+#: 而 300/分钟的事故 1 分钟就到 300。
+AGENT_TURN_CHURN_PER_5MIN = 120
+
 
 def in_watch_window(now: datetime) -> bool:
     """盘中窗口：09:15–11:30 与 13:00–15:05（午休不算）。"""
@@ -132,7 +145,19 @@ def check(conn, clock, dispatcher, *, cfg=None, agent_turn_stale_min: int | None
     # 加上这个 gate 就等于「最该报的那种空转恰好被永久静音」。
     if recent > AGENT_TURN_CHURN_PER_HOUR:
         if _alert(conn, clock, dispatcher, "agent_churn",
-                  f"最近一小时内 {recent} 个回合（正常日峰值约 50），疑似空转死循环", now):
+                  f"最近一小时内 {recent} 个回合（正常日约 50、暴跌日约 170，"
+                  f"阈值 {AGENT_TURN_CHURN_PER_HOUR}），疑似空转死循环", now):
+            fired.append("agent_churn")
+
+    # **短窗快线**：累计量对低速 runaway 太迟钝，5 分钟窗口先报。
+    short_start = (now - timedelta(minutes=5)).isoformat()
+    burst = conn.execute(
+        "SELECT count(*) FROM agent_turn WHERE ts > ? AND ts <= ?",
+        (short_start, now.isoformat())).fetchone()[0]
+    if burst > AGENT_TURN_CHURN_PER_5MIN:
+        if _alert(conn, clock, dispatcher, "agent_churn",
+                  f"最近 5 分钟 {burst} 个回合（正常日约 5~8、暴跌日峰值约 20，"
+                  f"阈值 {AGENT_TURN_CHURN_PER_5MIN}），疑似空转死循环", now):
             fired.append("agent_churn")
 
     # 心跳本身断了就只判心跳：心跳陈旧时 `loop_last_tick_at` 必然也旧，

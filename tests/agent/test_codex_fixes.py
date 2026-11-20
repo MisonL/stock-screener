@@ -743,18 +743,32 @@ async def test_budget_exhausted_does_not_rerun_alarms(tmp_path):
     schedule_alarm(conn, turn_id=1, due_at=clock.now().isoformat(), market="cn_main",
                    target="sh600519", note="回访", now=clock.now())
 
-    class _Deps:
-        def __init__(self):
-            self.conn = conn
-            self.cfg = cfg
-            self.clock = clock
-            self.pusher = None
-            self.llm = None
-            self.budget = None
-            self.alert = lambda *a, **k: None
-            self.conn_factory = lambda: conn
+    # **必须用真实的 Deps**（第四轮评审）：原来手写的 `_Deps` 没有 `render`/`llm`，
+    # 变异后 `_run` 一进去就 `deps.render` → `AttributeError`，断言根本没执行——
+    # 红的理由不对，等于另一种假绿（同 S-a 的形状：手设状态绕过生产路径）。
+    # 现在给全依赖，让「门坏了」时 `_run` 真的跑起来并写出 alarm 行，红在断言本身上。
+    from agent.context import Rendered
+    from agent.loop import Deps
+    from llm.budget import Budget
+    from llm.tools import ToolRegistry
 
-    main = AgentMain(_Deps(), clock)
+    class _SilentLlm:
+        async def chat(self, *a, **k):
+            from types import SimpleNamespace
+            return SimpleNamespace(content="", tool_calls=[
+                {"id": "c1", "function": {"name": "emit_decision", "arguments":
+                 '{"speak": false, "body": "", "why_silent": "无事"}'}}],
+                attempts=1, usage=None)
+
+    deps = Deps(conn=conn, cfg=cfg, clock=clock, llm=_SilentLlm(),
+                budget=Budget(conn, "agent", cfg.llm.budget.agent),
+                tools=ToolRegistry(conn, cfg, clock, mcp=None),
+                render=lambda t: Rendered("…", 1, False, {}),
+                pusher=None, memory=None, westock=None)
+    deps.conn_factory = lambda: conn
+    deps.alert = lambda *a, **k: None
+
+    main = AgentMain(deps, clock)
     # **走真实路径置位**，不要直接写 `budget_exhausted`：
     # v0.2.95 把它改成每轮重算的派生值（额度 latch ∨ 记账标志），
     # 直接赋值会被 `_once()` 覆盖掉。这里让一次回合真的因预算耗尽失败。
@@ -1551,6 +1565,83 @@ async def test_long_turn_does_not_cause_back_to_back_heartbeats(tmp_path, monkey
         "下一轮 _once() 会立刻再跑一次心跳，长回合下心跳背靠背")
 
 
+async def test_heartbeat_reanchor_never_shortens_the_planned_gap(tmp_path):
+    """**回合后的墙钟补正不能用 `next_heartbeat(now)` 直接覆盖**（第四轮自查）。
+
+    `next_heartbeat` 的分档**不是单调的**：13:29 属 `_LOOSE`(600s) 档，
+    `next_heartbeat(13:29)` = 13:39；回合一跑跨进 13:30 之后的 `_NORMAL`(300s) 档，
+    `next_heartbeat(13:32)` = 13:37 —— **比原计划还早**。
+
+    所以补正必须取 `max(已有, next_heartbeat(now))`。直接覆盖会把原本 10 分钟的
+    间隔压缩成 8 分钟，长回合密集时就会叠出多余的心跳。
+
+    上一版测试固定在 10:30（单档内，回合 180s < 间隔 300s），既跨不到分档，
+    也造不出"变短"，所以**删掉 `max()` 它照样绿**——第四轮评审实测指出的。
+    这里把时钟钉在**分档边界**上。
+    """
+    from agent.context import Rendered
+    from agent.loop import Deps
+    from agent.main import AgentMain
+    from agent.schedule import next_heartbeat
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from llm.budget import Budget
+    from llm.tools import ToolRegistry
+    from tests.helpers import SH
+    from datetime import datetime, timedelta
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "hb_bound.db")
+    migrate(conn)
+    # 13:29 在 _LOOSE(600s) 档；回合 180 秒后落进 13:32 的 _NORMAL(300s) 档
+    start = datetime(2026, 11, 19, 13, 29, tzinfo=SH)
+    planned = next_heartbeat(start)
+    assert planned == datetime(2026, 11, 19, 13, 39, tzinfo=SH), (
+        f"前提不成立：13:29 的下一跳应是 13:39，实际 {planned}")
+
+    class _Clock(FixedClock):
+        def __init__(self, t):
+            super().__init__(t)
+            self._t = t
+
+        def now(self):
+            self._t = self._t + timedelta(seconds=2)
+            return self._t
+
+        def advance(self, seconds):
+            self._t = self._t + timedelta(seconds=seconds)
+
+    clock = _Clock(start)
+
+    class _SlowLlm:
+        async def chat(self, *a, **k):
+            from types import SimpleNamespace
+            clock.advance(180)
+            return SimpleNamespace(content="", tool_calls=[
+                {"id": "c1", "function": {"name": "emit_decision", "arguments":
+                 '{"speak": false, "body": "", "why_silent": "无事"}'}}],
+                attempts=1, usage=None)
+
+    deps = Deps(conn=conn, cfg=cfg, clock=clock, llm=_SlowLlm(),
+                budget=Budget(conn, "agent", cfg.llm.budget.agent),
+                tools=ToolRegistry(conn, cfg, clock, mcp=None),
+                render=lambda t: Rendered("…", 1, False, {}),
+                pusher=None, memory=None, westock=None)
+    deps.conn_factory = lambda: conn
+    deps.alert = lambda *a, **k: None
+
+    main = AgentMain(deps, clock)
+    main.next_heartbeat_at = start
+
+    await main._once()
+
+    assert main.next_heartbeat_at >= planned, (
+        f"回合后的补正把下一跳从计划的 {planned} 提前到了 "
+        f"{main.next_heartbeat_at}：跨分档时 `next_heartbeat` 会变短，"
+        "必须用 max() 兜住，否则长回合下心跳被叠密")
+
+
 async def test_rounds_exhausted_alarm_is_cancelled_not_retried(tmp_path):
     """**"轮数用尽"不该退回重试**（评审 M-c）。
 
@@ -1773,15 +1864,13 @@ async def test_budget_exhausted_flag_follows_the_db_flag(tmp_path):
     clock = FixedClock(now)
 
     class _ExhaustedLlm:
-        """第一次调用：预算耗尽；之后（标志被清）正常返回沉默。"""
+        """记录每次调用，用来断言"确实跑了回合"。"""
 
-        calls = 0
+        calls_seen: list[int] = []
 
         async def chat(self, *a, **k):
             from types import SimpleNamespace
-            _ExhaustedLlm.calls += 1
-            if _ExhaustedLlm.calls == 1:
-                raise RuntimeError("预算耗尽路径由 run_with_deadline 的预检触发")
+            _ExhaustedLlm.calls_seen.append(len(_ExhaustedLlm.calls_seen))
             return SimpleNamespace(content="", tool_calls=[
                 {"id": "c1", "function": {"name": "emit_decision", "arguments":
                  '{"speak": false, "body": "", "why_silent": "无事"}'}}],
@@ -1798,6 +1887,17 @@ async def test_budget_exhausted_flag_follows_the_db_flag(tmp_path):
     main = AgentMain(deps, clock)
     main.next_heartbeat_at = now + timedelta(hours=1)
 
+    # **必须让第二次 `_once()` 真的跑一次 `_run()`**（第四轮评审指出的第 6 次假绿）：
+    # 原来第二次 `_once()` 一个回合都没跑（心跳未到期、无闹钟、无事件、open 已 done），
+    # 于是断言只验到 `_once()` 开头那行重算，`_run()` 里的镜像**零覆盖**——
+    # 把 `_run` 恢复成"只有 True 分支"的旧写法，这条测试**照样绿**。
+    # 这里放一条到期的闹钟，第二次 `_once()` 必然会 `_run()` 一次心跳/闹钟回合。
+    def _seed_alarm(day_iso):
+        conn.execute(
+            "INSERT INTO agent_schedule(created_at, due_at, market, target, note, status)"
+            " VALUES (?,?,?,?,?,?)",
+            (day_iso, day_iso, "cn_main", "sh600519", "回访", "pending"))
+
     # 直接把库标志置上（模拟一次写锁抖动），并让 main 读到它
     conn.execute("INSERT OR REPLACE INTO job_state(name, value)"
                  " VALUES ('budget.write_failed:agent', '1')")
@@ -1808,8 +1908,14 @@ async def test_budget_exhausted_flag_follows_the_db_flag(tmp_path):
     # 探测已自愈、库标志被删掉（`llm/budget.py::_try_deduct` 成功时就这么做）
     conn.execute("DELETE FROM job_state WHERE name = 'budget.write_failed:agent'")
     conn.commit()
+    _seed_alarm(clock.now().isoformat())        # 保证第二次 _once() 有回合可跑
+    conn.commit()
 
+    runs_before = len(_ExhaustedLlm.calls_seen)
     await main._once()
+    assert len(_ExhaustedLlm.calls_seen) > runs_before, (
+        "第二次 `_once()` 一次 `_run()` 都没跑，这条测试只验到 `_once()` 的重算，"
+        "`_run()` 的镜像零覆盖（第 6 次假绿的形状）")
     assert main.budget_exhausted is False, (
         "库里的标志已经清掉，main.budget_exhausted 仍是 True："
         "当天剩下的时间所有闹钟都会被跳过（回访一条都不跑）")
@@ -1907,3 +2013,255 @@ def test_failing_alarm_does_not_starve_the_backlog(tmp_path):
         f"只跑到 {sorted(set(ran))}，有闹钟一次都没轮到："
         f"失败的闹钟（{sorted({x for x in ran if ran.count(x) > 1})}）"
         "在退避后仍排在积压前面，把后面的饿死了")
+
+
+async def test_restart_with_exhausted_quota_does_not_churn(tmp_path):
+    """**进程重启后额度仍用完，只能浪费有限几轮，不能回到死循环**（第四轮自查）。
+
+    `_quota_exhausted` 是内存变量，重启就丢。如果所以它丢了就恢复空转，
+    那 11-19 的事故只要重启一次就会重演。
+
+    实际不会：`run_with_deadline()` 开头有 `deps.budget.allow()` 预检
+    （`agent/loop.py:398`），额度不够时**直接返回 `BUDGET_EXHAUSTED_WHY`、不调模型**；
+    `_run()` 读到这个 why 就重新置上 `_quota_exhausted`。
+
+    所以重启的代价是 **一轮 `_once()` 里最多 `ALARM_MAX_PER_ONCE` 个空转回合**，
+    然后就重新 latch 住。这条测试把这个上界钉死——否则一次重构把预检挪走，
+    就会静默回到一天上万行。
+    """
+    import agent.main as m_mod
+    from agent.main import ALARM_MAX_PER_ONCE, AgentMain
+    from agent.schedule import due_alarms, schedule_alarm
+    from agent.loop import BUDGET_EXHAUSTED_WHY, TurnResult
+    from agent.decision import TurnDecision
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from tests.helpers import SH
+    from datetime import datetime
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "restart.db")
+    migrate(conn)
+    now = datetime(2026, 11, 19, 10, 30, tzinfo=SH)
+    clock = FixedClock(now)
+    for i in range(10):
+        schedule_alarm(conn, turn_id=i + 1, due_at=now.isoformat(), market="cn_main",
+                       target="sh600519", note=f"回访{i}", now=now)
+
+    class _Deps:
+        def __init__(self):
+            self.conn = conn
+            self.cfg = cfg
+            self.clock = clock
+            self.pusher = None
+
+    main = AgentMain(_Deps(), clock)
+    main.next_heartbeat_at = now.replace(hour=12)
+
+    # 预检拦住的形态：不调模型，直接返回预算耗尽
+    async def _exhausted(*a, **k):
+        return TurnResult(decision=TurnDecision.error(BUDGET_EXHAUSTED_WHY),
+                          rounds=0, tool_calls=[], rendered=None, usage=None,
+                          fallback=0, latency_ms=0, why=BUDGET_EXHAUSTED_WHY)
+
+    with __import__("pytest").MonkeyPatch.context() as mp:
+        mp.setattr(m_mod, "run_with_deadline", _exhausted)
+        await main._once()
+        wasted = conn.execute(
+            "SELECT count(*) FROM agent_turn WHERE wake_kind='alarm'").fetchone()[0]
+        assert wasted <= ALARM_MAX_PER_ONCE, (
+            f"重启后第一轮跑了 {wasted} 个空转闹钟回合（上限 {ALARM_MAX_PER_ONCE}）")
+        assert main._quota_exhausted is True, "没有重新 latch，下一轮还会继续空转"
+
+        # 第二轮：已经 latch，一个都不该跑
+        before = conn.execute("SELECT count(*) FROM agent_turn").fetchone()[0]
+        await main._once()
+        after = conn.execute("SELECT count(*) FROM agent_turn").fetchone()[0]
+        assert after == before, (
+            f"latch 之后又跑了 {after - before} 个空转回合：这就是 11-19 的死循环")
+
+    # 剩下的闹钟没有被吞掉，只是暂停
+    assert len(due_alarms(conn, now)) >= 8, "闹钟被跳过时不该被改成 fired"
+
+
+async def test_rounds_exhausted_push_notification_reaches_user(tmp_path):
+    """**轮数用尽必须真的通知用户，而不是只在 `agent_turn` 里留痕**（v0.2.96）。
+
+    闹钟是用户看得见的承诺（"我 30 分钟后回来看"）。轮数用尽静默转 `cancelled`
+    时，只有 `agent_turn` 里一行 `decision=timeout, why=轮数用尽`——
+    那是运维看的，用户以为 30 分钟后会有结论，实际静默丢了。
+    与"静默 pending 再烧 18 轮"是同一个毛病，只是这次省了钱。
+    """
+    from agent.main import AgentMain
+    from agent.schedule import due_alarms, schedule_alarm
+    from agent.decision import TurnDecision
+    from agent.loop import ROUNDS_EXHAUSTED_WHY, TurnResult
+    import agent.main as m_mod
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from tests.helpers import SH
+    from datetime import datetime
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "push.db")
+    migrate(conn)
+    now = datetime(2026, 11, 19, 10, 30, tzinfo=SH)
+    clock = FixedClock(now)
+    schedule_alarm(conn, turn_id=1, due_at=now.isoformat(), market="cn_main",
+                   target="sh600519", note="看是否收复 4.97", now=now)
+    alarm = due_alarms(conn, now)[0]
+    conn.execute("UPDATE agent_schedule SET status='fired' WHERE id=?", (alarm["id"],))
+    conn.commit()
+
+    class _Pusher:
+        def __init__(self):
+            self.notes = []
+
+        def agent_note(self, decision, grounded, code=None, target=None):
+            self.notes.append((decision.body, target))
+            return "seq-1"
+
+    class _Deps:
+        def __init__(self):
+            self.conn = conn
+            self.cfg = cfg
+            self.clock = clock
+            self.pusher = _Pusher()
+
+    main = AgentMain(_Deps(), clock)
+
+    async def _fake(*a, **k):
+        return TurnResult(decision=TurnDecision.timeout(ROUNDS_EXHAUSTED_WHY),
+                          rounds=6, tool_calls=[], rendered=None, usage=None,
+                          fallback=0, latency_ms=90000, why=ROUNDS_EXHAUSTED_WHY)
+
+    with __import__("pytest").MonkeyPatch.context() as mp:
+        mp.setattr(m_mod, "run_with_deadline", _fake)
+        await main._run(main._trigger("alarm", rounds=6, deadline=0,
+                                      alarm_id=alarm["id"], target="sh600519",
+                                      note="看是否收复 4.97"))
+
+    notes = main.deps.pusher.notes
+    assert len(notes) == 1, f"轮数用尽没有通知用户（推送 {len(notes)} 条）"
+    body, target = notes[0]
+    assert "sh600519" in body and "没有得出结论" in body, f"通知正文不合预期：{body}"
+    assert "4.97" in body, "通知里没带原定的关注点，用户对不上是哪次回访"
+    assert target == "sh600519"
+
+    row = conn.execute("SELECT status, cancelled_reason FROM agent_schedule WHERE id=?",
+                       (alarm["id"],)).fetchone()
+    assert row[0] == "cancelled" and "轮数用尽" in row[1], (
+        f"取消原因没落库：{tuple(row)}——事后区分不了'按时没跑成'和'跑了没跑出来'")
+
+
+async def test_give_up_push_failure_does_not_break_the_turn(tmp_path):
+    """**推送失败不能让回合链路崩**（与上一条配套）。
+
+    通知是尽力而为的副作用，一条推送失败不值得让整个 `_run` 抛出去——
+    那会让闹钟退回、下次再烧一遍。
+    """
+    from agent.main import AgentMain
+    from agent.schedule import due_alarms, schedule_alarm
+    from agent.decision import TurnDecision
+    from agent.loop import ROUNDS_EXHAUSTED_WHY, TurnResult
+    import agent.main as m_mod
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from tests.helpers import SH
+    from datetime import datetime
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "pushfail.db")
+    migrate(conn)
+    now = datetime(2026, 11, 19, 10, 30, tzinfo=SH)
+    clock = FixedClock(now)
+    schedule_alarm(conn, turn_id=1, due_at=now.isoformat(), market="cn_main",
+                   target="sh600519", note="回访", now=now)
+    alarm = due_alarms(conn, now)[0]
+    conn.execute("UPDATE agent_schedule SET status='fired' WHERE id=?", (alarm["id"],))
+    conn.commit()
+
+    class _Pusher:
+        def agent_note(self, *a, **k):
+            raise RuntimeError("ntfy 挂了")
+
+    class _Deps:
+        def __init__(self):
+            self.conn = conn
+            self.cfg = cfg
+            self.clock = clock
+            self.pusher = _Pusher()
+
+    main = AgentMain(_Deps(), clock)
+
+    async def _fake(*a, **k):
+        return TurnResult(decision=TurnDecision.timeout(ROUNDS_EXHAUSTED_WHY),
+                          rounds=6, tool_calls=[], rendered=None, usage=None,
+                          fallback=0, latency_ms=90000, why=ROUNDS_EXHAUSTED_WHY)
+
+    with __import__("pytest").MonkeyPatch.context() as mp:
+        mp.setattr(m_mod, "run_with_deadline", _fake)
+        await main._run(main._trigger("alarm", rounds=6, deadline=0,
+                                      alarm_id=alarm["id"], target="sh600519",
+                                      note="回访"))          # **不该抛**
+
+    row = conn.execute("SELECT status FROM agent_schedule WHERE id=?",
+                       (alarm["id"],)).fetchone()
+    assert row[0] == "cancelled", "推送失败连带闹钟也没取消掉"
+
+
+async def test_oversized_request_does_not_latch_the_whole_day(tmp_path):
+    """**单次请求比剩余额度大一点点，不能把整天锁死**（v0.2.96，Codex 实测）。
+
+    Codex 复现的真实形状：合并事件组请求需要 **41367** 输入 token，剩余 **41366**
+    —— 差 1 个 token。原实现把这种情况也记成 `BUDGET_EXHAUSTED_WHY`，
+    `agent/main.py` 于是 latch 出 `_quota_exhausted=True`，
+    **当天剩余所有回访都被跳过**。
+
+    可实际上紧接着只需 8913 token 的心跳、单票回访完全跑得动。
+    Codex 用"同进程新建 `AgentMain` 实例"做对照：latch 一清，那条闹钟立刻完成。
+
+    现在区分两条 why：
+      · `BUDGET_EXHAUSTED_WHY` = 连最小请求（`MIN_TURN_EST_IN`）都放不下 → 真没了
+      · `BUDGET_TOO_LARGE_WHY`  = 这次请求太大，但还有额度 → 只影响这一回合
+    """
+    from agent.loop import (BUDGET_EXHAUSTED_WHY, BUDGET_TOO_LARGE_WHY,
+                            MIN_TURN_EST_IN, MAX_TOKENS, budget_shortfall)
+    from core.clock import FixedClock
+    from core.db import connect, migrate
+    from llm.budget import Budget
+    from tests.helpers import SH
+    from datetime import datetime
+
+    clock = FixedClock(datetime(2026, 11, 19, 10, 30, tzinfo=SH))
+    conn = connect(tmp_path / "oversize.db")
+    migrate(conn)
+    # 输入上限 41366；已用 31366 → 剩余 10000。够最小请求（2000），不够大请求。
+    limits = (41_366, 1_000_000)
+    budget = Budget(conn, "agent", limits, clock=clock)
+    conn.execute("INSERT INTO llm_budget(day, pool, tokens_in, tokens_out) VALUES (?,?,?,0)",
+                 (budget.day, "agent", 31_366))
+    conn.commit()
+
+    class _Deps:
+        def __init__(self):
+            self.budget = budget
+
+    deps = _Deps()
+
+    # ① 大请求放不下，但最小请求放得下 → 只是"这次太大"
+    big = budget.limit_in - 31_366 + 1          # 剩余 10000，差 1 个 token
+    assert big > MIN_TURN_EST_IN, "前提不成立：大请求应远大于最小请求"
+    assert budget_shortfall(deps, big, MAX_TOKENS) == BUDGET_TOO_LARGE_WHY, (
+        "大请求被误判成'今天额度用完'：会把当天所有回访锁死")
+
+    # ② 连最小请求都放不下 → 真的没了
+    conn.execute("UPDATE llm_budget SET tokens_in = ? WHERE day = ? AND pool = ?",
+                 (budget.limit_in, budget.day, "agent"))
+    conn.commit()
+    assert budget.allow(est_in=0, est_out=0) is True   # 额度表本身没坏
+    assert budget_shortfall(deps, MIN_TURN_EST_IN, MAX_TOKENS) == BUDGET_EXHAUSTED_WHY, (
+        "连最小请求都放不下却没判成'额度用完'：会一直重试到收盘")

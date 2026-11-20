@@ -159,6 +159,20 @@ def _bump_rounds(state: dict) -> None:
 #: 预算耗尽的统一措辞。`agent/main.py` 用它判断"今天不可能再跑了"，
 #: 从而跳过闹钟——避免"每 2 秒重跑一次必败回合"的死循环（生产实测一天 17885 行）。
 BUDGET_EXHAUSTED_WHY = "agent 日预算已用完"
+#: 单次请求比剩余额度还大时用的 why。
+#:
+#: **绝不能和 `BUDGET_EXHAUSTED_WHY` 混用**（v0.2.96 修的，Codex 实测）：
+#: 那条的语义是"今天没额度了，任何请求都别发"，`agent/main.py` 会把它 latch 成
+#: `_quota_exhausted` 并**跳过当天所有闹钟**。
+#:
+#: 而"这次请求太大"只说明**这一个回合**做不了。实测：合并事件组请求需要
+#: 41367 输入 token，而剩余 41366 —— 差 1 个 token，就把整天的回访全锁死了；
+#: 可实际上紧接着只需 8913 的心跳、单票回访完全跑得动。
+#: Codex 用同进程新建 `AgentMain` 实例验证过：latch 一清，那条闹钟立刻完成。
+BUDGET_TOO_LARGE_WHY = "本次请求超出剩余额度"
+#: 判定"额度真的没了"时用的最小请求输入估算：连最省的提示词都放不下，
+#: 才叫额度耗尽。系统提示 + 工具 schema 大约就是这个量级。
+MIN_TURN_EST_IN = 2000
 #: "轮数用尽"的 why 文案。**必须与 `agent/main.py` 的判定同源**：
 #: 它是"模型自己在 N 轮内没有收敛"，重试必然再次用尽，不该退回闹钟重跑。
 ROUNDS_EXHAUSTED_WHY = "轮数用尽"
@@ -194,6 +208,20 @@ def _call_timeout(cap: float, deadline_s: float | None, started: float) -> float
         # 上游不回包时那就是永久卡死。兜底给一个足够大的值。
         return SAFETY_DEADLINE_S
     return min(limits)
+
+
+def budget_shortfall(deps, est_in: int, est_out: int = MAX_TOKENS) -> str | None:
+    """额度不够时返回**该用哪条 why**：`None` 表示够。
+
+    **"今天没了"和"这次太大"必须分开**（v0.2.96）。合在一起时，
+    一个仅超出 1 个 token 的合并事件组会把 `agent/main.py` 的
+    `_quota_exhausted` latch 置上，于是当天剩余时间所有回访都被跳过。
+    """
+    if deps.budget.allow(est_in=est_in, est_out=est_out):
+        return None
+    if deps.budget.allow(est_in=MIN_TURN_EST_IN, est_out=est_out):
+        return BUDGET_TOO_LARGE_WHY
+    return BUDGET_EXHAUSTED_WHY
 
 
 def _est_in(msgs: list[dict], tools: list[dict] | None = None) -> int:
@@ -305,7 +333,8 @@ async def run_turn(trigger: Trigger, deps: Deps, rendered: Rendered,
                                   trigger.deadline_s, started)
         # **每一轮都查**：只在回合开头查的话，首轮把额度用光后，后续工具轮与
         # grounding 重写仍然继续调用中转站——日预算是硬上限，不是软提示
-        if not deps.budget.allow(est_in=_est_in(msgs, tools), est_out=MAX_TOKENS):
+        short = budget_shortfall(deps, _est_in(msgs, tools), MAX_TOKENS)
+        if short is not None:
             # **这里不加轮数**：一次 LLM 都没发出去，记成 1 轮会把 F-34 的
             # 「一轮收场」占比虚高到 1.0。
             # **必须记 `error` 而不是 `timeout`**：预算耗尽不是"慢"，
@@ -314,7 +343,7 @@ async def run_turn(trigger: Trigger, deps: Deps, rendered: Rendered,
             # （耗时 0–5 秒，根本没等），真实超时率被虚报成 51%（实际约 5%）。
             # 入口层（`run_with_deadline` 前面的预检）一直记的是 `error`，
             # 这里跟它统一。
-            return _result(TurnDecision.error(BUDGET_EXHAUSTED_WHY), rounds, tool_calls,
+            return _result(TurnDecision.error(short), rounds, tool_calls,
                            rendered, state, started, deps)
         # **`rounds` 在 `chat` 真正发出后才加**（见下）：`deduct` 扣不动时
         # `LlmClient` 会在发请求前抛 `BudgetExceeded`，那次不算一轮。
@@ -395,13 +424,13 @@ async def run_turn(trigger: Trigger, deps: Deps, rendered: Rendered,
 async def run_with_deadline(trigger: Trigger, deps: Deps) -> TurnResult:
     """整回合硬截止。`rendered` 与 `state` 必须在这里建并传进去（见模块文档）。"""
     rendered = deps.render(trigger)
-    allowed = deps.budget.allow(est_in=math.ceil(rendered.chars / 2) + 800,
-                                est_out=MAX_TOKENS)
-    if not allowed:
+    # **必须区分"今天没了"与"这次太大"**（v0.2.96，Codex 实测）：合并事件组
+    # 需要 41367 token 而剩余 41366 时，差 1 个 token 就把整天回访锁死了。
+    short = budget_shortfall(deps, math.ceil(rendered.chars / 2) + 800, MAX_TOKENS)
+    if short is not None:
         return TurnResult(decision=TurnDecision(kind="error", speak=False,
-                                                why=BUDGET_EXHAUSTED_WHY,
-                                                why_silent=BUDGET_EXHAUSTED_WHY),
-                          rounds=0, rendered=rendered, why=BUDGET_EXHAUSTED_WHY,
+                                                why=short, why_silent=short),
+                          rounds=0, rendered=rendered, why=short,
                           grounded=GroundedText(text="", ungrounded=False, failed=False))
     state: dict = {"rounds": 0, "usage": None}
     started = time.monotonic()

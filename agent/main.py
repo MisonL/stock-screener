@@ -262,17 +262,18 @@ class AgentMain:
             # 直接 cancelled，把这次回访明确记为放弃。
             rounds_exhausted = getattr(result, "why", "") == ROUNDS_EXHAUSTED_WHY
             if rounds_exhausted:
-                self.deps.conn.execute(
-                    "UPDATE agent_schedule SET status = 'cancelled', fired_turn = NULL"
-                    " WHERE id = ? AND status = 'fired'", (trigger.alarm_id,))
-                self.deps.conn.commit()
+                self._cancel_alarm(trigger.alarm_id, "轮数用尽（模型未收敛）")
+                # **必须让用户知道这次回访没发生**（v0.2.96，评审建议）。
+                # 闹钟是用户看得见的承诺（「我 30 分钟后回来看」），
+                # `agent_turn` 里的 `decision=timeout, why=轮数用尽` 只有运维在看。
+                # 不推的话，用户以为 30 分钟后会有结论，实际静默丢了——
+                # 和「静默 pending 再烧 18 轮」是同一个毛病，只是这次省了钱。
+                # 每条闹钟只推一次（取消是单向的，不会重复），走低优先级便签。
+                self._notify_alarm_give_up(trigger)
             elif result.decision.kind in ("error", "invalid", "timeout"):
                 exhausted = getattr(result, "why", "") == BUDGET_EXHAUSTED_WHY
                 if exhausted:
-                    self.deps.conn.execute(
-                        "UPDATE agent_schedule SET status = 'cancelled', fired_turn = NULL"
-                        " WHERE id = ? AND status = 'fired'", (trigger.alarm_id,))
-                    self.deps.conn.commit()
+                    self._cancel_alarm(trigger.alarm_id, "预算耗尽")
                 else:
                     release_alarm(self.deps.conn, trigger.alarm_id, now=self.clock.now())
         if result.decision.pending_action and self.deps.pusher is not None:
@@ -296,26 +297,45 @@ class AgentMain:
             # 额度用完：**跨日才恢复**，所以单独记一个 latch，别被下面的重读清掉
             self._quota_exhausted = True
             self.budget_exhausted = True
-        # 预算写库失败也要进「预算不可用」：否则下一唤醒继续请求、继续花
+        # **这里刻意不再镜像 `budget_exhausted`**（第四轮评审发现第 6 次假绿的
+        # 副产品）：`_once()` 在**闹钟与开盘回合之前**无条件重算一次
+        # `budget_exhausted = _quota_exhausted or _budget_unavailable()`，
+        # 所以这里再写一遍是**冗余的、且测不到的**——评审实测：把这段删掉，
+        # 全部测试照样绿，因为它永远被 `_once()` 那一行覆盖。
         #
-        # **但它是"标志的镜像"，不是独立的状态**（v0.2.95 修的 S1，第 5 次假绿）。
-        # 原来这里只做 `if 标志存在: True`，从没有 `else: False`——
-        # 于是 `budget_exhausted` 成了**只在跨日清零的 latch**：
-        # 记一次写锁抖动把它置上，即使 `llm/budget.py` 的探测已经自愈、
-        # 库里的标志已经被删掉，这里仍然恒为 True，
-        # **当天剩下的时间所有闹钟都被跳过**（回访一条都不跑）。
-        # 评审实测：标志已清、`deduct()` 返回 True、`_once()` 再跑一轮，
-        # `budget_exhausted` 仍是 True，闹钟仍 pending。
-        #
-        # 现在每次回合结束都跟着标志走：标志在就 True，不在就 False。
-        # 注意不能简单地整体 `= False`——那会把「本次回合刚因预算耗尽而失败」
-        # （上面那一行）也一起抹掉。
-        # 本次回合若正常跑完（不是预算耗尽），就跟着库标志复位；
-        # 若本次就是预算耗尽，上面那行已经置 True，不要被 `_budget_unavailable()`
-        # 的 False 覆盖（预算是"额度用完"，与"记账坏了"是两个不同的键）。
-        if getattr(result, "why", None) != BUDGET_EXHAUSTED_WHY:
-            self.budget_exhausted = self._quota_exhausted or self._budget_unavailable()
+        # 与其留一段无覆盖的代码冒充"修复"，不如删掉，让 `_once()` 那行成为
+        # **唯一**的判定点。上面 `_quota_exhausted = True` 的 latch 仍然必要：
+        # 它跨回合保存"今天额度用完了"这个不可自愈的事实。
         return turn_id
+
+    def _cancel_alarm(self, alarm_id: int, reason: str) -> None:
+        """把已认领的闹钟转 `cancelled`，并记下原因（见 008 迁移）。"""
+        self.deps.conn.execute(
+            "UPDATE agent_schedule SET status = 'cancelled', fired_turn = NULL,"
+            " cancelled_reason = ? WHERE id = ? AND status = 'fired'",
+            (reason, alarm_id))
+        self.deps.conn.commit()
+
+    def _notify_alarm_give_up(self, trigger) -> None:
+        """告诉用户"这次回访放弃了"（轮数用尽）。
+
+        **只在真有推送通道时做**，且任何异常都不能影响调度——
+        一条通知失败不值得让整个回合链路崩掉。
+        """
+        pusher = getattr(self.deps, "pusher", None)
+        if pusher is None:
+            return
+        try:
+            target = getattr(trigger, "target", None) or ""
+            note = getattr(trigger, "note", "") or ""
+            body = (f"放弃了 {target or '这次'} 的回访：模型 6 轮内没有得出结论。"
+                    f"原定关注：{note or '（无备注）'}")
+            from agent.decision import TurnDecision
+            decision = TurnDecision(kind="speak", speak=True, body=body, level="P2")
+            pusher.agent_note(decision, None, None, target)
+        except Exception:                                  # noqa: BLE001
+            logging.getLogger("agent").warning(
+                "回访放弃通知发送失败", exc_info=True)
 
     def _budget_unavailable(self) -> bool:
         """预算是否不可用：**只看数据库标志**，每轮重读。
@@ -699,7 +719,17 @@ def main(conn_factory=None, clock=None, every_s: int = 30) -> None:
     # **心跳必须有**：compose 跑的是 `python -m agent.main`。没有心跳线程，
     # watchdog 会在 120 秒后判 agent_down；而且首页「最后活动」与预算抑制都读它。
     Heartbeat(conn_factory, service=heartbeat_service(), every_s=every_s, clock=clock,
-              detail_provider=lambda: {"budget_exhausted": boss.budget_exhausted}).start()
+              detail_provider=lambda: {
+                  # **只报"额度用完"，不报"记账写库坏了"**（第四轮评审的轻微项）。
+                  # watchdog 用 `budget_exhausted` 去**静音** `agent_stalled` 与
+                  # `llm_down`——因为额度用完是"预期停止"。但记账读不出来时
+                  # 同样会 fail-closed 置 True，那会被误当成"额度用完"，
+                  # 把「卡死」的告警一起静音。分开报：额度用完才静音，
+                  # 记账坏了单独可观测（运维能查，但不影响告警）。
+                  "budget_exhausted": boss._quota_exhausted,
+                  "budget_write_failed": boss._budget_unavailable()
+                  if boss._quota_exhausted is False else False,
+              }).start()
     # **`run()` 是协程**：不 `asyncio.run` 的话这里只是建了个协程对象，
     # 进程立刻退出，容器反复重启，而所有单测都绿。
     asyncio.run(boss.run())

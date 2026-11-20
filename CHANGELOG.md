@@ -1,5 +1,59 @@
 ## [Unreleased]
 
+### 修复（第四轮独立复核 + Codex 评审：第 6 次假绿 + 1 严重 + 3 中等）
+
+- **单次请求比剩余额度大一点点，会把整天锁死**（Codex 实测，严重）。
+
+  合并事件组请求需要 **41367** 输入 token，剩余 **41366** —— 差 1 个 token。
+  原实现把这种情况也记成 `BUDGET_EXHAUSTED_WHY`，`agent/main.py` 于是 latch 出
+  `_quota_exhausted=True`，**当天剩余所有回访都被跳过**。
+
+  可实际上紧接着只需 8913 token 的心跳、单票回访完全跑得动。
+  Codex 用「同进程新建 `AgentMain` 实例」做对照：latch 一清，那条闹钟立刻完成。
+
+  修法：拆成两条 why——
+  · `BUDGET_EXHAUSTED_WHY`：连最小请求（`MIN_TURN_EST_IN`）都放不下 → 真没了
+  · `BUDGET_TOO_LARGE_WHY`：这次太大，但还有额度 → 只影响这一回合
+
+- **第 6 次假绿：`test_budget_exhausted_flag_follows_the_db_flag` 没跑到它声称的 `_run()`**。
+
+  第二个 `_once()` 一个回合都没跑（心跳未到期、无闹钟、无事件、open 已 done），
+  断言只验到 `_once()` 开头那行重算。把 `_run` 恢复成旧写法仍然**全绿**。
+
+  顺带发现那段"镜像"本身是**冗余的**：`_once()` 在闹钟与开盘回合之前
+  已经无条件重算一次，`_run` 里再写一遍永远被覆盖。**与其留一段无覆盖的代码
+  冒充修复，不如删掉**——现在 `_once()` 那行是唯一判定点。测试补了
+  「两次 `_once()` 之间必须真有回合」的断言。
+
+- **`test_budget_exhausted_does_not_rerun_alarms` 的变异红是 `AttributeError`**。
+  手写的 `_Deps` 没有 `render`/`llm`，门一坏 `_run` 立刻炸在 `deps.render` 上，
+  断言根本没执行。改成真实 `Deps`，现在红在断言本身。
+
+- **`test_long_turn_does_not_cause_back_to_back_heartbeats` 的 `max()` 变异存活**。
+  测试固定在 10:30（单档内，回合 180s < 间隔 300s），既跨不到分档也造不出"变短"。
+  而 `next_heartbeat` 的分档**不是单调的**：13:29 属 `_LOOSE`(600s) 档 → 13:39；
+  回合一跑跨进 13:30 后的 `_NORMAL`(300s) 档 → 13:37，**比原计划还早**。
+  新增 `test_heartbeat_reanchor_never_shortens_the_planned_gap` 钉在分档边界上。
+
+- **churn 只有「滚动一小时 >1000」一条判据，低速 runaway 发现太晚**。
+  每分钟 20 个（≈4800/日，正常日 131 行的 36 倍）要跑满 48 分钟才越线，
+  而 `_alert` 还有 `REPEAT_S=1800` 去重。新增 **5 分钟快线**
+  `AGENT_TURN_CHURN_PER_5MIN = 120`（暴跌日实测峰值约 20），与小时线并联。
+
+- **`test_normal_turn_volume_does_not_alarm` 的上界覆盖也是假的**：
+  169 正常行 + 500 未来行 = 669 < 1000，删掉 `ts <= now` 照样绿。
+  未来行加到 1200，现在删上界立刻转红。
+
+- **"轮数用尽"静默取消，用户不知道这次回访没发生**（评审建议，已采纳）。
+  闹钟是用户看得见的承诺（「我 30 分钟后回来看」），`agent_turn` 里那行只有
+  运维在看。现在补一条低优先级便签，带标的与原始关注点；每条闹钟只推一次，
+  推送失败也不影响回合链路。同时新增 `agent_schedule.cancelled_reason`
+  （迁移 008），事后能区分「按时没跑成」和「跑了没跑出来」。
+
+- **心跳 detail 把"额度用完"和"记账写库坏了"混在一起**。watchdog 用
+  `budget_exhausted` 静音 `agent_stalled`/`llm_down`，而记账读失败也会
+  fail-closed 置 True——那会把「卡死」的告警一起静音。现在分开报。
+
 ## [0.2.95] - 2026-11-20
 
 ### 修复（第三轮独立复核：第 5 次假绿 + 2 中等 + 1 轻微）

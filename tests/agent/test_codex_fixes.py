@@ -2245,9 +2245,12 @@ async def test_rounds_exhausted_push_notification_reaches_user(tmp_path):
     class _Pusher:
         def __init__(self):
             self.notes = []
+            self.exempts = []
 
-        def agent_note(self, decision, grounded, code=None, target=None):
+        def agent_note(self, decision, grounded, code=None, target=None,
+                       *, exempt_from_total_cap=False):
             self.notes.append((decision.body, target))
+            self.exempts.append(exempt_from_total_cap)
             return "seq-1"
 
     class _Deps:
@@ -2605,9 +2608,12 @@ async def test_budget_cancelled_alarms_notify_the_user_once(tmp_path):
     class _Pusher:
         def __init__(self):
             self.notes = []
+            self.exempts = []
 
-        def agent_note(self, decision, grounded, code=None, target=None):
+        def agent_note(self, decision, grounded, code=None, target=None,
+                       *, exempt_from_total_cap=False):
             self.notes.append(getattr(decision, "body", ""))
+            self.exempts.append(exempt_from_total_cap)
             return "seq-1"
 
     class _Deps:
@@ -2679,3 +2685,68 @@ async def test_cancelling_an_already_cancelled_one_does_not_notify(tmp_path):
     main = AgentMain(_Deps(), clock)
     assert main._cancel_alarm(alarm_id, "轮数用尽") is False, (
         "已经 cancelled 的闹钟再取消仍然报告成功：会重复发通知")
+
+
+def test_give_up_note_does_not_squeeze_out_market_alerts(tmp_path):
+    """**放弃便签不能挤掉 P1 行情提醒**（v0.2.101，Codex 实测）。
+
+    `notify.daily_cap` 那份额度是给**行情信号**的——`notify/dispatcher.py`
+    明确它用来保证 P1/P0 不被淹没。而 `agent_note` 原来把它也算进去。
+
+    Codex 实测：先写 59 条 accepted，再发一条 P2 放弃便签，随后派发的 **P1 就被
+    suppressed**（P0 与运维告警仍放行）。运维性说明不该和行情信号抢额度。
+
+    豁免是安全的：这类便签由 `_flush_give_up()` 按原因每天最多各一条，
+    且仍受 `channel_b_daily_cap`(15) 约束。
+    """
+    import json as _json
+
+    from agent.decision import TurnDecision
+    from agent.push import AgentPusher
+    from core.clock import FixedClock
+    from core.config import load_config
+    from core.db import connect, migrate
+    from notify.policy import pushed_today
+    from tests.helpers import SH
+    from datetime import datetime
+
+    cfg = load_config(Path("config"))
+    conn = connect(tmp_path / "cap.db")
+    migrate(conn)
+    clock = FixedClock(datetime(2026, 11, 20, 10, 0, tzinfo=SH))
+    today = clock.today()
+
+    class _Ntfy:
+        def __init__(self):
+            self.sent = []
+
+        def publish(self, msg):
+            self.sent.append(msg)
+            return "ntfy-1"
+
+    pusher = AgentPusher(conn, _Ntfy(), cfg, clock)
+
+    # 先把全局日额度用掉大半（模拟行情信号已发 59 条）
+    cap = int(cfg.notify.daily_cap)
+    for i in range(cap):        # **必须填满**：填到 cap-1 时 ≥cap 判断不成立，
+                                # 豁免与否都放行，测了个寂寞（第一版就是）
+        conn.execute(
+            "INSERT INTO push_log(ts, code, kind, level, seq_id, segment, body,"
+            " trade_date, status) VALUES (?,?,?,?,?,?,?,?,?)",
+            (clock.now().isoformat(), None, f"kw{i}", "P1", f"s{i}", 1, "行情",
+             today, "accepted"))
+    conn.commit()
+    used_now = pushed_today(conn, channel=None, exclude_segments=(2,),
+                            exclude_kinds=(), day=today)
+    assert used_now >= cap, f"前提不成立：总额度还没占满（{used_now}/{cap}）"
+
+    d = TurnDecision(kind="speak", speak=True, level="P2", body="1 条回访被放弃")
+    got = pusher.agent_note(d, None, None, None, exempt_from_total_cap=True)
+    assert got is not None, (
+        "总日额度快满时运维便签被压掉了（豁免没生效）")
+
+    # 再发一条**普通** P2 便签：它必须仍受总额度约束（豁免不能是全开）
+    d2 = TurnDecision(kind="speak", speak=True, level="P2", body="普通便签")
+    got2 = pusher.agent_note(d2, None, None, None)
+    assert got2 is None, (
+        "普通便签也豁免了总额度：那等于把日上限整体取消，会淹掉 P1")

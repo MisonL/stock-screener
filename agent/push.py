@@ -220,7 +220,20 @@ class AgentPusher:
     # ---- 通道 B ----------------------------------------------------------
 
     def agent_note(self, decision, grounded, code: str | None = None,
-                   target: str | None = None) -> str | None:
+                   target: str | None = None, *, exempt_from_total_cap: bool = False
+                   ) -> str | None:
+        """通道 B 便签。
+
+        `exempt_from_total_cap`：**运维性通知**（"N 条回访被放弃"）不占
+        `notify.daily_cap` 那份额度（v0.2.101，Codex 实测）。
+
+        那份额度是给**行情信号**的：`notify/dispatcher.py` 明确它用来
+        保证 P1/P0 不被淹没。Codex 实测：先写 59 条 accepted，再发一条放弃便签，
+        随后派发的 P1 就被 suppressed 了（P0 与运维告警仍放行）。
+
+        之所以能安全豁免：这类便签由 `_flush_give_up()` 按原因每天最多各一条，
+        且仍然受 `channel_b_daily_cap`(15) 约束——不存在刷屏风险。
+        """
         if self._drill_skip("agent_note", code=code, target=target):
             return None
         conn = self.conn
@@ -238,13 +251,14 @@ class AgentPusher:
                 conn.rollback()
                 self._audit_cap("通道 B 日上限")
                 return None
-            total_cap = int(self.cfg.notify.daily_cap)
-            used = pushed_today(conn, channel=None, exclude_segments=(2,),
-                                exclude_kinds=NON_PUSH_KINDS, day=today)
-            if used >= total_cap:
-                conn.rollback()
-                self._audit_cap("推送总日上限")
-                return None
+            if not exempt_from_total_cap:
+                total_cap = int(self.cfg.notify.daily_cap)
+                used = pushed_today(conn, channel=None, exclude_segments=(2,),
+                                    exclude_kinds=NON_PUSH_KINDS, day=today)
+                if used >= total_cap:
+                    conn.rollback()
+                    self._audit_cap("推送总日上限")
+                    return None
 
             # 同 code 同 kind 的独立推送刚发过 → 改成对原条追加第二段（§7.2 去重表）
             if code:

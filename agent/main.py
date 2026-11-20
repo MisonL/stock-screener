@@ -124,12 +124,17 @@ def should_wake(conn, now: datetime) -> bool:
         return False
 
 
-def _give_up_decision(reason: str, n: int):
+def _give_up_decision(reason: str, n: int, dropped_events: int = 0):
     """放弃回访的合并通知正文。"""
     from agent.decision import TurnDecision
 
     if reason == "额度不足":
         tail = "今天额度用完了，这些回访不会补跑——需要的话明天开盘重新安排。"
+        if dropped_events > 0:
+            # **事件被静默丢弃必须说出来**（Codex 实测）：跳过 poll 之后事件保持
+            # `new`，下一交易日由 housekeeping 标 `expired`。不会有永久残留，
+            # 但用户完全看不到这些盘中信号被丢了。
+            tail += f"另外有 {dropped_events} 条盘中信号因额度不足没有处理。"
     else:
         tail = "模型在轮数上限内没得出结论，重试也会同样用尽，所以没再跑。"
     return TurnDecision(
@@ -357,6 +362,22 @@ class AgentMain:
         self.deps.conn.commit()
         return bool(cur.rowcount)
 
+    def _dropped_events(self) -> int:
+        """当天还没处理、且因为额度不会再处理的盘中信号数。
+
+        跳过了 `poll()` 之后事件保持 `new`，下一交易日由 housekeeping 标 `expired`
+        ——不会有永久残留，但**用户完全看不到这些信号被丢了**。
+        合并通知里带上这个数，至少让用户知道"今天有 N 条信号没看"。
+        """
+        try:
+            row = self.deps.conn.execute(
+                "SELECT count(*) FROM event_log WHERE trade_date = ?"
+                " AND agent_status IN ('new','pending_retry')",
+                (self.clock.today(),)).fetchone()
+            return int(row[0]) if row else 0
+        except Exception:                                  # noqa: BLE001
+            return 0
+
     def _flush_give_up(self) -> None:
         """把"今天放弃了哪些回访"**合并成至多两条**通知推给用户。
 
@@ -386,7 +407,9 @@ class AgentMain:
                 if self.deps.conn.execute("SELECT 1 FROM job_state WHERE name = ?",
                                           (key,)).fetchone() is not None:
                     continue                # 今天这个原因已经推过，只累计不再吵
-                pusher.agent_note(_give_up_decision(reason, n), None, None, None)
+                pusher.agent_note(
+                    _give_up_decision(reason, n, self._dropped_events() if reason == "额度不足" else 0),
+                    None, None, None, exempt_from_total_cap=True)
                 self.deps.conn.execute(
                     "INSERT OR REPLACE INTO job_state(name, value) VALUES (?, '1')",
                     (key,))

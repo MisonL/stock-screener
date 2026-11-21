@@ -598,9 +598,16 @@ docker compose -f deploy/docker-compose.yml --project-directory . run --rm \
 
 ```bash
 docker builder prune -f          # 只清未被使用的缓存层，不动在用镜像
-docker system df                 # 确认回收量
+docker system df                 # 确认回收量（**看 Reclaimable 那一列，不止 Build Cache**）
 df -h /                          # 目标：可用空间 > 30G
+
+# 可回收里还有悬空镜像/未用卷时，再补这两条（都是安全的，不动活着的容器）
+docker image prune -f
+docker volume prune -f
 ```
+
+2026-11-21 在 81.4 上实测：`docker builder prune -f` 回收 **15.69 GB**，
+根分区从 85%（14G 可用）回到 70%（29G 可用）。
 
 **不需要**动 `data/backups/`（7 份日备份 ≈8.5 GB，是恢复演练依赖的资产）。
 

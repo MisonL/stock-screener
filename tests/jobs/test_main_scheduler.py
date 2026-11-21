@@ -1743,3 +1743,22 @@ def test_actions_refresh_runs_every_two_minutes(env):
         assert fields["minute"] == "*/2", (
             f"{job_id} 的分钟字段是 {fields['minute']!r}，应为 '*/2'"
             "（退回 */20 会让全市场刷新一圈要 4.5 天）")
+
+
+def test_disk_job_holds_the_write_lock():
+    """**`disk_job` 必须持 `loops.lock`**（v0.2.109，Codex 复核 S1）。
+
+    巡检本身只读 `shutil.disk_usage`，但越阈值时会走
+    `dispatcher.alert()` → `_push_log()` 的 `BEGIN IMMEDIATE`，
+    写的是**同一个 conn** 的 `push_log`。磁盘越线时正赶上 tick/心跳/快照线程，
+    事务状态就乱了——与 `cleanup_job` 用的是同一个理由。
+    """
+    import inspect
+    from jobs import main as jobs_main
+
+    src = inspect.getsource(jobs_main.make_scheduler)
+    idx = src.index("def disk_job")
+    body = src[idx:idx + 900]
+    assert "_write_lock(loops)" in body, (
+        "disk_job 没在写锁里：dispatcher.alert 会写 push_log，"
+        "与 tick/心跳共用同一个 conn")

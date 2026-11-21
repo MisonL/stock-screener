@@ -39,23 +39,41 @@ tar -cf "$TARBALL" \
     --exclude='.venv' --exclude='*.pyc' \
     -C "$ROOT" .
 
-ARGS="$*"
+# 参数用 **bash 数组** 传递：`ARGS="$*"` 会把带空格的参数（如 `-k "a b"`）拆坏，
+# 也会让远端拿到二次展开的结果。
+ARGS_LITERAL=""
+for a in "$@"; do
+    ARGS_LITERAL+=" $(printf '%q' "$a")"
+done
+
+# **RUNID 在本地生成并写死进 runner**：远端若自己生成，上传的 tar 名就对不上
+# （踩过一次）。它也顺带解决并发：两次同时跑各自用不同的 tar/runner/WORK。
+RUNID="$(date +%s)-$$"
+REMOTE_TAR="/tmp/ss-src-$RUNID.tar"
+REMOTE_RUNNER="/tmp/ss-runner-$RUNID.sh"
+
 cat > "$RUNNER" <<EOF
 set -euo pipefail
 # **每次跑用独立目录**：容器以 root 写入挂载点，复用同一个目录时
 # 下一次宿主机侧的 rm 会因为属主不对而失败（实测踩过）。
-WORK=\$(mktemp -d /tmp/ss-src-XXXXXX)
-trap 'docker run --rm -v /tmp:/x alpine sh -c "rm -rf /x/\$(basename \$WORK)" >/dev/null 2>&1 || true' EXIT
-tar -xf /tmp/ss-src.tar -C "\$WORK"
+WORK=\$(mktemp -d /tmp/ss-src-work-XXXXXX)
+cleanup() {
+    # 用一次性容器删（root 建的目录，宿主机用户删不掉）
+    docker run --rm -v /tmp:/x alpine sh -c "rm -rf /x/\$(basename \$WORK)" >/dev/null 2>&1 \
+        || rm -rf "\$WORK" 2>/dev/null || true
+    rm -f "$REMOTE_TAR" "$REMOTE_RUNNER" 2>/dev/null || true
+}
+trap cleanup EXIT
+tar -xf "$REMOTE_TAR" -C "\$WORK"
 cd "\$WORK"
 # **关键**：新开一次性容器，而不是 docker exec 进生产容器——
 # 后者会把测试文件写进生产容器的可写层，正是这次事故的形状。
 docker run --rm \\
     --tmpfs /tmp:rw,exec,size=2g \\
     -v "\$WORK":/app -w /app \\
-    $IMAGE bash scripts/_remote_pytest.sh $ARGS
+    $IMAGE bash scripts/_remote_pytest.sh$ARGS_LITERAL
 EOF
 
-scp -q -o BatchMode=yes "$TARBALL" "$HOST:/tmp/ss-src.tar"
-scp -q -o BatchMode=yes "$RUNNER" "$HOST:/tmp/ss-runner.sh"
-ssh -o BatchMode=yes "$HOST" 'bash /tmp/ss-runner.sh'
+scp -q -o BatchMode=yes "$TARBALL" "$HOST:$REMOTE_TAR"
+scp -q -o BatchMode=yes "$RUNNER" "$HOST:$REMOTE_RUNNER"
+ssh -o BatchMode=yes "$HOST" "bash $REMOTE_RUNNER"

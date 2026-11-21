@@ -132,13 +132,20 @@ DISK_CRIT_PCT = 95.0
 
 
 def _alert_disk(dispatcher, used: float) -> None:
-    """按水位发告警。同 kind 30 分钟去重由 `Dispatcher.alert` 保证。"""
+    """按水位发告警。
+
+    **kind 必须带档位**（`disk_p2` / `disk_p1` / `disk_p0`）。
+    `Dispatcher.alert` 的 30 分钟去重判据是 `kind + 时间`，**不看 level**：
+    75% 先发一条 P2 之后，10 分钟内升到 85%/95% 的 P1/P0 会被
+    "同 kind 刚发过"直接压掉——最该升级的那次反而发不出去。
+    分档 kind 让它们各自去重，升级一定发得出去。
+    """
     if used >= DISK_CRIT_PCT:
-        dispatcher.alert("disk", f"磁盘水位 {used:.0f}%（{DISK_CRIT_PCT:.0f}% 以上，随时可能写不进）", "P0")
+        dispatcher.alert("disk_p0", f"磁盘水位 {used:.0f}%（{DISK_CRIT_PCT:.0f}% 以上，随时可能写不进）", "P0")
     elif used >= DISK_HIGH_PCT:
-        dispatcher.alert("disk", f"磁盘水位 {used:.0f}%（{DISK_HIGH_PCT:.0f}% 以上）", "P1")
+        dispatcher.alert("disk_p1", f"磁盘水位 {used:.0f}%（{DISK_HIGH_PCT:.0f}% 以上）", "P1")
     elif used >= DISK_WARN_PCT:
-        dispatcher.alert("disk", f"磁盘水位 {used:.0f}%（{DISK_WARN_PCT:.0f}% 以上，建议清理）", "P2")
+        dispatcher.alert("disk_p2", f"磁盘水位 {used:.0f}%（{DISK_WARN_PCT:.0f}% 以上，建议清理）", "P2")
 
 
 def check_disk(conn, dispatcher=None, path: str | None = None) -> float:

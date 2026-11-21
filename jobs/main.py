@@ -244,10 +244,15 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
         Docker 虚拟磁盘从 70% 涨到 100% 只花了几个小时，等 cleanup 跑起来时
         PostgreSQL 已经写不进 `postmaster.pid` 了。
 
-        只读 `shutil.disk_usage`，不写库，所以**不需要 `_write_lock`**。
+        **必须与其它写库任务共用 `loops.lock`**：巡检本身只读 `shutil.disk_usage`，
+        但越阈值时会走 `dispatcher.alert()` → `_push_log()` 的
+        `BEGIN IMMEDIATE`，写的是同一个 conn 的 `push_log`。
+        磁盘越线时正赶上 tick/心跳/快照线程交错，事务状态就乱了
+        （与 `cleanup_job` 上面那段注释是同一个理由）。
         """
         try:
-            check_disk(conn, dispatcher=dispatcher)
+            with _write_lock(loops):
+                check_disk(conn, dispatcher=dispatcher)
         except Exception:                          # noqa: BLE001 —— 巡检失败不能拖死调度器
             log.warning("磁盘巡检失败", exc_info=True)
 
@@ -269,8 +274,10 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
         # 部署窗口压在 23:30 时那一晚会**静默跳过**备份，7 份保留位出现空洞
         # 也没人知道（2026-11-21 实测：11-20 那天就缺了一份）。
         try:
-            age = check_backup_freshness(conn, data_dir, now=clock.now(),
-                                         dispatcher=dispatcher)
+            # 陈旧时也会 `dispatcher.alert`（写 push_log），所以同样在写锁里
+            with _write_lock(loops):
+                age = check_backup_freshness(conn, data_dir, now=clock.now(),
+                                             dispatcher=dispatcher)
             if age is not None:
                 result["backup_age_h"] = round(age, 1)
         except Exception:                      # noqa: BLE001 —— 自检不该被它拖死

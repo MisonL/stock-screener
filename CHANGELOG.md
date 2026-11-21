@@ -1,5 +1,37 @@
 ## [Unreleased]
 
+### 修复（Codex 复核 2026-11-21 磁盘修复，四条都成立）
+
+- **`disk_job` 没持 `loops.lock`**。[严重]
+  我在注释里写着"只读 `shutil.disk_usage`，不需要锁"——**这是错的**：
+  越阈值时会走 `dispatcher.alert()` → `_push_log()` 的 `BEGIN IMMEDIATE`，
+  写的是**同一个 conn** 的 `push_log`。磁盘越线的那一刻正赶上
+  tick/心跳/快照线程，事务状态就乱了。这正是 `cleanup_job` 上面那段注释
+  早写下的同一个理由。现在 `disk_job` 和 08:55 的备份陈旧检查都在写锁里。
+
+- **三档磁盘告警共用 `kind="disk"`，升级会被自己的去重压掉**。[严重]
+  `Dispatcher.alert` 的 30 分钟冷却判据是 `kind + 时间`，**不看 level**。
+  75% 先发一条 P2 之后，10 分钟内升到 95% 的 P0 会被"同 kind 刚发过"
+  直接吞掉——**最该升级的那次反而发不出去**。改成分档 kind
+  （`disk_p2` / `disk_p1` / `disk_p0`），各自去重。
+
+- **`host_disk_guard.sh` 用了 GNU 专有的 `df --output=pcent`**。[中等]
+  macOS 的 `df` 没有这个选项，取值静默变成 0——在**事故所在的那个平台**上
+  读成 0%，而磁盘已经写满。改成 POSIX 的 `df -P`。同时在文件头写明：
+  这个脚本面向 Linux 宿主机；Docker Desktop for Mac 的 `df /` 看不到那
+  294 GB 虚拟磁盘，那种场景要查 Docker Desktop 自己的镜像文件。
+
+- **`test_remote.sh` 并发不安全**。[中等]
+  固定用 `/tmp/ss-src.tar` 和 `/tmp/ss-runner.sh`，两次同时跑会互相覆盖源码包；
+  `ARGS="$*"` 还会把带空格的参数（`-k "a b"`）拆坏。
+  改成**本地生成 RUNID 并写死进 runner**（远端自己生成过一次，名字对不上，
+  实测报 `tar: Cannot open`），tar/runner/WORK 全部唯一，参数用 bash 数组
+  逐项 `%q` 转义后拼接。
+
+- `make test-integration` 也补上 `--tmpfs`（原来只有 `make test` 有）。
+- RUNBOOK §12 的清理指引补上 `image prune` / `volume prune`，并写明
+  "看 Reclaimable 那一列，不止 Build Cache"。
+
 ## [0.2.108] - 2026-11-21
 
 ### 修复（2026-11-21 磁盘写满事故）

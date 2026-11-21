@@ -80,3 +80,29 @@ def test_backup_freshness_alerts_when_a_night_was_skipped(tmp_path):
     age = check_backup_freshness(None, str(data), now=now, dispatcher=D())
     assert age > 36
     assert calls and calls[0][0] == "backup_stale", f"漏跑一夜没被喊出来：{calls}"
+
+
+def test_disk_alert_levels_do_not_suppress_each_other(conn):
+    """**水位升级必须发得出去**（v0.2.109，Codex 复核 S2）。
+
+    `Dispatcher.alert` 的 30 分钟去重判据是 `kind + 时间`，**不看 level**。
+    三档如果共用 `kind="disk"`，75% 先发一条 P2 之后，10 分钟内升到
+    95% 的 P0 会被"同 kind 刚发过"直接压掉——**最该升级的那次反而发不出去**。
+    分档 kind（`disk_p2`/`disk_p1`/`disk_p0`）让它们各自去重。
+    """
+    from jobs.cleanup import _alert_disk
+
+    kinds = []
+
+    class D:
+        def alert(self, kind, text, level="P1"):
+            kinds.append((kind, level))
+
+    d = D()
+    _alert_disk(d, 76.0)
+    _alert_disk(d, 86.0)
+    _alert_disk(d, 96.0)
+
+    assert [k for k, _ in kinds] == ["disk_p2", "disk_p1", "disk_p0"], (
+        f"三档共用了 kind，升级会被去重压掉：{kinds}")
+    assert [lv for _, lv in kinds] == ["P2", "P1", "P0"]

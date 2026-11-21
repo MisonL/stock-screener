@@ -24,7 +24,7 @@ test-integration:
 	docker build --target dev -t $(IMAGE) -f deploy/Dockerfile .
 	-docker network create $(NET)
 	docker run -d --rm --name ss-ntfy --network $(NET) binwiederhier/ntfy serve --listen-http :2586
-	docker run --rm --network $(NET) -e NTFY_TEST_URL=http://ss-ntfy:2586 -v "$$PWD":/app -w /app $(IMAGE) pytest -q -m integration; status=$$?; docker stop ss-ntfy; docker network rm $(NET); exit $$status
+	docker run --rm --tmpfs /tmp:rw,exec,size=2g --network $(NET) -e NTFY_TEST_URL=http://ss-ntfy:2586 -v "$$PWD":/app -w /app $(IMAGE) pytest -q -m integration; status=$$?; docker stop ss-ntfy; docker network rm $(NET); exit $$status
 
 # 前端镜像可覆盖：与 deploy/Dockerfile 的 web 构建阶段保持一致才最可靠，
 # 但某个环境本地没这个 tag 时，用 WEB_NODE_IMAGE=node:22-slim 也能跑。

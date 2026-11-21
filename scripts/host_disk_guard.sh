@@ -12,6 +12,9 @@
 #   （`jobs/cleanup.py::check_disk`）能发现**总量**危机，但发现不了
 #   "某个容器在偷偷长"——这个脚本补的就是后者。
 #
+# **平台**：本脚本面向 Linux 宿主机（生产机 81.4）。Docker Desktop for Mac
+# 的 `docker` 指向虚拟机内的 daemon，宿主机的 `df /` 看不到那 294 GB 的
+# 虚拟磁盘——那种场景要查的是 Docker Desktop 自己的磁盘镜像文件。
 # 用法：加到宿主机 crontab（每 30 分钟）
 #   */30 * * * * NTFY_URL=https://ntfy.example NTFY_TOPIC=ss \
 #     /home/qdm/stock-screener/scripts/host_disk_guard.sh >> /var/log/ss-disk-guard.log 2>&1
@@ -51,7 +54,10 @@ to_gb() {
 }
 
 # ① 宿主机根分区
-USED_PCT=$(df --output=pcent / | tail -1 | tr -dc '0-9')
+# **不用 `df --output=pcent`**：那是 GNU 扩展，macOS 的 df 没有这个选项，
+# 会把取值静默变成 0（实测：在 Docker Desktop 所在主机上读成 0%，
+# 而实际虚拟磁盘已经写满）。`df -P` 是 POSIX，两种系统都有。
+USED_PCT=$(df -P / | awk 'NR==2 {gsub(/%/,"",$5); print $5}')
 USED_PCT=${USED_PCT:-0}
 if [ "$USED_PCT" -ge 95 ]; then
     notify urgent "宿主机磁盘 ${USED_PCT}%（>=95%）：随时可能写不进去"

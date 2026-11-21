@@ -29,7 +29,7 @@ from types import SimpleNamespace
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from jobs.backup import backup_db, prune_orphan_tmp
+from jobs.backup import BackupBusy, backup_db, prune_orphan_tmp
 from jobs.cleanup import check_backup_freshness, check_disk, cleanup
 from jobs.intraday import IntradayTick
 from jobs.snapshot import SnapshotLoops, calls_by_scope
@@ -57,8 +57,8 @@ def _is_locked(exc: BaseException) -> bool:
 
 
 def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
-                   reg=None, data_dir="data", mcp=None, westock_runner=None,
-                   westock_env_path=None):
+                    reg=None, data_dir="data", mcp=None, westock_runner=None,
+                    westock_env_path=None):
     """装配调度器。返回 `(scheduler, state)`；`state` 里放心跳与自检需要的共享字段。
 
     `mcp` / `westock_runner` / `westock_env_path` 是批2 Task 6 的三个注入口子：
@@ -108,8 +108,8 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
         # 所以两处都在共享锁里做「读-改-写」
         with _write_lock(loops), _heartbeat_lock:
             detail = {"loop_last_tick_at": state["loop_last_tick_at"],
-                      "tick_last_at": state.get("tick_last_at"),
-                      "calls_by_scope": calls_by_scope(conn, clock.now())}
+                        "tick_last_at": state.get("tick_last_at"),
+                        "calls_by_scope": calls_by_scope(conn, clock.now())}
             if state.get("self_check") is not None:
                 detail["self_check"] = state["self_check"]
             try:
@@ -155,7 +155,7 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
             # （原先它写在 `with _write_lock` 之外，靠 `with conn` 单独提交）
             with conn:
                 conn.execute("INSERT OR REPLACE INTO job_state(name, value) VALUES (?, 'done')",
-                             (f"eod.{clock.today()}",))
+                                (f"eod.{clock.today()}",))
 
     def auction_job():
         """09:25:30：用 pool/market 快照缓存里的报价与 `auction_daily` 基线出简报。"""
@@ -194,7 +194,7 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
                 write_sector_members(conn, sectors)
                 with conn:
                     conn.execute("INSERT OR REPLACE INTO job_state(name, value) VALUES (?, 'done')",
-                                 (f"sector_members.{clock.today()}",))
+                                    (f"sector_members.{clock.today()}",))
         except Exception:                          # noqa: BLE001 —— 一次刷新失败不能拖死调度器
             if dispatcher is not None:
                 # `alert` 经 `_push_log` 写 `push_log`，必须在写锁内
@@ -259,7 +259,12 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
     def backup_job():
         try:
             path = backup_db(conn, Path(data_dir), clock=clock)
-        except Exception:                          # noqa: BLE001 —— 备份失败不能让调度器死掉
+        except BackupBusy:
+            # **并发跳过不是失败**：两实例叠在一起时，第二份安静退出即可。
+            #这里绝不能落到下面的 P0 ——部署重叠会平白制造一条「备份失败」。
+            log.warning("另一份备份正在进行，本次跳过")
+            return
+        except Exception: # noqa: BLE001 ——备份失败不能让调度器死掉
             path = None
         if path is None and dispatcher is not None:
             # **只包告警，不包 `backup_db`**：备份要拷 1GB+，占着写锁会把 tick 饿死；
@@ -268,29 +273,29 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
             with _write_lock(loops):
                 dispatcher.alert("backup", "备份失败或完整性校验未通过", "P0")
 
-    def self_check_job():
-        result = self_check(cfg, conn, clock, reg=reg)
-        # **备份陈旧检查放这里**（早上 08:55，备份应在昨晚 23:30 跑过）：
-        # 部署窗口压在 23:30 时那一晚会**静默跳过**备份，7 份保留位出现空洞
-        # 也没人知道（2026-11-21 实测：11-20 那天就缺了一份）。
-        # **顺手清掉中断留下的半截备份**：它们以 `.` 开头，`ls` 看不见、
-        # `_prune` 也匹配不到，实测攒过 ~3.9 GB。只清 2 小时以上的，
-        # 免得删掉正在写的那份。
+    def backup_health_job():
+        """**每天**查备份是否断档 +清半截备份（不看交易日、不看周末）。
+
+        为什么独立成 job而不是塞进 `self_check_job`：`self_check()`会拉行情
+        快照、发 ntfy、跑一次 LLM；周末这些都没意义。备份在23:30跑、库7×24
+        在写，检查它没有理由跟着交易日走——但也不该顺带把别的探测带进周末。
+        """
         try:
             gone = prune_orphan_tmp(Path(data_dir) / "backups")
             if gone:
-                log.info("清理中断备份 %d 个：%s", len(gone), ", ".join(gone))
-        except Exception:                      # noqa: BLE001
+                log.info("清理中断备份 %d个：%s", len(gone), ", ".join(gone))
+        except Exception: # noqa: BLE001
             log.warning("清理中断备份失败", exc_info=True)
         try:
-            # 陈旧时也会 `dispatcher.alert`（写 push_log），所以同样在写锁里
+            #陈旧时也会 `dispatcher.alert`（写 push_log），所以同样在写锁里
             with _write_lock(loops):
-                age = check_backup_freshness(conn, data_dir, now=clock.now(),
-                                             dispatcher=dispatcher)
-            if age is not None:
-                result["backup_age_h"] = round(age, 1)
-        except Exception:                      # noqa: BLE001 —— 自检不该被它拖死
+                check_backup_freshness(conn, data_dir, now=clock.now(),
+                dispatcher=dispatcher)
+        except Exception: # noqa: BLE001
             log.warning("备份陈旧检查失败", exc_info=True)
+
+    def self_check_job():
+        result = self_check(cfg, conn, clock, reg=reg)
         state["self_check"] = result        # 心跳下一次会把 self_check 一起写进去，不会互相覆盖
         with _write_lock(loops), _heartbeat_lock:
             row = conn.execute(
@@ -330,7 +335,7 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
         # 原来整段都在锁里，续期期间每秒的 tick、心跳、快照缓存全部停摆，
         # watchdog 会判死，而独立健康文件照常刷新——Docker 绿着，业务已经停了。
         return renew_if_needed(conn, clock, runner, dispatcher=dispatcher,
-                               write_lock=_write_lock(loops), **kwargs)
+                                write_lock=_write_lock(loops), **kwargs)
 
     def actions_refresh_job():
         """滚动推进除权/停牌刷新（每轮一小段，见 `make_refresh_hooks`）。"""
@@ -371,37 +376,38 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
     sched.add_job(heartbeat_job, "interval", seconds=HEARTBEAT_S, id="heartbeat", **JOB_DEFAULTS)
     # 健康标记独立调度：与心跳同频，但**不取写锁**（见 health_touch_job 的说明）
     sched.add_job(health_touch_job, "interval", seconds=HEARTBEAT_S, id="health_touch",
-                  **JOB_DEFAULTS)
+                    **JOB_DEFAULTS)
     # **每个 CronTrigger 都要显式 timezone**：容器是 UTC，不传时 APScheduler 按本地时区
     # 解释 hour/minute，15:05 的 eod 会跑到北京时间 23:05。
     sched.add_job(eod_job, CronTrigger(hour=15, minute=5, day_of_week="mon-fri", timezone=SH),
-                  id="eod", **JOB_DEFAULTS)
+                    id="eod", **JOB_DEFAULTS)
     sched.add_job(cleanup_job, CronTrigger(hour=16, minute=0, day_of_week="mon-fri", timezone=SH),
-                  id="cleanup", **JOB_DEFAULTS)
+                    id="cleanup", **JOB_DEFAULTS)
     # 磁盘巡检**每 10 分钟**，与交易日/盘中窗口无关（磁盘不看开市）
     sched.add_job(disk_job, "interval", minutes=10, id="disk", **JOB_DEFAULTS)
     # 15:30 归档 `agent_turn`（90 天前移到 archive 表，不删）。**不注册就永远不跑**：
     # 批1 的 cleanup 不管这张表，回合表会无限增长
     sched.add_job(archive_job, CronTrigger(hour=15, minute=30, day_of_week="mon-fri",
-                                           timezone=SH), id="archive", **JOB_DEFAULTS)
+                                            timezone=SH), id="archive", **JOB_DEFAULTS)
     sched.add_job(backup_job, CronTrigger(hour=23, minute=30, timezone=SH), id="backup",
-                  misfire_grace_time=3600, coalesce=True, max_instances=1)
-    # **备份陈旧检查不能只在工作日跑**：周五 23:30 若被中断，
-    # 周六 08:55 不跑、周日也不跑，到周一才检查——那时 age 已经 80+ 小时，
-    # 当然会报，但**周末两天完全没有告警窗口**。数据库 7×24 在写，
-    # 备份检查没有理由跳过周末。
+                    misfire_grace_time=3600, coalesce=True, max_instances=1)
     sched.add_job(self_check_job,
-                  CronTrigger(hour=8, minute=55, timezone=SH),
-                  id="self_check", **JOB_DEFAULTS)
+                    CronTrigger(hour=8, minute=55, day_of_week="mon-fri", timezone=SH),
+                    id="self_check", **JOB_DEFAULTS)
+    #备份健康：**每天**跑（含周末）。备份23:30跑、库7×24在写，
+    #没有理由只在工作日检查——周五断档要等到周一会浪费两天窗口。
+    sched.add_job(backup_health_job,
+        CronTrigger(hour=8, minute=55, timezone=SH),
+        id="backup_health", **JOB_DEFAULTS)
     sched.add_job(members_job,
-                  CronTrigger(hour=8, minute=50, day_of_week="mon-fri", timezone=SH),
-                  id="members", **JOB_DEFAULTS)
+                    CronTrigger(hour=8, minute=50, day_of_week="mon-fri", timezone=SH),
+                    id="members", **JOB_DEFAULTS)
     sched.add_job(auction_job,
-                  CronTrigger(hour=9, minute=25, second=30, day_of_week="mon-fri", timezone=SH),
-                  id="auction", **JOB_DEFAULTS)
+                    CronTrigger(hour=9, minute=25, second=30, day_of_week="mon-fri", timezone=SH),
+                    id="auction", **JOB_DEFAULTS)
     sched.add_job(close_digest_job,
-                  CronTrigger(hour=15, minute=10, day_of_week="mon-fri", timezone=SH),
-                  id="close_digest", **JOB_DEFAULTS)
+                    CronTrigger(hour=15, minute=10, day_of_week="mon-fri", timezone=SH),
+                    id="close_digest", **JOB_DEFAULTS)
     # 08:40 续期 + 08:46 唯一一次重试（间隔 ≥5 分钟，与 renew_if_needed 的退避一致）；
     # 09:00 自选股导入（09:15 开盘前完成，不占用盘中资源）
     #
@@ -411,11 +417,11 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
     # （除权事件、停牌日历）。续期本身很便宜（剩 ≥24h 直接 skip），
     # 多跑周末两天没有成本。
     sched.add_job(westock_renew_job,
-                  CronTrigger(hour=8, minute=40, timezone=SH),
-                  id="westock_renew", **JOB_DEFAULTS)
+                    CronTrigger(hour=8, minute=40, timezone=SH),
+                    id="westock_renew", **JOB_DEFAULTS)
     sched.add_job(westock_renew_job,
-                  CronTrigger(hour=8, minute=46, timezone=SH),
-                  id="westock_renew_retry", **JOB_DEFAULTS)
+                    CronTrigger(hour=8, minute=46, timezone=SH),
+                    id="westock_renew_retry", **JOB_DEFAULTS)
     # **启动补跑**：`misfire_grace_time` 只有 5 分钟，08:40 那一刻进程不在
     # （部署、重启、崩溃）这次就整个丢了。补跑是幂等的——
     # `renew_if_needed` 剩 ≥24h 直接 skip、当天已成功也 skip，
@@ -429,17 +435,17 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
     # 超过 `misfire_grace_time`(300s) 就被 APScheduler **静默丢弃**——
     # 启动补跑一次都不跑，而且不报错。那正是这道保险要兜的场景。
     sched.add_job(westock_renew_job, "date",
-                  run_date=clock.now() + timedelta(seconds=STARTUP_RENEW_DELAY_S),
-                  id="westock_renew_startup", **JOB_DEFAULTS)
+                    run_date=clock.now() + timedelta(seconds=STARTUP_RENEW_DELAY_S),
+                    id="westock_renew_startup", **JOB_DEFAULTS)
 
     def arm_startup_renew() -> None:
         """在调度器启动前重算补跑时刻（`startup_recovery` 之后调用）。"""
         sched.modify_job("westock_renew_startup",
-                         next_run_time=clock.now() + timedelta(seconds=STARTUP_RENEW_DELAY_S))
+                            next_run_time=clock.now() + timedelta(seconds=STARTUP_RENEW_DELAY_S))
 
     sched.add_job(westock_import_job,
-                  CronTrigger(hour=9, minute=0, day_of_week="mon-fri", timezone=SH),
-                  id="westock_import", **JOB_DEFAULTS)
+                    CronTrigger(hour=9, minute=0, day_of_week="mon-fri", timezone=SH),
+                    id="westock_import", **JOB_DEFAULTS)
     # **除权/停牌滚动刷新**：上游限频决定了一次拉不完全市场（实测连发 8–10 个
     # 请求就限频、单次返回也残缺），所以每 20 分钟推进一小段（游标见
     # `jobs/eod.py::actions_cursor`），几天滚完一遍全市场。
@@ -458,26 +464,26 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
     # 2 分钟一轮 = 一天约 310 轮，全市场约 7 小时跑完一圈（单轮 1.2 秒，占用极低）。
     # 开盘前（09:00、09:10）与收盘后（15:20、15:40）用独立的分钟级触发补上。
     sched.add_job(actions_refresh_job,
-                  CronTrigger(hour="6-8,16-23", minute="*/2", day_of_week="mon-fri",
-                              timezone=SH),
-                  id="actions_refresh", **JOB_DEFAULTS)
+                    CronTrigger(hour="6-8,16-23", minute="*/2", day_of_week="mon-fri",
+                                timezone=SH),
+                    id="actions_refresh", **JOB_DEFAULTS)
     sched.add_job(actions_refresh_job,
-                  CronTrigger(hour=9, minute="0,10", day_of_week="mon-fri", timezone=SH),
-                  id="actions_refresh_premarket", **JOB_DEFAULTS)
+                    CronTrigger(hour=9, minute="0,10", day_of_week="mon-fri", timezone=SH),
+                    id="actions_refresh_premarket", **JOB_DEFAULTS)
     sched.add_job(actions_refresh_job,
-                  CronTrigger(hour=15, minute="20,40", day_of_week="mon-fri", timezone=SH),
-                  id="actions_refresh_postclose", **JOB_DEFAULTS)
+                    CronTrigger(hour=15, minute="20,40", day_of_week="mon-fri", timezone=SH),
+                    id="actions_refresh_postclose", **JOB_DEFAULTS)
     # 周末同样避开 09:20–15:00（虽然没行情，但保持同一套口径、也少打扰用户）
     sched.add_job(actions_refresh_job,
-                  CronTrigger(hour="6-8,16-23", minute="*/2", day_of_week="sat,sun",
-                              timezone=SH),
-                  id="actions_refresh_weekend", **JOB_DEFAULTS)
+                    CronTrigger(hour="6-8,16-23", minute="*/2", day_of_week="sat,sun",
+                                timezone=SH),
+                    id="actions_refresh_weekend", **JOB_DEFAULTS)
     sched.add_job(actions_refresh_job,
-                  CronTrigger(hour="9", minute="0,10", day_of_week="sat,sun", timezone=SH),
-                  id="actions_refresh_weekend_am", **JOB_DEFAULTS)
+                    CronTrigger(hour="9", minute="0,10", day_of_week="sat,sun", timezone=SH),
+                    id="actions_refresh_weekend_am", **JOB_DEFAULTS)
     sched.add_job(actions_refresh_job,
-                  CronTrigger(hour="15", minute="20,40", day_of_week="sat,sun", timezone=SH),
-                  id="actions_refresh_weekend_pm", **JOB_DEFAULTS)
+                    CronTrigger(hour="15", minute="20,40", day_of_week="sat,sun", timezone=SH),
+                    id="actions_refresh_weekend_pm", **JOB_DEFAULTS)
     state["arm_startup_renew"] = arm_startup_renew
     return sched, state
 
@@ -495,7 +501,7 @@ def self_check(cfg, conn, clock, reg=None, http=None) -> dict[str, bool]:
         import httpx
 
         resp = httpx.get(f"{cfg.notify.ntfy_url}/v1/health", timeout=10,
-                  trust_env=not _direct_http())
+                    trust_env=not _direct_http())
         out["ntfy"] = resp.status_code == 200 and (resp.json() or {}).get("healthy") is True
     except Exception:                              # noqa: BLE001
         out["ntfy"] = False
@@ -519,12 +525,12 @@ def _llm_probe(cfg) -> bool:                       # pragma: no cover - 网络�
     三条口径（每条都对应一次真实误判）：
 
     1. **url 从 yaml 或环境变量取**：`config/llm.env` 这个文件从来就不存在
-       （密钥在 `~/.config/stock-screener/llm.env`，由 compose `env_file` 注入成
-       环境变量）。旧实现读那个路径永远读不到 → `llm` 恒 False → 每天 08:55
-       误报 P1，把真故障淹掉。
+        （密钥在 `~/.config/stock-screener/llm.env`，由 compose `env_file` 注入成
+        环境变量）。旧实现读那个路径永远读不到 → `llm` 恒 False → 每天 08:55
+        误报 P1，把真故障淹掉。
     2. **必须带密钥**：不带 Authorization 时服务端返 401。
     3. **401/403 是故障，不是健康**：旧判据 `status_code < 500` 把鉴权失败当正常，
-       密钥过期时自检照样报绿——最该告警的情况恰好不告警。
+        密钥过期时自检照样报绿——最该告警的情况恰好不告警。
     """
     import os
 
@@ -534,7 +540,7 @@ def _llm_probe(cfg) -> bool:                       # pragma: no cover - 网络�
     # 演练要用 `LLM_BASE_URL=http://blackhole:1` 把链路指走，
     # 探测若反着取（yaml 优先）就永远探不到真实配置，演练也失效。
     url = (os.environ.get("LLM_BASE_URL")
-           or getattr(getattr(cfg, "llm", None), "base_url", None) or "").strip()
+            or getattr(getattr(cfg, "llm", None), "base_url", None) or "").strip()
     if not url:
         return False
     key_env = str(getattr(getattr(cfg, "llm", None), "api_key_env", "") or "LLM_API_KEY")
@@ -544,13 +550,13 @@ def _llm_probe(cfg) -> bool:                       # pragma: no cover - 网络�
     # 但不存在叫 probe 的模型"的端点（很常见）都会被自检判成故障，
     # 08:55 那次自检就会推一条假告警。
     model = (os.environ.get("LLM_MODEL")
-             or getattr(getattr(cfg, "llm", None), "model", None) or "").strip()
+                or getattr(getattr(cfg, "llm", None), "model", None) or "").strip()
     if not model:
         return False
     resp = httpx.post(f"{url.rstrip('/')}/chat/completions", timeout=10,
-               trust_env=not _direct_http(),
-                      headers=headers,
-                      json={"model": model, "messages": [{"role": "user", "content": "ping"}],
+                trust_env=not _direct_http(),
+                        headers=headers,
+                        json={"model": model, "messages": [{"role": "user", "content": "ping"}],
                             "max_tokens": 1})
     # 4xx 一律不算健康：401/403 是密钥问题，404/400 是路径或参数问题，
     # 这些正是自检该报出来的；只有 2xx/3xx 才说明链路通。
@@ -595,7 +601,7 @@ def _trace(msg: str) -> None:                       # pragma: no cover - 排障�
     try:
         with _TRACE_LOCK:
             lines = (path.read_text(encoding="utf-8").splitlines()[-200:]
-                     if path.exists() else [])
+                        if path.exists() else [])
             lines.append(f"{datetime.now(SH):%Y-%m-%d %H:%M:%S} {msg}")
             path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     except OSError:
@@ -647,10 +653,11 @@ def _call_with_lock(fn, lock):
 
 
 def startup_recovery(cfg, conn, clock, *, reg, tick=None, dispatcher=None, loops=None,
-                     refresh_actions=None, refresh_suspensions=None, run_eod=None) -> dict:
+                        refresh_actions=None, refresh_suspensions=None, run_eod=None,
+    data_dir="data") -> dict:
     """D10 启动恢复：盘中立即起循环；跨日补跑 eod；除权刷新按「距上次 ≥7 天」补。"""
     out = {"loops_started": False, "eod_days": [], "eod_ran": [], "eod_skipped": [],
-           "eod_failed": [], "refresh_actions": False}
+            "eod_failed": [], "refresh_actions": False}
     now = clock.now()
     today = clock.today()
 
@@ -706,10 +713,20 @@ def startup_recovery(cfg, conn, clock, *, reg, tick=None, dispatcher=None, loops
 
         if _minutes(clock.now().time()) >= _minutes(close_time) + CLOSE_BUFFER_MIN:
             marker = conn.execute("SELECT 1 FROM job_state WHERE name = ?",
-                                  (f"eod.{today_ymd}",)).fetchone()
+                                    (f"eod.{today_ymd}",)).fetchone()
             if marker is None:
                 closed.append(today_ymd)
 
+    # **启动时补一次备份健康检查**（评审 M2）：`backup_job`的
+    # `misfire_grace_time`只在「调度器在跑但被阻塞」时生效——进程在23:30
+    #不在，那次备份就**永久丢了**；陈旧检查挂在08:55的单次 cron上，
+    #容器若恰好那时不在，当天的检查也丢。启动补一次，代价接近零。
+    try:
+        with write_lock:
+            check_backup_freshness(conn, data_dir, now=now, dispatcher=dispatcher)
+    except Exception: # noqa: BLE001 ——启动恢复不能被它拖死
+        log.warning("启动时备份陈旧检查失败", exc_info=True)
+    
     out["eod_days"] = closed[-5:]
     runner = run_eod
     if runner is None:
@@ -746,7 +763,7 @@ def startup_recovery(cfg, conn, clock, *, reg, tick=None, dispatcher=None, loops
         # marker 走共享连接，由共享写锁保护
         with write_lock, conn:
             conn.execute("INSERT OR REPLACE INTO job_state(name, value) VALUES (?, 'done')",
-                         (f"eod.{day}",))
+                            (f"eod.{day}",))
         out["eod_ran"].append(day)
 
     # refresh_actions：键不存在或距上次 ≥7 天就补跑（周日不是交易日，不能用 contains 判）
@@ -827,8 +844,8 @@ def _warn_if_placeholder_config(cfg) -> None:  # pragma: no cover - 进程入口
         p = Path(path)
         if p.exists() and p.is_dir():
             log.error("%s 是**目录**而不是文件：单文件 bind mount 在宿主机对应路径"
-                      "不存在时会建空目录顶替。处理：在宿主机删掉该目录后 "
-                      "`touch` 同名文件（见 README 快速开始第 1 步）", path)
+                        "不存在时会建空目录顶替。处理：在宿主机删掉该目录后 "
+                        "`touch` 同名文件（见 README 快速开始第 1 步）", path)
         elif not p.exists():
             log.warning("%s 不存在：westock 续期会要求重新扫码（扫码需要人工）", path)
 
@@ -893,7 +910,7 @@ def main() -> int:                                  # pragma: no cover - 进程�
     # 09:00 自选股导入读的是 `/state/westock.env`（D13 的可写挂载）
     _westock = _make_westock()
     sched, state = make_scheduler(cfg, conn, clock, loops=loops, tick=tick,
-                                  dispatcher=dispatcher, reg=reg, mcp=_westock)
+                                    dispatcher=dispatcher, reg=reg, mcp=_westock)
     # `startup_recovery` **自己管理锁**：它先 `loops.start()` 拉起快照线程，
     # 之后凡写共享连接的动作（marker、除权/停牌回调）都在 `loops.lock` 内；
     # 只有 EOD 补跑例外——它用独立连接，事务与共享连接隔离。
@@ -907,7 +924,8 @@ def main() -> int:                                  # pragma: no cover - 进程�
 
     refine_actions, refine_susp = make_refresh_hooks(_westock, cfg, conn)
     startup_recovery(cfg, conn, clock, reg=reg, tick=tick, dispatcher=dispatcher, loops=loops,
-                     refresh_actions=refine_actions, refresh_suspensions=refine_susp)
+    data_dir=data_dir,
+                        refresh_actions=refine_actions, refresh_suspensions=refine_susp)
     # **必须在 startup_recovery 之后再算一次**：它可能耗时数十分钟，
     # 而补跑任务的 run_date 是在 make_scheduler 里基于那时的 now 算的。
     state["arm_startup_renew"]()
@@ -995,7 +1013,7 @@ def make_refresh_hooks(mcp, cfg, conn):
             # 没出现的票不能算处理过，否则滚动一圈约 3 天才再遇到。
             # 用 `done` 而不是整个 `batch`，残缺返回也不会把缺失的票跳过去。
             advance_actions_cursor(conn, all_codes, done,
-                                   start=batch[0] if batch else None)
+                                    start=batch[0] if batch else None)
         return written
 
     def _suspensions(lock=None):

@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import fcntl # POSIX-only；本项目只跑 Linux容器
 import os
 import sqlite3
 from datetime import datetime
@@ -19,17 +20,26 @@ from pathlib import Path
 ORPHAN_TMP_S =2 *3600
 
 
+class BackupBusy(RuntimeError):
+    """另一份备份正持有锁——**不是失败**，是并发重叠时的正常跳过。
+
+    为什么单独一个异常类型：`backup_db()`返回 `None`的语义是「真失败」
+    （写盘错/校验不过），调用方据此发 **P0**。锁被占用如果也走 `None`，
+    部署重叠窗口就会平白发一条「备份失败」P0。这两件事必须分开。
+    """
+
+
 def backup_db(conn, data_dir: Path, keep: int =7, clock=None) -> Path | None:
     """备份到 `data_dir/backups/market-YYYYMMDD.db`；校验失败返回 `None`并发 P0。
 
     **同名 tmp +跨进程互斥**（Codex复核）：临时文件名由日期决定，两个备份
     进程同时跑会写同一个 `.market-YYYYMMDD.db.tmp`，内容交错、`integrity_check`
-    可能照样通过——结果是一份"看着正常、其实混了两个事务"的备份。
+    可能照样通过——结果是一份「看着正常、其实混了两个事务」的备份。
     `APScheduler`的 `max_instances=1`只管**同一个调度器实例**，管不了
-    "旧容器还没退、新容器已经起"的部署重叠窗口。
+    「旧容器还没退、新容器已经起」的部署重叠窗口。
 
-    所以用 `flock`拿一把排他锁：拿不到就说明另一份备份正在跑，返回 `None`
-    （调用方当"没做成"处理），**一个字节都不碰**。
+    所以用 `flock`拿一把排他锁：拿不到就抛 `BackupBusy`（**不是失败**），
+    **一个字节都不碰**。
     """
     data_dir = Path(data_dir)
     out_dir = data_dir / "backups"
@@ -43,11 +53,12 @@ def backup_db(conn, data_dir: Path, keep: int =7, clock=None) -> Path | None:
     # "路径相同但 inode不同"的锁，互斥就失效了。
     with open(out_dir / ".backup.lock", "a+") as lock_fd:
         try:
-            import fcntl
-
             fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            return None #另一份备份正在进行，别碰任何文件
+        # **只把「竞争」当成「并发跳过」**：`flock(LOCK_NB)`在锁被占用时抛
+        # `BlockingIOError`。原来写 `except OSError`会把 `ENOLCK`/`EACCES`/`EIO`
+        # （锁机制本身坏了）一起吃下，于是真故障变成静默跳过——零告警。
+        except BlockingIOError:
+            raise BackupBusy("另一份备份正在进行") from None
         return _backup_locked(conn, out_dir, final, tmp, keep)
 
 
@@ -80,12 +91,12 @@ def prune_orphan_tmp(out_dir: Path, *, max_age_s: float = ORPHAN_TMP_S,
     now: float | None = None) -> list[str]:
     """清掉中断留下的半截备份（`.market-*.db.tmp`及其 `-shm` / `-wal`）。
 
-    **只清"已经不可能有人还在写"的**：默认2小时内的一律保留，
+    **只清「已经不可能有人还在写」的**：默认2小时内的一律保留，
     因为那可能是正在进行的备份。返回被删的文件名，供调用方记录。
 
-    为什么需要它：备份顺序是"写 tmp →校验 →原子改名"，**中途被杀**
+    为什么需要它：备份顺序是「写 tmp →校验 →原子改名」，**中途被杀**
     （部署重启、OOM、`timeout`）就停在 tmp阶段，正式备份不存在、
-    tmp又藏起来——外部只能看到"今天没有备份"，看不出真因。
+    tmp又藏起来——外部只能看到「今天没有备份」，看不出真因。
     """
     import time
 
@@ -103,22 +114,26 @@ def prune_orphan_tmp(out_dir: Path, *, max_age_s: float = ORPHAN_TMP_S,
         except OSError:
             return False
 
+    def _too_young(p: Path) -> bool:
+        """可能正在写——主体和伴生都别动。"""
+        try:
+            return now_ts - p.stat().st_mtime < max_age_s
+        except OSError:
+            return True #读不到状态就当它是新的，不删
+
     # **glob只匹配主体 `.tmp`，不带尾随 `*`**（Codex复核抓到的）：
     #带 `*`时 `-shm` / `-wal`也是独立候选项，各自按自己的 mtime判——
     #主文件还新鲜、伴生文件超过2小时，伴生就会被**单独删掉**，
     #而那份备份其实还在写，删掉 shm等于破坏它。
     for f in sorted(out_dir.glob(".market-*.db.tmp")):
-        try:
-            if now_ts - f.stat().st_mtime < max_age_s:
-                continue #可能正在写，主体和伴生都别动
-        except OSError:
+        if _too_young(f):
             continue
         if not _try_unlink(f):
             continue
         removed.append(f.name)
         #伴生文件**跟着主体走**：主体都删了它们就是孤儿。
-        # SQLite关闭时可能重写 shm，按 mtime判会被当成"新鲜"而漏掉。
-        for ext in ("-shm", "-wal"):
+        # SQLite关闭时可能重写 shm，按 mtime判会被当成「新鲜」而漏掉。
+        for ext in ("-shm", "-wal", "-journal"):
             side = f.with_name(f.name + ext)
             if side.exists() and _try_unlink(side):
                 removed.append(side.name)
@@ -129,6 +144,11 @@ def prune_orphan_tmp(out_dir: Path, *, max_age_s: float = ORPHAN_TMP_S,
         main = side.with_name(side.name.rsplit("-",1)[0])
         if main.exists():
             continue #主体还在，交给第一遍按主体判
+        # **伴生也要 mtime宽限**：原来这一遍对伴生零宽限，主体守2小时、
+        #伴生不守，是不对称的。正常流程虽是「先建主体再产生伴生」，
+        #但一旦出现「伴生已建、主体还没建」的瞬间，零宽限会直接删掉它。
+        if _too_young(side):
+            continue
         if _try_unlink(side):
             removed.append(side.name)
 

@@ -100,7 +100,11 @@ def test_backup_registered_at_2330_with_long_grace(env):
     job = _jobs(env.sched)["backup"]
     fields = {f.name: str(f) for f in job.trigger.fields}
     assert fields["hour"] == "23" and fields["minute"] == "30"
-    assert job.misfire_grace_time == 3600        # 晚一小时开机也要补跑
+    # **不是「重启后补跑」**：APScheduler的 misfire只覆盖「调度器在跑、
+    #但 job被阻塞」的情形；进程在23:30不在，那次备份就**永久丢了**。
+    # （评审实测：now=00:10时 next fire是次日23:30，不补跑。）
+    #兜底靠08:55的陈旧检查 +启动时的检查，不靠这个值。
+    assert job.misfire_grace_time ==3600
 
 
 def test_eod_cleanup_selfcheck_registered(env):

@@ -1,5 +1,52 @@
 ## [Unreleased]
 
+###修复（独立评审 + Codex复核 v0.2.113，四条都成立）
+
+- **锁被占用时返回 `None`，会误发 P0**。[严重]
+ `backup_db()`返回 `None`在 `backup_job`里的语义是「真失败」→发 **P0**。
+而锁被占用是**部署重叠窗口里的正常现象**——评审实测跑出的告警原文是
+ `('backup', '备份失败或完整性校验未通过', 'P0')`。讽刺的是：这把锁加进来
+的前提就是"重叠确实可能发生"，于是一旦真发生，就必然产生一条最高级别假警报。
+ →新增 `BackupBusy`异常，`backup_job`单独接住、只记 warning并 return。
+
+- **`except OSError`太宽，会把"锁机制坏了"当成"别人在跑"**。[严重]
+ `flock(LOCK_NB)`竞争抛的是 `BlockingIOError`；写成 `except OSError`
+会把 `ENOLCK`/`EACCES`/`EIO`一起吞下——`BackupBusy`版本下后果更隐蔽：
+**真故障变成静默跳过、零告警**。
+ →收窄成 `except BlockingIOError`；`import fcntl`也从函数内提到模块顶部
+ （放函数里的 `try`中时 `except OSError`接不住 ImportError）。
+
+- **两条测试是假绿**。[中等]
+① `BACKUP_STALE_H`那条只断言"常量落在区间"，不调函数——评审的存活变异
+ （常量仍29、但函数默认参数写死 `stale_h=36`）**全绿**，真实阈值已退回 bug。
+② `test_busy_backup_does_not_alert_p0`用 `inspect.getsource`文本匹配——评审
+的变异 H（把 `except Exception`挪到 `except BackupBusy`前，子类被父类先接住）
+**照样全绿**，行为已经退回发 P0。
+ →都改成行为测试：构造"最新备份33.4h前"断言真的 `alert`；拿住锁后调真实的
+ `backup_job`、断言 `dispatcher`一条告警都没有。两条都用变异验证会红在断言。
+
+- **伴生文件零宽限，主体却守2小时**。[中等]
+ `prune_orphan_tmp`第二遍清孤儿伴生时不看 mtime，而第一遍对主体守2小时——
+契约不对称。正常流程虽是"先建主体再产生伴生"，但一旦出现"伴生已建、主体
+还没建"的瞬间就会被误删。→第二遍也加 mtime宽限。
+
+- **`misfire_grace_time=3600`并不能让重启后补跑**。[中等]
+测试注释写着"晚一小时开机也要补跑"——**错的**。评审对 APScheduler实测：
+ `now=00:10`时 next fire是次日23:30，不补跑。所以"进程在23:30不在"=那次
+备份永久丢失；而陈旧检查只挂在08:55单次 cron上（`misfire_grace_time=300`），
+容器若恰好那时不在，当天检查也丢。
+ → `startup_recovery`里补一次备份陈旧检查（幂等、只读文件），并更正注释。
+
+- **周末的自检会真去拉行情、发 ntfy、调 LLM**。[中等]
+上一版为了让断档在周末也能发现，把 `self_check_job`改成每天——但
+ `self_check()`本身会 `snapshot`一次行情、探 ntfy、跑一次 `max_tokens=1`
+的 LLM。**为了修一个缺陷而扩大了另一个行为**。
+ →拆开：`backup_health_job`（清半截 +陈旧告警）每天跑；`self_check`恢复
+ mon-fri。
+
+-顺手：`check_backup_freshness`删掉死参数 `keep`（函数体从不使用，
+容易让人以为它管保留份数）。
+
 ## [0.2.113] - 2026-11-21
 
 ###修复（备份并发互斥）

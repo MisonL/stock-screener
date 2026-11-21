@@ -182,7 +182,7 @@ BACKUP_STALE_H = 29
 
 
 def check_backup_freshness(conn, data_dir, now=None, dispatcher=None,
-                           *, keep: int = 7, stale_h: int = BACKUP_STALE_H) -> float | None:
+                           *, stale_h: int = BACKUP_STALE_H) -> float | None:
     """返回最新备份距今的小时数；**超时则告警**。
 
     为什么需要它：备份只有 `misfire_grace_time=3600` 的兜底，部署窗口正好压在

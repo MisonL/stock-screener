@@ -108,38 +108,64 @@ def test_disk_alert_levels_do_not_suppress_each_other(conn):
     assert [lv for _, lv in kinds] == ["P2", "P1", "P0"]
 
 
-def test_single_missed_night_crosses_the_stale_threshold():
-    """**单晚备份中断必须摸到告警阈值**（v0.2.112，评审抓的假绿）。
+def test_single_missed_night_actually_alerts(tmp_path):
+    """**单晚断档必须真的发出告警**（v0.2.114，评审抓的行为级假绿）。
 
-    备份在 23:30 跑，次日 08:55 自检，若昨晚那晚没跑成，age 恰好是
-    **33.4 小时**。我原来设的阈值是 36——单晚断档永远摸不到它，
-    连漏两晚（57.4h）才报警。等于对最常发生的故障完全失明。
+    上一版这条只断言「常量落在(9.42,33.42)之间」——不调用
+    `check_backup_freshness`。评审的存活变异：常量仍是29，但把函数默认参数
+    写死成 `stale_h=36`，于是**真实阈值退回旧 bug、测试全绿**。
+
+    这里直接构造「最新备份是33.4小时前」，调函数，断言真的 `alert`了。
     """
-    from jobs.cleanup import BACKUP_STALE_H
+    import os
+    from datetime import datetime, timezone
 
-    # 正常：23:30 备份 → 次日 08:55 检查 = 9.42h
-    # 单晚断档：最新备份退回前一天的 23:30 → 33.42h
-    normal = 9.42
-    single_night = 24 + normal
-    # 阈值要大于正常间隔（否则天天误报）、小于单晚断档（否则单晚漏报）
-    assert normal < BACKUP_STALE_H < single_night, (
-        f"阈值 {BACKUP_STALE_H}h 没落在（正常 {normal:.1f}h，单晚 {single_night:.1f}h）"
-        "之间：偏大则单晚断档不报警，偏小则天天误报")
+    from jobs.cleanup import check_backup_freshness
+
+    data = tmp_path / "data"
+    (data / "backups").mkdir(parents=True)
+    #11-2023:30的备份，检查时刻是11-2208:55 →33.4h
+    f = data / "backups" / "market-20261120.db"
+    f.write_bytes(b"x")
+    check_at = datetime(2026,11,22,8,55, tzinfo=timezone.utc)
+    ts = check_at.timestamp() -33.42 *3600
+    os.utime(f, (ts, ts))
+
+    calls = []
+
+    class D:
+        def alert(self, kind, text, level="P1"):
+            calls.append((kind, level))
+
+    age = check_backup_freshness(None, data, now=check_at, dispatcher=D())
+
+    assert age is not None and age >33, f"算出来的 age不对：{age}"
+    assert calls and calls[0][0] == "backup_stale", (
+        f"单晚断档（{age:.1f}h）**没有**发出 backup_stale告警：{calls}")
 
 
-def test_self_check_runs_every_day_including_weekends():
-    """**备份陈旧自检不能只在工作日跑**（v0.2.112）。
+def test_recent_backup_does_not_alert(tmp_path):
+    """正常情况（9.4h）不能误报——否则每天都会响。"""
+    import os
+    from datetime import datetime, timezone
 
-    周五 23:30 若被中断，周六 08:55 不跑、周日也不跑，到周一才检查——
-    age 已 80+ 小时，当然会报，但**周末两天没有任何告警窗口**。
-    数据库 7×24 在写，备份检查没有理由跳过周末。
-    """
-    import inspect
-    from jobs import main as jobs_main
+    from jobs.cleanup import check_backup_freshness
 
-    src = inspect.getsource(jobs_main.make_scheduler)
-    idx = src.index('CronTrigger(hour=8, minute=55')
-    line_end = src.index(")", idx)
-    chunk = src[idx:line_end]
-    assert "day_of_week" not in chunk, (
-        f"自检仍限工作日：{chunk} —— 周末断档会没有告警窗口")
+    data = tmp_path / "data"
+    (data / "backups").mkdir(parents=True)
+    f = data / "backups" / "market-20261121.db"
+    f.write_bytes(b"x")
+    check_at = datetime(2026,11,22,8,55, tzinfo=timezone.utc)
+    ts = check_at.timestamp() -9.42 *3600
+    os.utime(f, (ts, ts))
+
+    calls = []
+
+    class D:
+        def alert(self, kind, text, level="P1"):
+            calls.append((kind, level))
+
+    age = check_backup_freshness(None, data, now=check_at, dispatcher=D())
+
+    assert age is not None and age <10
+    assert calls == [], f"备份很新却报警：{calls}"

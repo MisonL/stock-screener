@@ -347,10 +347,10 @@ def _image_id(host: str) -> str:
     验收要比对容器跑的是不是这次构建出来的镜像——只查 Names/Status
     会被「build静默失败、up没重建」骗过去。
     """
-    cmd = "docker image inspect --format '{{{{.Id}}}}' stock-screener:latest || true"
+    cmd = "docker image inspect --format '{{.Id}}' stock-screener:latest || true"
     out = _capture(["ssh", "-o", "BatchMode=yes", host, cmd])
     for line in out.splitlines():
-     if line.startswith("sha256:"):
+        if line.startswith("sha256:"):
             return line.strip()
     return ""
 

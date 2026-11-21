@@ -13,6 +13,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import deploy
 
+twoId = "{{.Id}}"
+fourId = "{{{{"
+
 
 def _noop_archive(dest):
     """造一个合法的空 tar.gz（main()会 tarfile.open它数文件）。"""
@@ -130,3 +133,54 @@ def test_success_records_the_good_image(monkeypatch, capsys):
     assert code ==0
     assert "record:sha256:new" in calls, f"没记录好镜像：{calls}"
     assert "rollback" not in calls
+
+
+def test_image_id_uses_a_valid_docker_format(monkeypatch):
+    """**docker --format只能是两个花括号**。
+
+    `{{{{.Id}}}}`会被 docker当成非法 format，命令失败返回空串，
+    于是 `if image_id:`恒假——**marker永远写不进去**，
+    回滚点退回「当前 latest」的老逻辑（等于没修）。
+
+    pyflakes查不出这种错（在字符串里），必须靠测试钉。
+    """
+    seen = []
+
+    def cap(cmd):
+        seen.append(" ".join(cmd))
+        return "sha256:abc123"
+
+    monkeypatch.setattr(deploy, "_capture", cap)
+    got = deploy._image_id("h")
+
+    assert got == "sha256:abc123", f"没解析出镜像ID：{got!r}"
+    assert twoId in seen[0], f"docker format不是两个花括号：{seen[0]}"
+    assert fourId not in seen[0], "用了四个花括号——docker会拒绝"
+
+
+def test_image_id_returns_empty_when_docker_fails(monkeypatch):
+    """取不到镜像 ID时返回空串（调用方据此跳过比对）。"""
+    monkeypatch.setattr(deploy, "_capture", lambda cmd: "Error: No such image")
+    assert deploy._image_id("h") == ""
+
+
+def test_snapshot_prefers_the_recorded_good_image(monkeypatch):
+    """快照必须**优先**用 `.last_good_image`，而不是当前 latest。
+
+    若上次回滚失败，latest停在坏镜像上；再从 latest快照，
+    就把已知坏版本变成了回滚点，之后每次都「成功回滚」到起不来的版本。
+    """
+    seen = []
+
+    def cap(cmd):
+        seen.append(" ".join(cmd))
+        return "SS_SNAPSHOT=MARKER"
+
+    monkeypatch.setattr(deploy, "_capture", cap)
+    mode = deploy.snapshot_image("h", "/srv/app")
+
+    assert mode == "MARKER"
+    cmd = seen[0]
+    assert ".last_good_image" in cmd, "没用 marker文件"
+    assert cmd.index(".last_good_image") < cmd.index("stock-screener:latest"), (
+         "先用了 latest——坏镜像会被快照成回滚点")

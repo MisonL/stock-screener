@@ -1,5 +1,26 @@
 ## [Unreleased]
 
+###修复（0.2.117的两个洞：marker没写成、format转义错）
+
+部署0.2.117后核对现场，发现两处**功能没生效**：
+
+- **`_image_id`的 docker format多写了两层花括号**。[严重]
+ `{{{{.Id}}}}`不是合法 format，docker直接报错返回空串 → `if image_id:`
+恒假 → **`.last_good_image`从来没被写过**，快照一直是"当前 latest"
+的老逻辑。等于 M3（回滚点被坏镜像污染）**根本没修上**，
+却因为日志里没报错而看不出来。
+ →改成 `{{.Id}}`。pyflakes查不出这类错（在字符串里），
+补了两条测试钉住：合法 format +取不到时返回空串。
+
+- **快照优先用 marker这条路径没有测试覆盖**。[中等]
+补 `test_snapshot_prefers_the_recorded_good_image`：断言命令里
+ `.last_good_image`出现在 `stock-screener:latest`之前——
+顺序反了就会把坏镜像快照成回滚点。
+
+实测（81.4）：`_image_id`现在能返回
+ `sha256:b39ac247…`，`record_good_image`写入成功，
+ `/home/qdm/stock-screener/.last_good_image`已存在。
+
 ## [0.2.117] - 2026-11-21
 
 ###修复（v0.2.116的验收门禁其实是空的）

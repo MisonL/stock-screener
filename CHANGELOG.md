@@ -1,5 +1,55 @@
 ## [Unreleased]
 
+###修复（v0.2.116的验收门禁其实是空的）
+
+Codex与独立评审同时指出：v0.2.116那道门禁**看起来在验收，实际上什么也没验。**
+
+- **致命：等不到任何东西**。[严重]
+原逻辑「三个服务都 `running`就 break」，而 `up -d`返回时容器状态就是
+ `Up0 seconds`——**第一轮就成立，0.8秒返回 OK**，`sleep3`从未执行。
+评审在81.4上实测：`real0m0.807s`。部署后30秒才崩的容器、
+healthcheck不通过、配置装配错误，**一个都等不到**。`--since4m`
+因此既不误报也无用处。
+
+→改成四段式：**先无条件 settle20秒**（期间持续查
+ `Restarting`/`unhealthy`）→等 `running` → **等 healthcheck变 `healthy`**
+ （`start_period`300秒的 jobs也在内）→最后扫日志。
+实测同一脚本：`real0m21.7s`，手工 `docker stop jobs`后0.24秒即
+ `SS_VERIFY=FAIL:容器已退出`。
+
+- **`Exited`判据扫到了不该扫的容器**。[严重]
+`docker ps -a --filter name=stock-screener-`把 `ntfy`/`cloudflared`也扫进来，
+而部署只重建 `api jobs agent`。用户为省内存手工 `stop ntfy`之后，
+**每个版本都会被判失败并自动回滚**。
+ → `Restarting`/`unhealthy`对所有容器算（硬故障），`Exited`只对本次
+重建的服务算。
+
+- **「没验成」被当成「部署坏了」**。[严重]
+ssh抖动、脚本异常会返回空输出——原实现把它和"确认失败"一样**自动回滚**。
+一次网络抖动就会把成功的部署切回旧镜像并 recreate生产容器。
+ →区分 `FAIL:`与 `UNKNOWN:`，`UNKNOWN`只报警、**不自动回滚**。
+
+- **从不校验"跑的到底是不是新镜像"**。[中等]
+只查 `Names`/`Status` → build静默失败、`up`没 recreate都会判 OK。
+ →构建后取镜像 ID，验收时逐个 `docker inspect .Image`比对。
+
+- **回滚点可能被坏镜像污染**。[中等]
+原来从"当前 latest"快照 rollback。若上次回滚失败，`latest`停在坏镜像上，
+下一次快照就把**已知坏版本**变成回滚点。
+ →目标机记 `.last_good_image`（验收通过才写），快照优先用它。
+
+-回滚后重新验收一次（回滚本身也可能失败）；回滚失败区分
+ `NO_IMAGE`/`TAG_FAILED`/`UP_FAILED`；`_capture`加600秒超时。
+
+**测试**：6条，其中三条变异验证会红在断言——把 `settle`去掉、
+把「整行等于 `SS_VERIFY=OK`」放宽成"包含"、把 `UNKNOWN`也回滚。
+补的两条用例 `prefix SS_VERIFY=OK` / `SS_VERIFY=FAIL:上次是 SS_VERIFY=OK`
+专堵评审发现的那个漏洞（原四个用例区分不出 `in`与 `startswith`）。
+
+**顺带**：这轮写 `MARKER_TAGS`时又漏了定义，**pyflakes门禁当场报出
+ `deploy.py:202: undefined name 'MARKER_TAGS'`**——v0.2.115加的那道闸
+在这一轮抓到了第一个真实的同类错误。
+
 ## [0.2.116] - 2026-11-21
 
 ###新增（部署后自动验收 +失败回滚）

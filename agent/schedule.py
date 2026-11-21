@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from core.clock import SH  # noqa: F401 —— `Deps` 组装点需要 `SH`
+from core.clock import SH
 
 #: 心跳节奏的**默认值**。真实来源是 `config/agent.yaml::heartbeat`，
 #: 由 `next_heartbeat(now, hb)` 的 `hb` 参数传入；这些常量只是"没传就用它们"，

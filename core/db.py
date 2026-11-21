@@ -83,18 +83,6 @@ def migrate(conn: sqlite3.Connection) -> list[str]:
             conn.rollback()
             raise
     return done
-
-
-def connect_lite(path: Path | None = None, readonly: bool = False) -> sqlite3.Connection:
-    """只建连接、设 PRAGMA，**不跑 migrate**。
-
-    api 的每次查询都走 `connect()` 会连 `BEGIN IMMEDIATE` 一起抢写锁：前端 3 秒轮询
-    正好撞上 jobs 的写事务时，`busy_timeout` 耗尽后直接 500 `database is locked`。
-    迁移是一次性的事，由入口（api/jobs/agent 启动、make_conn_factory）负责。
-    """
-    return connect(path, readonly=readonly)
-
-
 def make_conn_factory(path: Path | None = None, migrate_each: bool = True) -> Callable[[], sqlite3.Connection]:
     """返回「每次调用都建一个新连接并迁移」的闭包。
 

@@ -30,7 +30,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from jobs.backup import backup_db
-from jobs.cleanup import cleanup
+from jobs.cleanup import check_disk, cleanup
 from jobs.intraday import IntradayTick
 from jobs.snapshot import SnapshotLoops, calls_by_scope
 from core.clock import SH, SystemClock, TradingCalendar
@@ -236,6 +236,21 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
         with _write_lock(loops):
             cleanup(conn, clock, dispatcher=dispatcher)
 
+    def disk_job():
+        """每 10 分钟查一次宿主机磁盘水位。
+
+        **不看交易日、不看盘中窗口**：2026-11-21 本机那次是夜里到早上涨满的，
+        而原来的磁盘检查挂在每日 16:00 的 cleanup 里——一天只查一次，
+        Docker 虚拟磁盘从 70% 涨到 100% 只花了几个小时，等 cleanup 跑起来时
+        PostgreSQL 已经写不进 `postmaster.pid` 了。
+
+        只读 `shutil.disk_usage`，不写库，所以**不需要 `_write_lock`**。
+        """
+        try:
+            check_disk(conn, dispatcher=dispatcher)
+        except Exception:                          # noqa: BLE001 —— 巡检失败不能拖死调度器
+            log.warning("磁盘巡检失败", exc_info=True)
+
     def backup_job():
         try:
             path = backup_db(conn, Path(data_dir), clock=clock)
@@ -337,6 +352,8 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
                   id="eod", **JOB_DEFAULTS)
     sched.add_job(cleanup_job, CronTrigger(hour=16, minute=0, day_of_week="mon-fri", timezone=SH),
                   id="cleanup", **JOB_DEFAULTS)
+    # 磁盘巡检**每 10 分钟**，与交易日/盘中窗口无关（磁盘不看开市）
+    sched.add_job(disk_job, "interval", minutes=10, id="disk", **JOB_DEFAULTS)
     # 15:30 归档 `agent_turn`（90 天前移到 archive 表，不删）。**不注册就永远不跑**：
     # 批1 的 cleanup 不管这张表，回合表会无限增长
     sched.add_job(archive_job, CronTrigger(hour=15, minute=30, day_of_week="mon-fri",
@@ -655,7 +672,7 @@ def startup_recovery(cfg, conn, clock, *, reg, tick=None, dispatcher=None, loops
     today_ymd = _ymd(today)
     if cal.is_trading_day(today_ymd):
         close_time = cal.close_time(today_ymd) or str(cfg.markets.session.close_time)
-        from jobs.eod import _minutes, CLOSE_BUFFER_MIN, EodReport  # noqa: F401
+        from jobs.eod import _minutes, CLOSE_BUFFER_MIN
 
         if _minutes(clock.now().time()) >= _minutes(close_time) + CLOSE_BUFFER_MIN:
             marker = conn.execute("SELECT 1 FROM job_state WHERE name = ?",

@@ -29,6 +29,10 @@ def ex_ref(prev_close: float, cash: float, bonus: float, tran: float) -> float:
 
 
 def day_factor(prev_close: float, action: CorpAction) -> float:
+    """单日复权因子。**生产路径不直接调它**（`rebuild_adj` 内联了同样算法），
+    但 `tests/core/test_adjust.py` 用它逐条校验复权数学——留着当参考实现，
+    不要因为"生产零调用"就删掉（会连带丢掉那组测试覆盖）。
+    """
     """单一事件的日因子。快照反推的事件直接用记录下来的 `implied_factor`。
 
     `snapshot_implied` 的 cash/bonus/tran 全是 0，走公式路径恒得 1.0——不显式保存
@@ -184,6 +188,9 @@ def _rebuild_one(conn, code: str) -> int:
 
 
 def factors_at(conn, code: str, date: int) -> tuple[float, float]:
+    """任意日期的累计因子。**同上**：生产不调，但测试拿它校验
+    `rebuild_adj` 写库的结果是否自洽。删掉等于删掉那组断言。
+    """
     """该日累计因子。**读不到就抛 `KeyError`，不回落 (1, 1)**（§6.1：因子只读 adj）。
 
     静默回落会让「桥接 raw 价」拿到 1.0，箱顶价直接写成复权价——错得很安静。

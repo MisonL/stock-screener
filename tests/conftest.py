@@ -648,3 +648,36 @@ def _no_real_network(monkeypatch):
         return real_connect(self, address, *a, **kw)
 
     monkeypatch.setattr(socket.socket, "connect", guard, raising=False)
+
+
+# ---- 临时目录隔离：**所有** `tempfile.mkdtemp()` 都落进 pytest 的 tmp_path ----
+#
+# 2026-11-21 事故：本机的长期测试容器 `ss-dev-run`（`sleep infinity`，从不删除）
+# 可写层涨到 **230 GB**，撑爆 Docker Desktop 虚拟磁盘，连带 PostgreSQL 起不来
+# （`could not write lock file "postmaster.pid": No space left on device`）。
+#
+# 直接原因有两条，这条 fixture 治的是第一条：
+#   1. `tests/chat/test_session.py` 有 12 处、`tests/jobs/test_main_scheduler.py`
+#      有 1 处直接 `tempfile.mkdtemp()`，**从不清理**——每次跑测试都在 /tmp
+#      里留十几个目录和 SQLite 文件；
+#   2. 容器本身长期不删（`docker run --rm` 会收拾，`sleep infinity` 的守护容器不会）。
+#
+# 用 autouse + 猴补 `tempfile.mkdtemp`，而不是逐个改调用点：以后新写的测试
+# 也会自动被约束，不用靠人记得。pytest 的 `tmp_path` 会按用例清理，
+# 整体再由 `--basetemp`（见 Makefile 的 `--tmpfs /tmp`）兜底。
+@pytest.fixture(autouse=True)
+def _isolate_mkdtemp(tmp_path, monkeypatch):
+    """把 `tempfile.mkdtemp()` 重定向到本用例的 `tmp_path` 下。"""
+    import itertools
+    import tempfile as _tf
+
+    counter = itertools.count()
+
+    def _mkdtemp(suffix: str | None = None, prefix: str | None = None,
+                 dir: str | None = None) -> str:
+        target = tmp_path / f"mk{next(counter)}"
+        target.mkdir(parents=True, exist_ok=True)
+        return str(target)
+
+    monkeypatch.setattr(_tf, "mkdtemp", _mkdtemp)
+    yield

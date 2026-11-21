@@ -270,11 +270,11 @@ def test_two_concurrent_asks_do_not_share_tool_returns(caplog):
     from llm.budget import Budget as _B
     from core.clock import FixedClock as _FC
 
-    conn = _connect(Path(tempfile.mkdtemp()) / "c.db") if False else None
+    conn = _connect(Path(tempfile.mkdtemp(prefix="ss-chat-")) / "c.db") if False else None
     # 复用本模块的 fixture 形状
     import tempfile
 
-    conn = _connect(Path(tempfile.mkdtemp()) / "c.db")
+    conn = _connect(Path(tempfile.mkdtemp(prefix="ss-chat-")) / "c.db")
     _migrate(conn)
     cfg = _cfg(Path("config"))
     clk = _FC(T0)
@@ -317,7 +317,7 @@ def test_programming_errors_are_not_masked_as_llm_down():
     from core.config import load_config as _cfg
     from core.db import connect as _connect, migrate as _migrate
 
-    conn = _connect(Path(tempfile.mkdtemp()) / "c.db")
+    conn = _connect(Path(tempfile.mkdtemp(prefix="ss-chat-")) / "c.db")
     _migrate(conn)
     cfg = _cfg(Path("config"))
 
@@ -354,7 +354,7 @@ def test_ntfy_failure_closes_pending_and_changes_answer():
     from core.config import load_config as _cfg
     from core.db import connect as _connect, migrate as _migrate
 
-    conn = _connect(Path(tempfile.mkdtemp()) / "c.db")
+    conn = _connect(Path(tempfile.mkdtemp(prefix="ss-chat-")) / "c.db")
     _migrate(conn)
     cfg = _cfg(Path("config"))
 
@@ -401,7 +401,7 @@ def test_concurrent_asks_leak_returns_to_later_request():
     from core.config import load_config as _cfg
     from core.db import connect as _connect, migrate as _migrate
 
-    conn = _connect(Path(tempfile.mkdtemp()) / "c.db")
+    conn = _connect(Path(tempfile.mkdtemp(prefix="ss-chat-")) / "c.db")
     _migrate(conn)
     cfg = _cfg(Path("config"))
 
@@ -452,7 +452,7 @@ def test_chat_deducts_non_refundable_before_each_request():
     from core.config import load_config as _cfg
     from core.db import connect as _connect, migrate as _migrate
 
-    conn = _connect(Path(tempfile.mkdtemp()) / "c.db")
+    conn = _connect(Path(tempfile.mkdtemp(prefix="ss-chat-")) / "c.db")
     _migrate(conn)
     cfg = _cfg(Path("config"))
     seen = {}
@@ -703,11 +703,11 @@ def test_two_concurrent_asks_do_not_share_tool_returns(caplog):
     from llm.budget import Budget as _B
     from core.clock import FixedClock as _FC
 
-    conn = _connect(Path(tempfile.mkdtemp()) / "c.db") if False else None
+    conn = _connect(Path(tempfile.mkdtemp(prefix="ss-chat-")) / "c.db") if False else None
     # 复用本模块的 fixture 形状
     import tempfile
 
-    conn = _connect(Path(tempfile.mkdtemp()) / "c.db")
+    conn = _connect(Path(tempfile.mkdtemp(prefix="ss-chat-")) / "c.db")
     _migrate(conn)
     cfg = _cfg(Path("config"))
     clk = _FC(T0)
@@ -750,7 +750,7 @@ def test_programming_errors_are_not_masked_as_llm_down():
     from core.config import load_config as _cfg
     from core.db import connect as _connect, migrate as _migrate
 
-    conn = _connect(Path(tempfile.mkdtemp()) / "c.db")
+    conn = _connect(Path(tempfile.mkdtemp(prefix="ss-chat-")) / "c.db")
     _migrate(conn)
     cfg = _cfg(Path("config"))
 
@@ -787,7 +787,7 @@ def test_ntfy_failure_closes_pending_and_changes_answer():
     from core.config import load_config as _cfg
     from core.db import connect as _connect, migrate as _migrate
 
-    conn = _connect(Path(tempfile.mkdtemp()) / "c.db")
+    conn = _connect(Path(tempfile.mkdtemp(prefix="ss-chat-")) / "c.db")
     _migrate(conn)
     cfg = _cfg(Path("config"))
 
@@ -834,7 +834,7 @@ def test_concurrent_asks_leak_returns_to_later_request():
     from core.config import load_config as _cfg
     from core.db import connect as _connect, migrate as _migrate
 
-    conn = _connect(Path(tempfile.mkdtemp()) / "c.db")
+    conn = _connect(Path(tempfile.mkdtemp(prefix="ss-chat-")) / "c.db")
     _migrate(conn)
     cfg = _cfg(Path("config"))
 
@@ -886,7 +886,7 @@ def test_budget_exceeded_falls_back_not_raises():
     from core.config import load_config as _cfg
     from core.db import connect as _connect, migrate as _migrate
 
-    conn = _connect(Path(tempfile.mkdtemp()) / "b.db")
+    conn = _connect(Path(tempfile.mkdtemp(prefix="ss-chat-")) / "b.db")
     _migrate(conn)
     cfg = _cfg(Path("config"))
 

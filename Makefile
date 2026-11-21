@@ -7,9 +7,14 @@ NET ?= ss-test-$$$$
 
 # 测试一律在 dev 镜像里跑：生产是 3.12 + TA-Lib，宿主机 Python 不参与。
 # 用 $$PWD 而不是 $PWD —— 后者会被 make 展开成 $P + 字面 WD，挂载成空卷。
+# **`--tmpfs /tmp` 是 2026-11-21 事故的防线**：长期测试容器的 /tmp 里堆了
+# 33 万个变更路径、可写层涨到 230 GB，撑爆 Docker 虚拟磁盘。
+# 挂成 tmpfs 后，测试写的任何临时文件**随容器销毁而消失**，且容量被
+# `size=` 封顶——再怎么写也撑不爆宿主机磁盘。
+# `--rm` 保证容器不残留（长期 `sleep infinity` 的守护容器不享受这个清理）。
 test:
 	docker build --target dev -t $(IMAGE) -f deploy/Dockerfile .
-	docker run --rm -v "$$PWD":/app -w /app $(IMAGE) pytest -q
+	docker run --rm --tmpfs /tmp:rw,size=2g -v "$$PWD":/app -w /app $(IMAGE) pytest -q
 
 # 测试进程本身也在容器里，必须与 ntfy 同网络才解析得到容器名；不发布任何端口。
 test-integration:

@@ -39,8 +39,3 @@ class SnapshotCache:
                 return item
         return None
 
-    def invalidate(self, scope: str | None = None) -> None:
-        if scope is None:
-            self._cache.clear()
-        else:
-            self._cache.pop(scope, None)

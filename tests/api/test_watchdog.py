@@ -171,16 +171,6 @@ def test_agent_stub_sleeps_on_non_trading_day(conn):
     assert should_wake(conn, datetime(2026, 10, 30, 10, 0, tzinfo=SH)) is True
 
 
-def test_next_session_start():
-    from agent.main import next_session_start
-
-    now = datetime(2026, 10, 30, 16, 0, tzinfo=SH)
-    nxt = next_session_start(now)
-    assert nxt.strftime("%m%d%H%M") == "10310915"
-    same_day = next_session_start(datetime(2026, 10, 30, 8, 0, tzinfo=SH))
-    assert same_day.strftime("%d%H%M") == "300915"
-
-
 def test_heartbeat_thread_writes_every_30s(tmp_path):
     from agent.heartbeat import Heartbeat
 

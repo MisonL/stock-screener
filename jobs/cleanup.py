@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import shutil
 import sqlite3
+from pathlib import Path
 from datetime import timedelta
 
 log = logging.getLogger(__name__)
@@ -114,11 +115,45 @@ def cleanup(conn, clock, dispatcher=None, data_dir: str = "/app/data") -> dict[s
     used = disk_used_pct(data_dir)
     out["disk_used_pct"] = int(used)
     if dispatcher is not None:
-        if used > 95:
-            dispatcher.alert("disk", f"磁盘水位 {used:.0f}%", "P0")
-        elif used > 85:
-            dispatcher.alert("disk", f"磁盘水位 {used:.0f}%", "P1")
+        _alert_disk(dispatcher, used)
     return out
+
+
+#: 磁盘水位阈值。**分三档**：2026-11-21 那次本机事故里，
+#: 原来的 85/95 两档在"一天只查一次"的前提下等于没有预警——
+#: Docker 虚拟磁盘从 70% 涨到 100% 只用了几个小时，等到 16:00 的 cleanup
+#: 跑起来时 PostgreSQL 已经起不来了。
+#:
+#: 现在由 `jobs/main.py` 每 10 分钟查一次（与交易日无关，磁盘不看开市），
+#: 75% 就提前喊，留出清理时间。
+DISK_WARN_PCT = 75.0
+DISK_HIGH_PCT = 85.0
+DISK_CRIT_PCT = 95.0
+
+
+def _alert_disk(dispatcher, used: float) -> None:
+    """按水位发告警。同 kind 30 分钟去重由 `Dispatcher.alert` 保证。"""
+    if used >= DISK_CRIT_PCT:
+        dispatcher.alert("disk", f"磁盘水位 {used:.0f}%（{DISK_CRIT_PCT:.0f}% 以上，随时可能写不进）", "P0")
+    elif used >= DISK_HIGH_PCT:
+        dispatcher.alert("disk", f"磁盘水位 {used:.0f}%（{DISK_HIGH_PCT:.0f}% 以上）", "P1")
+    elif used >= DISK_WARN_PCT:
+        dispatcher.alert("disk", f"磁盘水位 {used:.0f}%（{DISK_WARN_PCT:.0f}% 以上，建议清理）", "P2")
+
+
+def check_disk(conn, dispatcher=None, path: str | None = None) -> float:
+    """**独立于每日 cleanup 的磁盘巡检**（每 10 分钟一次）。
+
+    监控的是**宿主机根分区**而不是只看 `/app/data`：容器里 `df /` 看到的就是
+    宿主机文件系统（Docker 的 `/var/lib/docker` 也在上面），所以 Docker 自身的
+    可写层膨胀也会被算进来——2026-11-21 那次就是这么被撑爆的。
+
+    返回占用百分比，供调用方记录。
+    """
+    used = disk_used_pct(path or ("/" if Path("/app/data").exists() else "."))
+    if dispatcher is not None:
+        _alert_disk(dispatcher, used)
+    return used
 
 
 def disk_used_pct(path: str) -> float:

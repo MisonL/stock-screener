@@ -1,5 +1,34 @@
 ## [Unreleased]
 
+### 清理（死代码，审计清单里的低危项）
+
+- **`core/db.py::connect_lite()`**：零调用。`api/main.py` 走的是
+  `make_conn_factory(migrate_each=False)`，其内部仍 `connect()`——
+  这个"只建连接不 migrate"的独立入口是重复品。
+
+- **`core/snapcache.py::invalidate()`**：零调用（连测试都没有）。缓存按 `as_of` 自失效。
+
+- **`agent/main.py::next_session_start()`** + 它的孤儿测试：零生产调用
+  （真用的是 `in_session()` / `should_wake()`）。
+
+- **`agent/push.py` 里 `ttl_h = getattr(...)`**：赋值后从不使用，下一行自己重算 `ttl`。
+
+- **`jobs/main.py` 的死导入 `EodReport`**：函数体里一次都没用，`# noqa: F401` 把它盖住了。
+
+- **`agent/schedule.py` 的误导性 `# noqa: F401`**：`SH` 在 `:127` 真被用了，
+  注释却说"`Deps` 组装点需要"，让 `SH` 看起来是"已授权未使用"。
+
+**两个刻意留下的**（并补了说明，免得下次又被当死代码删掉）：
+
+- `core/adjust.py::day_factor()` / `factors_at()`：生产不调（`rebuild_adj` 内联了
+  同样算法），但 `tests/core/test_adjust.py` 用它们逐条校验复权数学——
+  删掉等于删掉那组断言。
+- `core/db.py::write_retry()`：**确实没有生产调用者**，而模块 docstring 写着
+  "写事务重试"。这是一处**已知缺口**：`notify/dispatcher.py` 的 `BEGIN IMMEDIATE`
+  是裸调用，撞锁时靠 `busy_timeout=5000` 兜着，兜不住就抛。
+  接线要重构那段事务，风险大于收益，留待单独一轮——这里写明是为了
+  不让"文档说有重试"继续误导。
+
 ## [0.2.107] - 2026-11-21
 
 ### 修复

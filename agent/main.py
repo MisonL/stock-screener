@@ -98,14 +98,6 @@ def shadow_enabled(cfg) -> bool:
 def heartbeat_service() -> str:
     """心跳服务名：`HEARTBEAT_SERVICE` 覆盖，缺省 `agent`（RUNBOOK §11 演练用）。"""
     return (os.environ.get("HEARTBEAT_SERVICE") or "").strip() or HEARTBEAT_SERVICE_DEFAULT
-
-
-def next_session_start(now: datetime) -> datetime:
-    base = now.astimezone(SH)
-    target = base.replace(hour=9, minute=15, second=0, microsecond=0)
-    return target if target > base else target + timedelta(days=1)
-
-
 def in_session(now: datetime) -> bool:
     """盘中时段。**午休（11:30–13:00）不算**：11:30–13:00 与 15:05 后都休眠到下一个
     时段起点，否则午休期间每 2 秒白跑一次主循环（每轮都要查库、判闹钟、判开盘回合）。"""

@@ -29,6 +29,12 @@ COPY web/ ./
 RUN npm run build
 
 FROM base AS dev
+# **dev 镜像必须带 git**：`tests/test_version.py`、`test_release_script.py`、
+# `test_scan_secrets.py` 都要读 git 历史/tag。缺 git 时这些测试不是跳过而是
+# 报 `env: 'git': Permission denied` 之类的假红（2026-11-21 在 81.4 上实测）。
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git \
+ && rm -rf /var/lib/apt/lists/*
 COPY requirements-dev.txt ./
 RUN pip install -r requirements-dev.txt
 

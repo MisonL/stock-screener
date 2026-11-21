@@ -1604,7 +1604,7 @@ def test_eod_catchup_does_not_run_inside_the_write_lock():
     import tempfile
     from pathlib import Path as _Path
 
-    tmp = _Path(tempfile.mkdtemp())
+    tmp = _Path(tempfile.mkdtemp(prefix="ss-sched-"))
     conn = connect(tmp / "e.db")
     migrate(conn)
 

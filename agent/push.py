@@ -321,7 +321,6 @@ class AgentPusher:
             # 也不能把回合标成 pending：演练里没人会点这张卡，标了就是永久待办
             return None
         host = getattr(self.cfg.notify, "public_host", None) or "localhost"
-        ttl_h = getattr(getattr(self.cfg.agent, "pending_action_ttl_h", None), "__int__", None)
         ttl = int(getattr(self.cfg.agent, "pending_action_ttl_h", 24) or 24)
         exp_ts = int(self.clock.now().timestamp()) + ttl * 3600
         desc = action_desc(pending_action, reason)

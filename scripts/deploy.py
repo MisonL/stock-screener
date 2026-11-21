@@ -179,6 +179,94 @@ def build_archive(dest: Path) -> None:
         raise SystemExit(f"git archive 失败：{proc.stderr.decode(errors='replace')}")
 
 
+def snapshot_image(host: str) -> None:
+    """构建前把当前在跑的镜像存成 rollback标签。
+
+    没有这一步就无法回滚：`compose build`会直接覆盖 `stock-screener:latest`，
+    旧镜像被新构建取代后，容器引用的还是同一个 tag，等于把退路也一起删了。
+    """
+    cmd = (
+        "docker image inspect stock-screener:latest >/dev/null 2>&1 && "
+        "docker tag stock-screener:latest stock-screener:rollback && "
+        "echo SS_SNAPSHOT=OK || echo SS_SNAPSHOT=NONE")
+    _run(["ssh", "-o", "BatchMode=yes", host, cmd])
+
+
+def verify_script(services: str, wait_s: int) -> str:
+    """远端验收脚本：容器稳定 +启动日志无 traceback。
+
+    只认 `SS_VERIFY=OK`一行——**别的都算失败**，包括脚本自己出错。
+    """
+    svc = " ".join(f"stock-screener-{x.strip()}-1" for x in services.split() if x.strip())
+    return f'''set -u
+    deadline=$(( $(date +%s) + {wait_s} ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        #有容器在重启/退出/不健康 →立刻判失败，不必等满
+        bad=$(docker ps -a --filter 'name=stock-screener-' \
+            --format '{{{{.Names}}}} {{{{.Status}}}}' \
+            | grep -E 'Restarting|Exited|unhealthy' || true)
+        if [ -n "$bad" ]; then echo "SS_VERIFY=FAIL:容器异常 $bad"; exit 0; fi
+        ok=1
+        for c in {svc}; do
+            docker ps --filter "name=$c" --filter status=running \
+                --format '{{{{.Names}}}}' | grep -qx "$c" || ok=0
+        done
+        if [ "$ok" = "1" ]; then break; fi
+        sleep 3
+    done
+    for c in {svc}; do
+        docker ps --filter "name=$c" --filter status=running \
+            --format '{{{{.Names}}}}' | grep -qx "$c" \
+            || {{ echo "SS_VERIFY=FAIL:容器未运行 $c"; exit 0; }}
+    done
+    # **扫启动日志里的 traceback**：容器重启后可能短暂显示 Up，
+    #真正判据是它有没有在异常里打滚。--since 4m覆盖这次重启。
+    for c in {svc}; do
+        tb=$(docker logs --since 4m "$c" 2>&1 \
+            | grep -c 'Traceback (most recent call last)' || true)
+        if [ "${{tb:-0}}" -gt 0 ]; then
+            detail=$(docker logs --since 4m "$c" 2>&1 \
+                | grep -A2 'Traceback (most recent call last)' | head -3 | tr '\\n' ' ')
+            echo "SS_VERIFY=FAIL:$c启动异常 $detail"; exit 0
+        fi
+    done
+    echo SS_VERIFY=OK'''
+
+
+def rollback(host: str, target: str, services: str) -> bool:
+    """回退到 `stock-screener:rollback`；返回是否回退成功。"""
+    compose = "docker compose -f deploy/docker-compose.yml --project-directory . "
+    body = (
+        "set -e; cd " + target
+        + " && docker image inspect stock-screener:rollback >/dev/null 2>&1 || "
+        + "{ echo SS_ROLLBACK=NONE; exit 0; }; "
+        + "docker tag stock-screener:rollback stock-screener:latest && "
+        + compose
+        + "up -d --force-recreate " + services
+        + " >/dev/null 2>&1 && echo SS_ROLLBACK=OK"
+    )
+    out = _capture(["ssh", "-o", "BatchMode=yes", host, "bash -c " + _sh_quote(body)])
+    return "SS_ROLLBACK=OK" in out
+
+
+def verify_deployment(host: str, services: str, wait_s: int) -> str:
+    """返回 "OK"或失败原因。**只有明确见到 OK才算成功**。"""
+    out = _capture(["ssh", "-o", "BatchMode=yes", host,
+        "bash -c " + _sh_quote(verify_script(services, wait_s))])
+    for line in out.splitlines():
+        if line.startswith("SS_VERIFY=OK"):
+            return "OK"
+        if line.startswith("SS_VERIFY=FAIL:"):
+            return line[len("SS_VERIFY=FAIL:"):].strip() or "未知原因"
+    return "验收脚本没有给出结论（ssh失败或脚本异常）"
+
+
+def _capture(cmd: list[str]) -> str:
+    """跑命令并取输出（失败也返回已拿到的部分，交给调用方判定）。"""
+    proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    return (proc.stdout or "") + (proc.stderr or "")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="部署已提交的内容到 VM")
     ap.add_argument("--host", default=DEFAULT_HOST)
@@ -188,6 +276,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="允许脏工作区（内容仍只取 HEAD）")
     ap.add_argument("--services", default="api jobs agent",
                     help="要 --force-recreate 的服务")
+    ap.add_argument("--verify-wait", type=int, default=90,
+ help="部署后最多等多少秒让容器稳定")
     args = ap.parse_args(argv)
 
     check_clean(allow_dirty=args.allow_dirty)
@@ -229,6 +319,9 @@ def main(argv: list[str] | None = None) -> int:
     # 被当成成功，然后拿**旧镜像**重建容器并报告"已重启"——故障被完全掩盖。
     # 用 `bash -c 'set -o pipefail; …'`：SSH 的登录 shell 可能是 dash，
     # 直接 `set -o pipefail` 会报 `Illegal option -o pipefail` 并整个中止。
+    # **先给当前镜像打 rollback标签**：新构建会直接覆盖 latest，
+    #没有这一步就没得回滚。
+    snapshot_image(args.host)
     body = (f"set -o pipefail; cd {args.dir} && "
             f"{compose}build api 2>&1 | tail -1 && "
             f"{compose}up -d --force-recreate {args.services} 2>&1 | tail -3")
@@ -238,9 +331,23 @@ def main(argv: list[str] | None = None) -> int:
     # 仍用旧值，运维会以为新值已经生效（v0.2.71→v0.2.72 的真实事故）。
     _run(["ssh", "-o", "BatchMode=yes", args.host,
           "bash -c " + _sh_quote(config_drift_script(args.dir))])
-    print("已重启容器。下一步请自行核对 /healthz（见 RUNBOOK §9）")
-    print(f"提示：{len(PRESERVE_ON_TARGET)} 个站点配置保留在目标机未被覆盖；"
-          "改了仓库默认值时请按上面的提示手工同步，或用 --show-config 对比")
+       # **机器判定部署成功**：v0.2.114那次 jobs容器重启循环，deploy.py
+    #打印一句「请自行核对 /healthz」就退出0，故障全靠人盯 docker ps才发现。
+    reason = verify_deployment(args.host, args.services, args.verify_wait)
+    if reason == "OK":
+        print("验收通过：容器稳定、启动日志无 traceback")
+        print("已重启容器。建议再确认一次 /healthz（见 RUNBOOK §9）")
+    else:
+        print(f"**验收失败**：{reason}")
+        if rollback(args.host, args.dir, args.services):
+            print("已回退到上一个镜像（stock-screener:rollback）")
+            print("**仍需人工确认**：回退后也要看一眼 /healthz与容器状态")
+        else:
+            print("**回退失败**：目标机上没有 stock-screener:rollback标签")
+            print("→立即手工处理，见 RUNBOOK §9")
+        return 1
+    print(f"提示：{len(PRESERVE_ON_TARGET)}个站点配置保留在目标机未被覆盖；"
+        "改了仓库默认值时请按上面的提示手工同步，或用 --show-config对比")
     return 0
 
 

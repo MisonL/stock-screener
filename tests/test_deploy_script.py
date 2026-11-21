@@ -52,14 +52,18 @@ def test_clean_check_precedes_any_remote_work():
     所以顺序是安全属性本身：先检查、后传输。
     """
     src = (ROOT / "scripts" / "deploy.py").read_text(encoding="utf-8")
-    assert "check_clean(allow_dirty=" in src
-    i_check = src.index("check_clean(allow_dirty=")
-    # 打包与所有远端操作都必须排在脏检查之后
+    # **只看 main()内部**：辅助函数（snapshot_image/verify_deployment等）
+    #定义在 main之前，它们也含 "ssh"，但那是"定义"不是"调用"。
+    body = src[src.index("def main(argv"):]
+    body = body[:body.index("def _sh_quote(")]
+    assert "check_clean(allow_dirty=" in body
+    i_check = body.index("check_clean(allow_dirty=")
+    #打包与所有远端操作都必须排在脏检查之后
     for later in ('build_archive(tarball)', '"ssh"', '"scp"'):
-        i_later = src.index(later)
-        assert i_check < i_later, (
-            f"{later} 出现在脏检查之前：脏工作区可能已被打包/上传。"
-            "先检查、后传输才是安全顺序")
+     i_later = body.index(later)
+     assert i_check < i_later, (
+     f"{later}出现在脏检查之前：脏工作区可能已被打包/上传。"
+     "先检查、后传输才是安全顺序")
 
 
 def test_uses_git_archive_not_ls_files():

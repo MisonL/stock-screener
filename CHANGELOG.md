@@ -1,5 +1,40 @@
 ## [Unreleased]
 
+###新增（部署后自动验收 +失败回滚）
+
+`deploy.py`原先重启完只打印一句「下一步请自行核对 /healthz」就 **exit0**。
+v0.2.114那次 jobs容器重启循环，就是靠人盯 `docker ps`才发现的——
+**部署是否成功，由人肉检查决定**，这本身就是个缺陷。
+
+现在：
+
+- **构建前自动快照**：把当前 `stock-screener:latest`打成
+ `stock-screener:rollback`。不做这一步就没得回滚——`compose build`
+会直接覆盖 latest，容器引用的也是同一 tag。
+- **重启后自动验收**（默认最多等90秒，`--verify-wait`可调）：
+ -有容器处于 `Restarting` / `Exited` / `unhealthy` →立刻失败，不等满；
+ - `api`/`jobs`/`agent`必须都在 running；
+ - **扫最近4分钟的启动日志，出现 `Traceback`即失败**。只看容器状态会被骗：
+重启循环里它可能短暂显示 `Up`，真正判据是它有没有在异常里打滚。
+- **验收不过自动回滚**：重新打 tag + `--force-recreate`，然后明确提示
+ 「仍需人工确认」。回滚失败（没有 rollback标签）也会说清楚。
+- **只有明确见到 `SS_VERIFY=OK`才算成功**。ssh失败、脚本报错、输出被截断
+一律不算——宁可误报失败，不可把故障当成功。
+
+真实验证（81.4）：
+
+-健康状态跑一遍 → `SS_VERIFY=OK`；
+-手工 `docker stop` jobs再跑 → `SS_VERIFY=FAIL:容器异常
+ stock-screener-jobs-1 Exited (137)`，随后恢复。
+
+测试6条，两条变异验证会红在断言：把回滚改成 `if False`（「验收失败但没有回滚」）、
+把「无结论」当成功（「输出 ''不该被判成功」）。
+
+顺手修了一条旧测试的范围：`test_clean_check_precedes_any_remote_work`
+原来在全文件里找第一个 `"ssh"`，新增的辅助函数定义在 `main()`之前、也含
+`"ssh"`，于是把「定义位置」误当成「调用位置」。收窄到 `main()`内部——
+安全属性（先检查、后传输）不变。
+
 ## [0.2.115] - 2026-11-21
 
 ###修复（v0.2.114造成了线上故障：jobs容器重启循环）

@@ -391,11 +391,15 @@ def _image_id(host: str) -> str:
 UA = "stock-screener-deploy/1.0"
 
 
-def check_public_health(url: str, timeout_s: int =20) -> str:
+def check_public_health(url: str, timeout_s: int =20, expect_version: str = "") -> str:
     """从**外部**探一次 `/healthz`；返回 "OK" / "FAIL:<原因>" / "SKIP"。
 
     容器 healthy只说明容器内部自洽。cloudflared挂了、DNS改了、证书过期，
     容器全是 `Up (healthy)`，而用户一个都访问不到——这一层必须单独验。
+
+    给了 expect_version时，还要求响应里就是**这一次部署的版本**：
+    `ok:true`只证明"有东西在应答"，CDN缓存、另一个实例、回滚到旧版
+    都能满足它。
 
     url为空时返回 SKIP（站点没配公网地址，或本地调试）。
     """
@@ -403,7 +407,7 @@ def check_public_health(url: str, timeout_s: int =20) -> str:
         return "SKIP"
     try:
         # **必须带 User-Agent**：Cloudflare把默认的 `Python-urllib/x.y`判成爬虫
-        #返回403——实测同一地址 `curl`200、`urllib`403。
+        #返回403——实测同一地址 `curl`200、`urllib`403、自定义 UA200。
         req = urllib.request.Request(url, headers={"User-Agent": UA})
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             code = resp.status
@@ -412,10 +416,14 @@ def check_public_health(url: str, timeout_s: int =20) -> str:
         return f"FAIL:请求失败 {type(exc).__name__}: {exc}"
     if code !=200:
         return f"FAIL:HTTP {code}"
-    if chr(34) + "ok" + chr(34) + ":true" not in body.replace(" ", "").replace(chr(10), ""):
+    flat = body.replace(" ", "").replace(chr(10), "")
+    if chr(34) + "ok" + chr(34) + ":true" not in flat:
         return f"FAIL:响应里没有 ok:true：{body[:120]}"
+    if expect_version:
+        want = chr(34) + "version" + chr(34) + ":" + chr(34) + expect_version + chr(34)
+        if want not in flat:
+            return f"FAIL:对外版本不是这次部署的（期望 {expect_version}）：{body[:120]}"
     return "OK"
-
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -445,6 +453,8 @@ def main(argv: list[str] | None = None) -> int:
     tag = _git("describe", "--tags", "--exact-match", "HEAD").strip() \
         if _has_tag() else "(未打 tag)"
     print(f"部署 HEAD={sha} {tag}")
+    #从 tag推出期望版本（v0.2.124 →0.2.124）；没打 tag时为空（跳过版本比对）
+    expected_version = tag[1:] if tag.startswith("v") and tag[1:2].isdigit() else ""
 
     with tempfile.TemporaryDirectory() as tmp:
         tarball = Path(tmp) / "src.tar.gz"
@@ -527,7 +537,8 @@ def main(argv: list[str] | None = None) -> int:
              "下次回滚点会退回当前 latest")
         # **容器 healthy不等于用户能访问**：cloudflared挂了、DNS改了、
         #证书过期时，容器全是 Up (healthy)，而外部一个都打不开。
-        pub = check_public_health(args.public_url)
+        pub = check_public_health(args.public_url,
+            expect_version=expected_version)
         if pub == "FAIL" or pub.startswith("FAIL:"):
             print("**外部探活失败**：" + pub)
             # **不回滚**：外部不可达多半是隧道/DNS/证书问题，

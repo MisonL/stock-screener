@@ -445,7 +445,7 @@ def test_main_exits_3_without_rollback_when_public_check_fails(monkeypatch, caps
  """
  calls = _patch_common(monkeypatch, verify="OK")
  monkeypatch.setattr(deploy, "check_public_health",
- lambda url, timeout_s=20: "FAIL:HTTP502")
+ lambda url, timeout_s=20, expect_version="": "FAIL:HTTP502")
  code = deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0",
  "--public-url", "https://x/healthz"])
  out = capsys.readouterr().out
@@ -480,3 +480,35 @@ def test_check_public_health_sends_a_real_user_agent(monkeypatch):
     ua = seen.get("ua") or ""
     assert ua, "没有带 User-Agent"
     assert "urllib" not in ua.lower(), f"UA是 urllib，会被 Cloudflare403：{ua}"
+
+def _stub_urlopen(monkeypatch, body, status=200):
+    class Resp:
+        pass
+    class R(Resp):
+        def __init__(self):
+            self.status = status
+        def read(self, n):
+            return body
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+    monkeypatch.setattr(deploy.urllib.request, "urlopen", lambda req, timeout: R())
+
+
+def test_public_health_accepts_the_deployed_version(monkeypatch):
+    """对外返回的 version与这次部署的一致 →OK。"""
+    _stub_urlopen(monkeypatch, b'{"ok":true,"version":"1.2.3"}')
+    assert deploy.check_public_health("https://x/healthz", expect_version="1.2.3") == "OK"
+
+
+def test_public_health_rejects_a_stale_version(monkeypatch):
+    """**对外还是旧版本必须 FAIL**。
+
+    `ok:true`只证明"有东西在应答"：CDN缓存、另一个实例、回滚到旧版
+    都满足它。只有版本对上，才说明这次部署真的对外生效了。
+    """
+    _stub_urlopen(monkeypatch, b'{"ok":true,"version":"1.2.2"}')
+    got = deploy.check_public_health("https://x/healthz", expect_version="1.2.3")
+    assert got.startswith("FAIL:"), got
+    assert "对外版本不是这次部署的" in got, got

@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -387,6 +388,29 @@ def _image_id(host: str) -> str:
     return ""
 
 
+def check_public_health(url: str, timeout_s: int =20) -> str:
+     """从**外部**探一次 `/healthz`；返回 "OK" / "FAIL:<原因>" / "SKIP"。
+
+    容器 healthy只说明容器内部自洽。cloudflared挂了、DNS改了、证书过期，
+    容器全是 `Up (healthy)`，而用户一个都访问不到——这一层必须单独验。
+
+    url为空时返回 SKIP（站点没配公网地址，或本地调试）。
+     """
+     if not url:
+        return "SKIP"
+     try:
+        with urllib.request.urlopen(url, timeout=timeout_s) as resp:
+            code = resp.status
+            body = resp.read(4000).decode("utf-8", "replace")
+     except Exception as exc:
+        return f"FAIL:请求失败 {type(exc).__name__}: {exc}"
+     if code !=200:
+        return f"FAIL:HTTP {code}"
+     if chr(34) + "ok" + chr(34) + ":true" not in body.replace(" ", "").replace(chr(10), ""):
+        return f"FAIL:响应里没有 ok:true：{body[:120]}"
+     return "OK"
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="部署已提交的内容到 VM")
     ap.add_argument("--host", default=DEFAULT_HOST)
@@ -402,6 +426,8 @@ def main(argv: list[str] | None = None) -> int:
         help="验收前先无条件观察多少秒（让启动期异常暴露）")
     ap.add_argument("--no-verify", action="store_true",
         help="跳过部署后验收（仅排障用）")
+    ap.add_argument("--public-url", default=os.environ.get("SS_PUBLIC_HEALTHZ", ""),
+        help="部署后从外部探一次 /healthz（留空则跳过）")
     args = ap.parse_args(argv)
 
     # **`--dir ~/x`必须展开**：`_sh_quote`会把路径包进单引号，
@@ -492,6 +518,19 @@ def main(argv: list[str] | None = None) -> int:
             if not record_good_image(args.host, args.dir, image_id):
              print("**警告**：没能写下 .last_good_image，"
              "下次回滚点会退回当前 latest")
+        # **容器 healthy不等于用户能访问**：cloudflared挂了、DNS改了、
+        #证书过期时，容器全是 Up (healthy)，而外部一个都打不开。
+        pub = check_public_health(args.public_url)
+        if pub == "FAIL" or pub.startswith("FAIL:"):
+            print("**外部探活失败**：" + pub)
+            # **不回滚**：外部不可达多半是隧道/DNS/证书问题，
+            #回退代码解决不了，反而把刚验过的版本换掉。
+            print("容器与新镜像都已验过；这次失败在公网可达性。见 RUNBOOK §9")
+            return 3
+        if pub == "OK":
+            print("外部探活通过：" + args.public_url)
+        else:
+            print("（未配置 --public-url，本次没有验公网可达性）")
         print("已重启容器。建议再确认一次 /healthz（见 RUNBOOK §9）")
     else:
         print(f"**验收未通过**：{reason}")

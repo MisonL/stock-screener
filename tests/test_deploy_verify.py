@@ -378,3 +378,78 @@ def test_real_script_fails_while_health_is_still_starting(tmp_path):
     status="Up3 seconds (health: starting)")
     assert "SS_VERIFY=FAIL" in got, got
     assert "健康检查未通过" in got, got
+    
+
+def test_check_public_health_skips_when_url_is_empty():
+ """没配公网地址时返回 SKIP（本地调试/无隧道的部署）。"""
+ assert deploy.check_public_health("") == "SKIP"
+
+
+def test_check_public_health_accepts_ok_true(monkeypatch):
+ """外部 /healthz返回 ok:true →OK。"""
+ class Resp:
+    status =200
+    def read(self, n):
+        return b'{"ok":true,"version":"1.2.3"}'
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+ monkeypatch.setattr(deploy.urllib.request, "urlopen", lambda url, timeout: Resp())
+ assert deploy.check_public_health("https://x/healthz") == "OK"
+
+
+def test_check_public_health_rejects_non_200(monkeypatch):
+ """502（隧道挂了）必须 FAIL——这正是容器 healthy却访问不到的场景。"""
+ class Resp:
+    status =502
+    def read(self, n):
+        return b"Bad Gateway"
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+ monkeypatch.setattr(deploy.urllib.request, "urlopen", lambda url, timeout: Resp())
+ assert deploy.check_public_health("https://x/healthz").startswith("FAIL:")
+
+
+def test_check_public_health_rejects_non_ok_body(monkeypatch):
+ """200但内容不是 ok:true（比如被登录页拦住）也不能算通过。"""
+ class Resp:
+    status =200
+    def read(self, n):
+        return "<html>login</html>".encode()
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+ monkeypatch.setattr(deploy.urllib.request, "urlopen", lambda url, timeout: Resp())
+ assert deploy.check_public_health("https://x/healthz").startswith("FAIL:")
+
+
+def test_check_public_health_reports_connection_errors(monkeypatch):
+ """连不上（DNS/证书/超时）要给出原因，不能抛出去。"""
+ def boom(url, timeout):
+    raise OSError("Name or service not known")
+ monkeypatch.setattr(deploy.urllib.request, "urlopen", boom)
+ got = deploy.check_public_health("https://x/healthz")
+ assert got.startswith("FAIL:")
+ assert "Name or service not known" in got
+
+
+def test_main_exits_3_without_rollback_when_public_check_fails(monkeypatch, capsys):
+ """公网探活失败 →退出码3、**不回滚**。
+
+外部不可达多半是 cloudflared/DNS/证书；回退代码解决不了，
+反而会把刚验过的版本换掉。
+ """
+ calls = _patch_common(monkeypatch, verify="OK")
+ monkeypatch.setattr(deploy, "check_public_health",
+ lambda url, timeout_s=20: "FAIL:HTTP502")
+ code = deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0",
+ "--public-url", "https://x/healthz"])
+ out = capsys.readouterr().out
+ assert code ==3, f"外部探活失败应该退出3，实际{code}"
+ assert "外部探活失败" in out
+ assert "rollback" not in calls, "外部故障不该触发代码回滚"
+ assert "record:sha256:new" in calls, "镜像本身已验过，应该记为可用"

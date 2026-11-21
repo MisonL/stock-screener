@@ -2,6 +2,11 @@
 
 ###修复（外部探活默认 UA被 Cloudflare判成爬虫）
 
+- **显式设置 `User-Agent: stock-screener-deploy/1.0`**：Cloudflare把 urllib
+的默认 UA当成爬虫拦掉，返回403，而服务本身是好的。
+-补 `test_check_public_health_sends_a_real_user_agent`：断言 UA非空且不含
+ `urllib`。变异（换回裸 `urlopen`）会红在断言。
+
 v0.2.123上线后第一次带 `--public-url`部署，门禁立刻报：
 
 ```

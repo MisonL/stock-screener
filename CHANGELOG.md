@@ -1,5 +1,45 @@
 ## [Unreleased]
 
+###修复（v0.2.114造成了线上故障：jobs容器重启循环）
+
+**这是我这一轮最严重的一次失误，必须写清楚。**
+
+v0.2.114部署后，`jobs`容器立刻进入重启循环，生产中断约20分钟：
+
+```
+File "/app/jobs/main.py", line927, in main
+ data_dir=data_dir,
+NameError: name 'data_dir' is not defined
+```
+
+我给 `startup_recovery(...)`加实参时，**没有核对 `main()`作用域里到底有没有
+这个变量**——那里根本没有。`startup_recovery`的 `data_dir`参数默认值就是
+`"data"`（与生产 `/app/data`一致），本来不需要传。
+
+**1349条测试全绿**，因为**没有任何测试调用 `main()`**——它是进程入口，
+测试只覆盖它下面的函数。这一整类「入口函数里的名字写错/漏定义」，
+现有测试体系是**结构性看不见**的。
+
+修复与改进：
+
+-去掉那条实参。
+- **新增静态门禁 `tests/test_static_undefined_names.py`**：用 `pyflakes`
+扫 `jobs/api/agent/core/notify/chat/scripts`下所有源文件，
+出现 `undefined name`就红。已用「把这次崩溃原样加回去」验证：
+门禁精确报出 `jobs/main.py:927:34: undefined name 'data_dir'`。
+- `pyflakes==3.4.0`加进 `requirements-dev.txt`。
+
+门禁顺带查出两处存量问题（运行期无害，但 `typing.get_type_hints()`会炸、
+且读代码的人会以为名字可用）：
+
+- `notify/dispatcher.py`：注解里用 `datetime`，但只导入了 `timedelta`。
+- `agent/loop.py`：`pusher: "AgentPusher | None"`引用了未导入的名字，
+改成 `TYPE_CHECKING`下导入（顶层导入会与 `agent/push.py`成环）。
+
+**教训**：这一版我改动的是「启动路径」，却只用单元测试验证了被调用的函数
+本身。启动路径、入口函数、配置装配这类代码，单测天然覆盖不到——
+必须配合静态检查或真正启动一次。
+
 ## [0.2.114] - 2026-11-21
 
 ###修复（独立评审 + Codex复核 v0.2.113，四条都成立）

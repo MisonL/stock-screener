@@ -18,12 +18,17 @@ import dataclasses
 import math
 import time
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Literal
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal
 
 from agent.context import Rendered, render_event, render_heartbeat
 from agent.decision import EMIT_DECISION_TOOL, TurnDecision, parse_decision
 from llm.budget import CHARS_TO_TOKENS
 from llm.grounding import GroundedText, enforce
+
+if TYPE_CHECKING:
+    #只在类型检查时导入：`agent/push.py`运行期会反向依赖本模块，
+    #顶层导入会成环。注解本身由 `from __future__ import annotations`延迟求值。
+    from agent.push import AgentPusher
 
 MAX_TOOL_CALLS_PER_ROUND = 6
 #: `max_tokens` 的**兜底值**。真实来源是 `config/llm.yaml::llm.max_tokens`
@@ -107,7 +112,7 @@ class Deps:
     tools: Any
     render: Callable[[Trigger], Rendered]
     # 字符串注解 + None 默认：`agent/memory.py` 在 Task 12 组装点之前不应被 import
-    pusher: "AgentPusher | None" = None
+    pusher: AgentPusher | None = None
     memory: "Any | None" = None
     westock: Any = None
 

@@ -421,8 +421,21 @@ def main(argv: list[str] | None = None) -> int:
     body = (f"set -o pipefail; cd {args.dir} && "
             f"{compose}build api 2>&1 | tail -1 && "
             f"{compose}up -d --force-recreate {args.services} 2>&1 | tail -3")
-    _run(["ssh", "-o", "BatchMode=yes", args.host,
-          "bash -c " + _sh_quote(body)])
+    # **build/up失败也要回滚**（Codex两次评审都点）：原来 `_run`抛 SystemExit
+    #直接退出，比验收早一步，回滚只在验收分支里——`up`半途失败会留下
+    #「一半旧一半新」且无人回退。
+    try:
+        _run(["ssh", "-o", "BatchMode=yes", args.host,
+         "bash -c " + _sh_quote(body)])
+    except SystemExit as exc:
+        print(f"**构建或重启失败**：{exc}")
+        ok, code = rollback(args.host, args.dir, args.services)
+        if ok:
+            print("已尝试回退到上一个镜像（stock-screener:rollback）")
+            print("**仍需人工确认**：回退后容器状态与 /healthz")
+        else:
+            print("**回退失败**： " + code)
+        return 1
     # **提示保留配置与仓库默认值的差异**：不提示的话，仓库改了默认值而站点
     # 仍用旧值，运维会以为新值已经生效（v0.2.71→v0.2.72 的真实事故）。
     _run(["ssh", "-o", "BatchMode=yes", args.host,

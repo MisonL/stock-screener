@@ -184,3 +184,40 @@ def test_snapshot_prefers_the_recorded_good_image(monkeypatch):
     assert ".last_good_image" in cmd, "没用 marker文件"
     assert cmd.index(".last_good_image") < cmd.index("stock-screener:latest"), (
          "先用了 latest——坏镜像会被快照成回滚点")
+
+
+def test_build_failure_also_rolls_back(monkeypatch, capsys):
+    """**build/up失败也要回滚**（Codex两次评审都点了这条）。
+
+    原来 `_run`抛 SystemExit直接退出，比验收早一步，回滚只在验收分支里。
+    后果：`up -d`半途失败会留下「一半旧一半新」的栈，且无人回退。
+    """
+    calls = []
+
+    def boom(cmd):
+        joined = " ".join(cmd)
+        if "build api" in joined:
+            raise SystemExit("命令失败（1）：ssh … build api")
+        calls.append(joined)
+
+    def fake_rollback(h, d, svc):
+        calls.append("rollback")
+        return (True, "OK")
+
+    monkeypatch.setattr(deploy, "check_clean", lambda **k: None)
+    monkeypatch.setattr(deploy, "_sha", lambda: "deadbeef")
+    monkeypatch.setattr(deploy, "_has_tag", lambda: False)
+    monkeypatch.setattr(deploy, "build_archive", _noop_archive)
+    monkeypatch.setattr(deploy, "snapshot_image", lambda h, d: "MARKER")
+    monkeypatch.setattr(deploy, "_run", boom)
+    monkeypatch.setattr(deploy, "config_drift_script", lambda d: "true")
+    monkeypatch.setattr(deploy, "rollback", fake_rollback)
+    def no_verify(*args, **kwargs):
+        raise AssertionError("build失败不该走到验收")
+    monkeypatch.setattr(deploy, "verify_deployment", no_verify)
+
+    code = deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"])
+    out = capsys.readouterr().out
+    assert code !=0, "构建失败却返回成功"
+    assert "rollback" in calls, "构建失败但没有回滚——会留下半新半旧的栈"
+    assert "构建或重启失败" in out

@@ -180,141 +180,163 @@ def build_archive(dest: Path) -> None:
 
 
 def snapshot_image(host: str, target: str) -> str:
-    """构建前确定回滚点，返回模式（MARKER / LATEST / NONE）。
+    """构建前确定回滚点，返回 MARKER / LATEST / NONE。
 
-    **优先用 marker里记录的「上次验收通过的镜像 ID」**，而不是'当前 latest'。
-    差别很关键：如果上一次部署验收失败且回滚也失败，`latest`停在那次的
-    坏镜像上——再从 latest快照，就把**已知坏版本**变成了回滚点，
-    之后每次部署都会「成功回滚」到一个起不来的版本。
+    **优先用 `.last_good_image`里记录的镜像 ID**（上次验收通过的），而不是
+    「当前 latest」：若上次验收失败且回滚也失败，latest停在坏镜像上，
+    再从 latest快照就把**已知坏版本**变成了回滚点。
+
+    **必须是 `$(cat $M)`**：`$M`是文件路径，直接递给 `docker image inspect`
+    会报 `invalid reference format`。这条错犯过两次，别再改回去。
     """
     marker = target.rstrip("/") + "/.last_good_image"
     cmd = (
-        f"M={marker}; "
-        "if [ -f " + '$M' + " ]; then "
-        "docker image inspect " + '$M' + " >/dev/null 2>&1 && "
-        "docker tag " + '$M' + " stock-screener:rollback && "
-        "echo SS_SNAPSHOT=MARKER; exit 0; fi; "
-        "if docker image inspect stock-screener:latest >/dev/null 2>&1; then "
-        "docker tag stock-screener:latest stock-screener:rollback && "
-        "echo SS_SNAPSHOT=LATEST; exit 0; fi; "
-        "echo SS_SNAPSHOT=NONE")
+     "M=" + marker + "; "
+     "if [ -f $M ]; then "
+     "I=$(cat $M); "
+     "docker image inspect \"$I\" >/dev/null 2>&1 && "
+     "docker tag \"$I\" stock-screener:rollback && echo SS_SNAPSHOT=MARKER; exit 0; "
+     "fi; "
+     "if docker image inspect stock-screener:latest >/dev/null 2>&1; then "
+     "docker tag stock-screener:latest stock-screener:rollback && "
+     "echo SS_SNAPSHOT=LATEST; exit 0; fi; "
+     "echo SS_SNAPSHOT=NONE"
+    )
     out = _capture(["ssh", "-o", "BatchMode=yes", host, cmd])
     for t in ("SS_SNAPSHOT=MARKER", "SS_SNAPSHOT=LATEST", "SS_SNAPSHOT=NONE"):
         if t in out:
             return t.split("=")[1]
+    return "UNKNOWN"
 
 
-def record_good_image(host: str, target: str, image_id: str) -> None:
-    """验收通过后记下镜像 ID，供下一次部署当回滚点。"""
+def record_good_image(host: str, target: str, image_id: str) -> bool:
+    """验收通过后记下镜像 ID，并**回读确认**；返回是否写成功。"""
     marker = target.rstrip("/") + "/.last_good_image"
     cmd = "printf " + _sh_quote("%s\\n") + " " + _sh_quote(image_id) + " > " + _sh_quote(marker)
     _capture(["ssh", "-o", "BatchMode=yes", host, cmd])
+    back = _capture(["ssh", "-o", "BatchMode=yes", host,
+        "cat " + _sh_quote(marker) + " || true"])
+    return image_id in back
 
 
 def verify_script(services: str, wait_s: int, settle_s: int =20,
-    image_id: str | None = None) -> str:
+        image_id: str | None = None) -> str:
     """远端验收脚本。只认 `SS_VERIFY=OK`一行。
 
     **为什么要 settle**：`up -d`返回时容器状态就是 `Up0 seconds`，
-    「一看到 running就 break」等于启动后几百毫秒就下结论——
-    启动期崩溃、healthcheck不通过、配置装配错误，一个都等不到。
-    所以先无条件等 `settle_s`秒（期间持续查 Restarting/unhealthy），
-    再等 running与 healthy，最后才扫日志。
+    「一看到 running就通过」等于启动后几百毫秒就下结论（实测0.8秒）。
+
+    **为什么处处用 `docker ps -a`**：容器退出后 `docker ps`里查不到，
+    `case`不匹配任何分支就会被当成「没有 healthcheck」放过去——
+    而那正是最该判失败的情况。
     """
     svc = " ".join(f"stock-screener-{x.strip()}-1" for x in services.split() if x.strip())
     expect = (image_id or "").strip()
     return f'''set -u
-    SVC="{svc}"
-    EXPECT="{expect}"
-    deadline=$(( $(date +%s) + {wait_s} ))
-    start=$(date +%s)
+SVC="{svc}"
+EXPECT="{expect}"
+start=$(date +%s)
+# **settle不占用 wait预算**：deadline从 settle结束后才开始算，
+#否则 settle20 + wait90实际只剩70秒，而 jobs的 start_period是300秒。
+deadline=$(( start + {settle_s} + {wait_s} ))
 
-    # ----1. settle：先让启动期的异常有机会暴露 ----
-    while [ $(( $(date +%s) - start )) -lt {settle_s} ]; do
-        bad=$(docker ps -a --filter 'name=stock-screener-' \
-            --format '{{{{.Names}}}} {{{{.Status}}}}' \
-            | grep -E 'Restarting|unhealthy' || true)
-        if [ -n "$bad" ]; then echo "SS_VERIFY=FAIL:容器异常 $bad"; exit 0; fi
-        # **Exited只对本次重建的服务算**：ntfy/cloudflared可能被人故意停着，
-        #把它们算进来会让每次部署都判失败。
-        for c in $SVC; do
-            st=$(docker ps -a --format '{{{{.Names}}}} {{{{.Status}}}}' \
-                | grep -E "^$c " | head -1)
-            case "$st" in
-            *Exited*) echo "SS_VERIFY=FAIL:容器已退出 $st"; exit 0 ;;
-            esac
-        done
-        sleep 2
-    done
+#逐个看**目标服务**的状态。不能用 docker ps（只看 running）：
+#容器退出后在那里查不到，case不匹配任何分支就会被当成「没有 healthcheck」放过去，
+#而那正是最该判失败的情况。
+check_svc() {{
+ for c in $SVC; do
+ st=$(docker ps -a --format '{{{{.Names}}}}|{{{{.Status}}}}' | grep -E "^$c\\|" | head -1)
+ case "$st" in
+ "") echo "SS_VERIFY=FAIL:容器不存在 $c"; return 1 ;;
+ *Restarting*) echo "SS_VERIFY=FAIL:容器在重启 $st"; return 1 ;;
+ *unhealthy*) echo "SS_VERIFY=FAIL:不健康 $st"; return 1 ;;
+ *Exited*) echo "SS_VERIFY=FAIL:容器已退出 $st"; return 1 ;;
+ esac
+ done
+ return 0
+}}
 
-    # ----2.等 running（最多到 deadline） ----
-    ok=0
-    while [ "$(date +%s)" -lt "$deadline" ]; do
-        ok=1
-        for c in $SVC; do
-            docker ps --filter "name=$c" --filter status=running \
-                --format '{{{{.Names}}}}' | grep -qx "$c" || ok=0
-        done
-        if [ "$ok" = "1" ]; then break; fi
-        sleep 2
-    done
-    if [ "$ok" != "1" ]; then echo "SS_VERIFY=FAIL:容器未运行 $SVC"; exit 0; fi
+# ----1. settle：先让启动期的异常有机会暴露 ----
+while [ $(( $(date +%s) - start )) -lt {settle_s} ]; do
+ check_svc || exit 0
+ sleep 2
+done
 
-    # ----3.等健康检查（有 healthcheck的必须变 healthy） ----
-    pending=0
-    while [ "$(date +%s)" -lt "$deadline" ]; do
-        pending=0
-        for c in $SVC; do
-            st=$(docker ps --format '{{{{.Names}}}}|{{{{.Status}}}}' | grep -E "^$c\\|" | head -1)
-            case "$st" in
-            *unhealthy*) echo "SS_VERIFY=FAIL:不健康 $st"; exit 0 ;;
-            *health:*) pending=1 ;;
-            esac
-        done
-        if [ "$pending" = "0" ]; then break; fi
-        sleep 2
-    done
-    if [ "$pending" != "0" ]; then
-        echo "SS_VERIFY=FAIL:健康检查在 {wait_s}秒内未通过"; exit 0
-    fi
+# ----2.等 running ----
+ok=0
+while [ "$(date +%s)" -lt "$deadline" ]; do
+ check_svc || exit 0
+ ok=1
+ for c in $SVC; do
+ docker ps --filter "name=$c" --filter status=running \
+ --format '{{{{.Names}}}}' | grep -qx "$c" || ok=0
+ done
+ if [ "$ok" = "1" ]; then break; fi
+ sleep 2
+done
 
-    # ----4.跑的是不是这次构建的镜像 ----
-    if [ -n "$EXPECT" ]; then
-        for c in $SVC; do
-            got=$(docker inspect --format '{{{{.Image}}}}' "$c" 2>/dev/null || true)
-            if [ "$got" != "$EXPECT" ]; then
-                echo "SS_VERIFY=FAIL:$c跑的不是新镜像（期望 $EXPECT，实际 $got）"
-                exit 0
-            fi
-        done
-    fi
+# ----3.等健康检查（有 healthcheck的必须变 healthy） ----
+pending=0
+while [ "$(date +%s)" -lt "$deadline" ]; do
+ check_svc || exit 0
+ pending=0
+ for c in $SVC; do
+ st=$(docker ps -a --format '{{{{.Names}}}}|{{{{.Status}}}}' | grep -E "^$c\\|" | head -1)
+ case "$st" in *health:*) pending=1 ;; esac
+ done
+ if [ "$pending" = "0" ]; then break; fi
+ sleep 2
+done
 
-    # ----5.启动日志扫 traceback ----
-    for c in $SVC; do
-        tb=$(docker logs --since 4m "$c" 2>&1 \
-            | grep -c 'Traceback (most recent call last)' || true)
-        if [ "${{tb:-0}}" -gt 0 ]; then
-            detail=$(docker logs --since 4m "$c" 2>&1 \
-                | grep -A2 'Traceback (most recent call last)' | head -3 | tr '\\n' ' ')
-            echo "SS_VERIFY=FAIL:$c启动异常 $detail"; exit 0
-        fi
-    done
-    echo SS_VERIFY=OK'''
+# ----4.最后再确认一次：还在跑、且不是 restarting ----
+check_svc || exit 0
+for c in $SVC; do
+ docker ps --filter "name=$c" --filter status=running \
+ --format '{{{{.Names}}}}' | grep -qx "$c" \
+ || {{ echo "SS_VERIFY=FAIL:容器未运行 $c"; exit 0; }}
+done
+if [ "$pending" = "1" ]; then
+ echo "SS_VERIFY=FAIL:健康检查在预算内未通过"; exit 0
+fi
+
+# ----5.跑的是不是这次构建的镜像 ----
+if [ -z "$EXPECT" ]; then
+ #取不到镜像 ID就不能吹「跑的是新镜像」——直接判无法确认
+ echo "SS_VERIFY=UNKNOWN:拿不到本次构建的镜像ID，无法校验"; exit 0
+fi
+for c in $SVC; do
+ got=$(docker inspect --format '{{{{.Image}}}}' "$c" 2>/dev/null || true)
+ if [ "$got" != "$EXPECT" ]; then
+ echo "SS_VERIFY=FAIL:$c跑的不是新镜像（期望 $EXPECT，实际 $got）"
+ exit 0
+ fi
+done
+
+# ----6.启动日志扫 traceback ----
+for c in $SVC; do
+ tb=$(docker logs --since 4m "$c" 2>&1 | grep -c 'Traceback (most recent call last)' || true)
+ if [ "${{tb:-0}}" -gt 0 ]; then
+ detail=$(docker logs --since 4m "$c" 2>&1 \
+ | grep -A2 'Traceback (most recent call last)' | head -3 | tr '\\n' ' ')
+ echo "SS_VERIFY=FAIL:$c启动异常 $detail"; exit 0
+ fi
+done
+echo SS_VERIFY=OK'''
 
 
 def rollback(host: str, target: str, services: str) -> tuple[bool, str]:
-    """回退到 `stock-screener:rollback`；返回 (是否成功,远端输出)。"""
+    """回退到 `stock-screener:rollback`；返回 (是否成功,原因码)。"""
     compose = "docker compose -f deploy/docker-compose.yml --project-directory . "
     body = (
-        "set -u; cd " + target + " || { echo SS_ROLLBACK=BAD_TARGET; exit 0; }; "
-        "docker image inspect stock-screener:rollback >/dev/null 2>&1 || "
-        "{ echo SS_ROLLBACK=NO_IMAGE; exit 0; }; "
-        "docker tag stock-screener:rollback stock-screener:latest || "
-        "{ echo SS_ROLLBACK=TAG_FAILED; exit 0; }; "
-        + compose
-        + "up -d --force-recreate " + services + " >/dev/null 2>&1 || "
-        "{ echo SS_ROLLBACK=UP_FAILED; exit 0; }; "
-        "echo SS_ROLLBACK=OK"
+     "set -u; cd " + target + " || { echo SS_ROLLBACK=BAD_TARGET; exit 0; }; "
+     "docker image inspect stock-screener:rollback >/dev/null 2>&1 || "
+     "{ echo SS_ROLLBACK=NO_IMAGE; exit 0; }; "
+     "docker tag stock-screener:rollback stock-screener:latest || "
+     "{ echo SS_ROLLBACK=TAG_FAILED; exit 0; }; "
+     + compose
+     + "up -d --force-recreate " + services + " >/dev/null 2>&1 || "
+     + "{ echo SS_ROLLBACK=UP_FAILED; exit 0; }; "
+     + "echo SS_ROLLBACK=OK"
     )
     out = _capture(["ssh", "-o", "BatchMode=yes", host, "bash -c " + _sh_quote(body)])
     for line in out.splitlines():
@@ -325,27 +347,35 @@ def rollback(host: str, target: str, services: str) -> tuple[bool, str]:
 
 
 def verify_deployment(host: str, services: str, wait_s: int,
-    image_id: str | None = None, settle_s: int =20) -> str:
+        image_id: str | None = None, settle_s: int =20) -> str:
     """返回 "OK" / "FAIL:<原因>" / "UNKNOWN:<原因>"。
 
-    **UNKNOWN与 FAIL必须分开**：ssh抖动、脚本异常属于「没验成」，
-    不能当成「部署坏了」去自动回滚——那是把一次成功的部署强行切回旧版本。
+    **UNKNOWN与 FAIL必须分开**：ssh抖动、脚本异常属于「没验成」，不能当成
+    「部署坏了」去自动回滚——那是把一次成功的部署强行切回旧版本。
     """
     out = _capture(["ssh", "-o", "BatchMode=yes", host,
         "bash -c " + _sh_quote(verify_script(services, wait_s, settle_s, image_id))])
     for line in out.splitlines():
-        if line.startswith("SS_VERIFY=OK") and line.strip() == "SS_VERIFY=OK":
+        if line.strip() == "SS_VERIFY=OK":
             return "OK"
         if line.startswith("SS_VERIFY=FAIL:"):
             return "FAIL:" + (line[len("SS_VERIFY=FAIL:"):].strip() or "未知原因")
+        if line.startswith("SS_VERIFY=UNKNOWN:"):
+            return "UNKNOWN:" + (line[len("SS_VERIFY=UNKNOWN:"):].strip() or "未知原因")
     return "UNKNOWN:验收脚本没有给出结论（ssh失败或脚本异常）"
 
 
+def _capture(cmd: list[str]) -> str:
+    """跑命令并取输出（失败也返回已拿到的部分，交给调用方判定）。"""
+    proc = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=900)
+    return (proc.stdout or "") + (proc.stderr or "")
+
+
 def _image_id(host: str) -> str:
-    """取 stock-screener:latest的镜像 ID；取不到返回空串。
+    """取 `stock-screener:latest`的镜像 ID；取不到返回空串。
 
     验收要比对容器跑的是不是这次构建出来的镜像——只查 Names/Status
-    会被「build静默失败、up没重建」骗过去。
+    会被「build静默失败、up没 recreate」骗过去。
     """
     cmd = "docker image inspect --format '{{.Id}}' stock-screener:latest || true"
     out = _capture(["ssh", "-o", "BatchMode=yes", host, cmd])
@@ -353,12 +383,6 @@ def _image_id(host: str) -> str:
         if line.startswith("sha256:"):
             return line.strip()
     return ""
-
-
-def _capture(cmd: list[str]) -> str:
-    """跑命令并取输出（失败也返回已拿到的部分，交给调用方判定）。"""
-    proc = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=600)
-    return (proc.stdout or "") + (proc.stderr or "")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -374,8 +398,13 @@ def main(argv: list[str] | None = None) -> int:
  help="部署后最多等多少秒让容器稳定")
     ap.add_argument("--settle", type=int, default=20,
         help="验收前先无条件观察多少秒（让启动期异常暴露）")
+    ap.add_argument("--no-verify", action="store_true",
+        help="跳过部署后验收（仅排障用）")
     args = ap.parse_args(argv)
 
+    # **`--dir ~/x`必须展开**：`_sh_quote`会把路径包进单引号，
+    #`~`不会被远端展开，marker写不进去且静默失败。
+    args.dir = os.path.expanduser(args.dir)
     check_clean(allow_dirty=args.allow_dirty)
     sha = _sha()
     tag = _git("describe", "--tags", "--exact-match", "HEAD").strip() \
@@ -431,8 +460,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"**构建或重启失败**：{exc}")
         ok, code = rollback(args.host, args.dir, args.services)
         if ok:
-            print("已尝试回退到上一个镜像（stock-screener:rollback）")
-            print("**仍需人工确认**：回退后容器状态与 /healthz")
+            print("已回退到上一个镜像（stock-screener:rollback）")
+            back = verify_deployment(args.host, args.services, args.verify_wait,
+            image_id=None, settle_s=args.settle)
+            print("回滚后验收：" + ("通过" if back == "OK" else back))
         else:
             print("**回退失败**： " + code)
         return 1
@@ -444,6 +475,9 @@ def main(argv: list[str] | None = None) -> int:
     #打印一句「请自行核对 /healthz」就退出0，故障全靠人盯 docker ps才发现。
     # **取这次构建出来的镜像 ID**：验收时要比对容器跑的是不是它。
     #只查 Names/Status会被「build静默失败、up没重建」骗过去。
+    if args.no_verify:
+        print("**已跳过验收**（--no-verify）：部署是否成功未经验证")
+        return 0
     image_id = _image_id(args.host)
     reason = verify_deployment(args.host, args.services, args.verify_wait,
         image_id=image_id, settle_s=args.settle)
@@ -451,7 +485,9 @@ def main(argv: list[str] | None = None) -> int:
         print("验收通过：容器稳定、健康检查通过、跑的是新镜像、无 traceback")
         # **记住这次验收通过的镜像**，下次当回滚点用（避免坏镜像被快照）
         if image_id:
-            record_good_image(args.host, args.dir, image_id)
+            if not record_good_image(args.host, args.dir, image_id):
+             print("**警告**：没能写下 .last_good_image，"
+             "下次回滚点会退回当前 latest")
         print("已重启容器。建议再确认一次 /healthz（见 RUNBOOK §9）")
     else:
         print(f"**验收未通过**：{reason}")
@@ -459,8 +495,11 @@ def main(argv: list[str] | None = None) -> int:
             # **「没验成」不是「部署坏了」**：ssh抖动/脚本异常都归这里。
             #自动回滚会把一次成功的部署强行切回旧版本——代价比报警大。
             print("无法确认部署状态（不是确认失败），**不自动回滚**。"
+             "**新代码已经上线**（up -d已返回0），只是没验成；"
              "请人工核对 /healthz与容器状态，见 RUNBOOK §9")
-            return 1
+            # **独立退出码3**：运维/CI才能区分「部署坏了」与「没验成」，
+            #否则 exit1会被当成「没部署」而去回滚一个健康的新版本。
+            return 3
         ok, code = rollback(args.host, args.dir, args.services)
         if ok:
             print("已回退到上一个镜像（stock-screener:rollback）")

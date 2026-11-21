@@ -484,6 +484,9 @@ git checkout main
  -最近4分钟启动日志里不能有 `Traceback`。
 4.通过 →把镜像 ID写进 `.last_good_image`，退出0。
 5.确认失败（`FAIL:`）→自动回滚并**再验收一次**，退出1。
+6. **无法确认**（`UNKNOWN:`）→ **只报警、不自动回滚，退出码3**。
+退出码3与1不同是有意的：这时**新代码已经上线**（`up -d`已返回0），
+只是没验成。当成「部署失败」去手工回滚，会把健康的新版本切回旧版。
 6. **无法确认**（`UNKNOWN:`，ssh抖动/脚本异常）→ **只报警，不自动回滚**。
 自动回滚会把一次成功的部署强行切回旧版本，代价比报警大。
 
@@ -495,7 +498,7 @@ git checkout main
 
 ```bash
 python3 scripts/deploy.py --host <ip> --dir <path> --no-verify #跳过验收（仅排障）
-python3 scripts/deploy.py --host <ip> --dir <path> --settle0 --verify-wait30
+python3 scripts/deploy.py --host <ip> --dir <path> --settle 0 --verify-wait 30
 ```
 
 **回到某个历史版本**（跨多个版本、或 `rollback`标签已经不对时）：

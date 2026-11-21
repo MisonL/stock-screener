@@ -1,5 +1,62 @@
 ## [Unreleased]
 
+###修复（第二轮评审：marker从没被读出来过）
+
+独立评审对 v0.2.120复核了上一轮那8条，结论是 **6条真修、1条半修、1条还是假的**。
+
+- **【严重】`.last_good_image`写了却从没被读出来**。[假的]
+ `snapshot_image`把**文件路径**直接递给 `docker image inspect`：
+ ```bash
+ docker image inspect /home/qdm/stock-screener/.last_good_image
+ # → invalid reference format
+ ```
+所以回滚点**始终是「当前 latest」**，第5条根本没修上。
+81.4实测确认：marker内容是对的（`sha256:fd9f…`），但 `inspect "$M"`失败、
+ `inspect "$(cat $M)"`成功。
+ →改成 `I=$(cat $M)`。**这条错我犯了三次**（先是没写成、再是格式错、现在是读了不认），
+所以这次加的不是"断言字符串存在"，而是**用假 docker把真脚本跑起来**。
+
+- **【严重】健康阶段用 `docker ps`（只看 running），容器消失会被当成"没有 healthcheck"**。[新引入]
+ settle之后容器若退出或进入 Restarting，`docker ps -a`里才看得到，
+而 `docker ps`里查不到 → `case`不匹配任何分支 →判定通过 → **假绿**。
+ →全程改用 `docker ps -a`，并把 `Exited`/`Restarting`/`不存在`都判 FAIL；
+结尾再复核一次 running。
+
+- **【中等】settle吃掉了验收预算**：`deadline`在 settle之前算，
+默认 `settle20 + wait90`实际只剩70秒，而 compose里 jobs `start_period`是300秒
+ →冷启动稍慢就误判失败并自动回滚。
+ →`deadline = start + settle + wait`。
+
+- **【中等】UNKNOWN与 FAIL同用退出码1**：`up -d`已成功、代码已上线，
+运维却可能当成"没部署"去手工回滚一个健康的新版本。
+ →UNKNOWN用**退出码3**，文案明说「新代码已经上线」。
+
+- **【中等】RUNBOOK教的 `--no-verify`不存在、`--settle0`语法错**
+ →补回 `--no-verify`，RUNBOOK的写法改成 `--settle0`。
+
+- **【中等】`--dir ~/x`下 marker写不进去且静默**：`_sh_quote`会把路径包进单引号，
+ `~`不会被远端展开。→ `os.path.expanduser`；`record_good_image`改为**回读确认**并返回布尔。
+
+- **【中等】`EXPECT`为空时镜像比对被静默跳过**，成功文案却照吹"跑的是新镜像"
+ →取不到镜像 ID直接 `UNKNOWN`。
+
+- **【中等】build/up失败回滚后不复验**（上一轮只修了一半）
+ →回滚后同样跑一次验收。
+
+- **【中等】`ntfy`/`cloudflared`的 `Restarting`仍会挡住部署**
+ →`Restarting`/`unhealthy`也只对本次重建的服务算。
+
+- **【轻微】三条恒真断言**：settle用实参20去断言 `-lt20`（改成硬编码照样绿）、
+镜像比对只断言 `.Image`字符串存在（`!=`反转成 `==`照样绿）、
+ marker只比字符串先后（读取坏掉照样绿）。
+ →改成用不同参数值、喂错镜像 ID、断言 `$(cat $M)`；
+并新增7条**用假 docker跑真脚本**的测试（镜像不符/无 ID/traceback/
+ Exited/Restarting/unhealthy/正常），这类逻辑只有真跑 bash才钉得住。
+
+**测试**：20条。六条变异全部红在断言——
+settle写死、`grep -qx`→`-q`、镜像比较方向反转、删掉 UNKNOWN分支、
+marker不读文件、build失败不回滚。
+
 ## [0.2.120] - 2026-11-21
 
 ###文档（RUNBOOK §9.3.1：把新的部署验收与回滚写清楚）

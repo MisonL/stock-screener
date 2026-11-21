@@ -76,13 +76,26 @@ while read -r name size; do
     fi
 done < <(docker ps -s --format '{{.Names}} {{.Size}}')
 
-# ③ 可回收空间：BuildKit 缓存与悬空镜像长期不管会堆到几十 GB
-RECLAIM=$(docker system df --format '{{.Reclaimable}}' 2>/dev/null \
-    | sed 's/ (.*//' | while read -r v; do to_gb "$v"; done \
-    | awk '{s+=$1} END{printf "%.1f", s}')
-RECLAIM=${RECLAIM:-0}
-if awk -v a="$RECLAIM" -v b="$RECLAIM_WARN_GB" 'BEGIN{exit !(a>=b)}'; then
-    notify default "Docker 可回收空间约 ${RECLAIM} GB（>=${RECLAIM_WARN_GB} GB），建议人工确认后执行 docker builder prune"
-fi
+# ③ 可回收空间：**按来源分开报，给对应的命令**。
+# 原来把所有 Reclaimable 加成一个大数、统一建议 `docker builder prune`——
+# 但停着的容器（事故里那 230 GB 的 ss-dev-run 正是这一类）`builder prune`
+# 一个字节也回收不了，指引会把运维带到反方向。
+reclaim_of() {
+    docker system df --format '{{.Type}}|{{.Reclaimable}}' 2>/dev/null \
+        | awk -F'|' -v want="$1" '$1 == want {print $2}' \
+        | sed 's/ (.*//'
+}
+
+for pair in "Build Cache|docker builder prune -f" \
+            "Images|docker image prune -f" \
+            "Containers|docker container prune -f （会删掉所有已停止的容器，确认后再跑）" \
+            "Local Volumes|docker volume prune -f"; do
+    type=${pair%%|*}
+    hint=${pair#*|}
+    gb=$(to_gb "$(reclaim_of "$type")")
+    if awk -v a="$gb" -v b="$RECLAIM_WARN_GB" 'BEGIN{exit !(a>=b)}'; then
+        notify default "Docker 可回收【${type}】约 ${gb} GB —— ${hint}"
+    fi
+done
 
 exit 0

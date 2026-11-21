@@ -669,6 +669,7 @@ def _no_real_network(monkeypatch):
 def _isolate_mkdtemp(tmp_path, monkeypatch):
     """把 `tempfile.mkdtemp()` 重定向到本用例的 `tmp_path` 下。"""
     import itertools
+    import os as _os
     import tempfile as _tf
 
     counter = itertools.count()
@@ -680,4 +681,27 @@ def _isolate_mkdtemp(tmp_path, monkeypatch):
         return str(target)
 
     monkeypatch.setattr(_tf, "mkdtemp", _mkdtemp)
+
+    # **同一类入口都要收**：评审指出只猴补 `mkdtemp` 的话，
+    # 将来有人用 `mkstemp()` / `NamedTemporaryFile(delete=False)` 又会漏到 /tmp。
+    # 这两个没有"自动清理"的语义，同样会跨用例堆积。
+    real_mkstemp = _tf.mkstemp
+
+    def _mkstemp(suffix: str | None = None, prefix: str | None = None,
+                 dir: str | None = None, text: bool = False) -> tuple[int, str]:
+        target = tmp_path / f"tmp{next(counter)}{suffix or ''}"
+        fd = _os.open(target, _os.O_RDWR | _os.O_CREAT | _os.O_EXCL, 0o600)
+        return fd, str(target)
+
+    monkeypatch.setattr(_tf, "mkstemp", _mkstemp)
+
+    _real_ntf = _tf.NamedTemporaryFile
+
+    def _named(*args, **kw):
+        # 落到 tmp_path 里；`delete=` 保持调用方语义（pytest 会整体删 tmp_path，
+        # 所以即使 delete=False 也不会跨用例泄漏）
+        kw.setdefault("dir", str(tmp_path))
+        return _real_ntf(*args, **kw)
+
+    monkeypatch.setattr(_tf, "NamedTemporaryFile", _named)
     yield

@@ -1,5 +1,28 @@
 ## [Unreleased]
 
+### 修复（Codex 复核的剩余三项）
+
+- **CI 的 pytest 也没挂 `--tmpfs`**。上一版只改了 `Makefile test` 与
+  `test-integration`，`.github/workflows/ci.yml` 仍是裸 `docker run`。
+  CI runner 虽然一次性，但 tmpfs 让临时文件**物理上不可能落到磁盘**
+  （`size=2g` 再封顶）。`exec` 同样不能省：`--tmpfs` 默认 `noexec`。
+
+- **`host_disk_guard.sh` 的可回收空间指引会把人带反方向**。
+  它把所有 Reclaimable 加成一个总数、统一建议 `docker builder prune`——
+  而**停着的容器**（事故里那 230 GB 的 `ss-dev-run` 正是这一类）
+  `builder prune` 一个字节也回收不了。改成按来源分开报：
+  Build Cache → `builder prune`、Images → `image prune`、
+  Containers → `container prune`（并提示会删掉所有已停止容器）、
+  Local Volumes → `volume prune`。
+
+- **`conftest` 的临时目录守卫只覆盖了 `mkdtemp`**。`mkstemp()` 与
+  `NamedTemporaryFile(delete=False)` 同样没有自动清理语义，将来有人在测试里
+  用了就又在 /tmp 里堆。现在两个入口一起收进 `tmp_path`，并各加一条测试
+  （取消重定向就红）。
+
+- `test_remote.sh` 的打包排除项补上 `.firecrawl` / `.superpowers` /
+  `.tmp_smoke` / `.mypy_cache` / `.ruff_cache`，别把本地工具的缓存传上去。
+
 ## [0.2.109] - 2026-11-21
 
 ### 修复（Codex 复核 2026-11-21 磁盘修复，四条都成立）

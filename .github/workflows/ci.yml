@@ -31,8 +31,12 @@ jobs:
         run: docker build --target dev -t ss-dev -f deploy/Dockerfile .
 
       - name: pytest
-        # 挂载方式与 Makefile 的 `make test` 一致；runner 上 $PWD 就是仓库根
-        run: docker run --rm -v "$PWD":/app -w /app ss-dev pytest -q
+        # 挂载方式与 Makefile 的 `make test` 一致；runner 上 $PWD 就是仓库根。
+        # **`--tmpfs /tmp:rw,exec` 必须和 Makefile 同步**：2026-11-21 的磁盘事故
+        # 就是"测试临时文件写进容器可写层、容器还不删"——CI runner 虽然是一次性的，
+        # 但 tmpfs 让临时文件**物理上不可能落到磁盘**，`size=2g` 再封个顶。
+        # `exec` 不能省：`--tmpfs` 默认 `noexec`，/tmp 里的 fake git 会执行失败。
+        run: docker run --rm --tmpfs /tmp:rw,exec,size=2g -v "$PWD":/app -w /app ss-dev pytest -q
 
   version:
     name: 版本门禁

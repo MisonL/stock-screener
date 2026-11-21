@@ -108,3 +108,34 @@ def test_mkdtemp_is_redirected_into_pytest_tmp(tmp_path):
     assert tmp_path in made.parents or made.parent == tmp_path, (
         f"mkdtemp 建到了 {made}，不在本用例的 tmp_path {tmp_path} 下——"
         "conftest 的重定向 fixture 失效了，临时目录会跨用例泄漏")
+
+
+def test_mkstemp_is_redirected_into_pytest_tmp(tmp_path):
+    """**`tempfile.mkstemp()` 也必须落在 `tmp_path` 里**（v0.2.110）。
+
+    评审指出：只猴补 `mkdtemp` 是**未覆盖边界**——`mkstemp()` 和
+    `NamedTemporaryFile(delete=False)` 同样没有自动清理语义，将来有人在测试里
+    用了就又会在 /tmp 里堆积。2026-11-21 那 33 万个路径就是这么来的。
+    """
+    import os
+    import tempfile
+    from pathlib import Path
+
+    fd, name = tempfile.mkstemp(prefix="ss-")
+    os.close(fd)
+    p = Path(name)
+    assert p.exists()
+    assert tmp_path in p.parents, (
+        f"mkstemp 建到了 {p}，不在 tmp_path {tmp_path} 下——会跨用例泄漏")
+
+
+def test_named_temporary_file_lands_in_pytest_tmp(tmp_path):
+    """`NamedTemporaryFile` 同样收进 `tmp_path`（v0.2.110）。"""
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.NamedTemporaryFile(prefix="ss-", delete=False) as f:
+        f.write(b"x")
+        name = f.name
+    assert tmp_path in Path(name).parents, (
+        f"NamedTemporaryFile 建到了 {name}，不在 tmp_path 下")

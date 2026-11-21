@@ -37,6 +37,8 @@ tar -cf "$TARBALL" \
     --exclude='node_modules' --exclude='__pycache__' \
     --exclude='.pytest_cache' --exclude='web/dist' --exclude='data' \
     --exclude='.venv' --exclude='*.pyc' \
+    --exclude='.firecrawl' --exclude='.superpowers' --exclude='.tmp_smoke' \
+    --exclude='.mypy_cache' --exclude='.ruff_cache' \
     -C "$ROOT" .
 
 # 参数用 **bash 数组** 传递：`ARGS="$*"` 会把带空格的参数（如 `-k "a b"`）拆坏，

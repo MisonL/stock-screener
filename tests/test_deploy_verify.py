@@ -453,3 +453,30 @@ def test_main_exits_3_without_rollback_when_public_check_fails(monkeypatch, caps
  assert "外部探活失败" in out
  assert "rollback" not in calls, "外部故障不该触发代码回滚"
  assert "record:sha256:new" in calls, "镜像本身已验过，应该记为可用"
+
+def test_check_public_health_sends_a_real_user_agent(monkeypatch):
+    """**必须带非 urllib的 UA**：Cloudflare把 `Python-urllib/x.y`判成爬虫返回403。
+
+    实测：同一地址 curl200、Python-urllib403、stock-screener-deploy/1.0200。
+    丢了 UA这条，门禁会在生产上每次都报"外部探活失败"，而服务其实好得很。
+    """
+    seen = {}
+
+    class Resp:
+        status =200
+        def read(self, n):
+            return b'{"ok":true}'
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    def fake(req, timeout):
+        seen["ua"] = req.get_header("User-agent")
+        return Resp()
+
+    monkeypatch.setattr(deploy.urllib.request, "urlopen", fake)
+    assert deploy.check_public_health("https://x/healthz") == "OK"
+    ua = seen.get("ua") or ""
+    assert ua, "没有带 User-Agent"
+    assert "urllib" not in ua.lower(), f"UA是 urllib，会被 Cloudflare403：{ua}"

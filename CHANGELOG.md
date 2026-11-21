@@ -1,5 +1,34 @@
 ## [Unreleased]
 
+###修复（外部探活默认 UA被 Cloudflare判成爬虫）
+
+v0.2.123上线后第一次带 `--public-url`部署，门禁立刻报：
+
+```
+**外部探活失败**：FAIL:请求失败 HTTPError: HTTP Error403: Forbidden
+```
+
+而同一条命令 `curl`是200。实测三者对比：
+
+| UA |结果 |
+|---|---|
+| `curl/8.7.1`（curl默认） |200 |
+| `Python-urllib/3.14` （urllib默认） | **403** |
+| `stock-screener-deploy/1.0` |200 |
+
+Cloudflare把默认 urllib UA当爬虫拦了。→显式设置
+ `User-Agent: stock-screener-deploy/1.0`。
+
+**这条值得记下来**：新加的检查第一次跑就报红，而**红的原因不是服务坏了**，
+是检查自己不讨喜。如果不看 UA就直接信它，会得出"生产不可用"的错误结论——
+和之前"0.8秒判成功"是同一类错误的两面：**结论比证据跑得快**。
+
+补测试 `test_check_public_health_sends_a_real_user_agent`：
+断言请求头里的 UA非空且不含 `urllib`。
+变异验证：把 Request换回裸 `urlopen` →测试红在断言。
+
+**测试**：28条。81.4全量 **1378 passed,3 skipped**。
+
 ## [0.2.123] - 2026-11-22
 
 ###新增（部署后从外部验一次 /healthz）

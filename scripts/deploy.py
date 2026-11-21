@@ -388,27 +388,34 @@ def _image_id(host: str) -> str:
     return ""
 
 
+UA = "stock-screener-deploy/1.0"
+
+
 def check_public_health(url: str, timeout_s: int =20) -> str:
-     """从**外部**探一次 `/healthz`；返回 "OK" / "FAIL:<原因>" / "SKIP"。
+    """从**外部**探一次 `/healthz`；返回 "OK" / "FAIL:<原因>" / "SKIP"。
 
     容器 healthy只说明容器内部自洽。cloudflared挂了、DNS改了、证书过期，
     容器全是 `Up (healthy)`，而用户一个都访问不到——这一层必须单独验。
 
     url为空时返回 SKIP（站点没配公网地址，或本地调试）。
-     """
-     if not url:
+    """
+    if not url:
         return "SKIP"
-     try:
-        with urllib.request.urlopen(url, timeout=timeout_s) as resp:
+    try:
+        # **必须带 User-Agent**：Cloudflare把默认的 `Python-urllib/x.y`判成爬虫
+        #返回403——实测同一地址 `curl`200、`urllib`403。
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             code = resp.status
             body = resp.read(4000).decode("utf-8", "replace")
-     except Exception as exc:
+    except Exception as exc:
         return f"FAIL:请求失败 {type(exc).__name__}: {exc}"
-     if code !=200:
+    if code !=200:
         return f"FAIL:HTTP {code}"
-     if chr(34) + "ok" + chr(34) + ":true" not in body.replace(" ", "").replace(chr(10), ""):
+    if chr(34) + "ok" + chr(34) + ":true" not in body.replace(" ", "").replace(chr(10), ""):
         return f"FAIL:响应里没有 ok:true：{body[:120]}"
-     return "OK"
+    return "OK"
+
 
 
 def main(argv: list[str] | None = None) -> int:

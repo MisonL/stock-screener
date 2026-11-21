@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.2.124] - 2026-11-22
+
 ###修复（外部探活默认 UA被 Cloudflare判成爬虫）
 
 - **显式设置 `User-Agent: stock-screener-deploy/1.0`**：Cloudflare把 urllib

@@ -29,7 +29,7 @@ from types import SimpleNamespace
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from jobs.backup import backup_db
+from jobs.backup import backup_db, prune_orphan_tmp
 from jobs.cleanup import check_backup_freshness, check_disk, cleanup
 from jobs.intraday import IntradayTick
 from jobs.snapshot import SnapshotLoops, calls_by_scope
@@ -273,6 +273,15 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
         # **备份陈旧检查放这里**（早上 08:55，备份应在昨晚 23:30 跑过）：
         # 部署窗口压在 23:30 时那一晚会**静默跳过**备份，7 份保留位出现空洞
         # 也没人知道（2026-11-21 实测：11-20 那天就缺了一份）。
+        # **顺手清掉中断留下的半截备份**：它们以 `.` 开头，`ls` 看不见、
+        # `_prune` 也匹配不到，实测攒过 ~3.9 GB。只清 2 小时以上的，
+        # 免得删掉正在写的那份。
+        try:
+            gone = prune_orphan_tmp(Path(data_dir) / "backups")
+            if gone:
+                log.info("清理中断备份 %d 个：%s", len(gone), ", ".join(gone))
+        except Exception:                      # noqa: BLE001
+            log.warning("清理中断备份失败", exc_info=True)
         try:
             # 陈旧时也会 `dispatcher.alert`（写 push_log），所以同样在写锁里
             with _write_lock(loops):

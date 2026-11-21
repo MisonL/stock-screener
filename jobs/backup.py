@@ -69,29 +69,44 @@ def prune_orphan_tmp(out_dir: Path, *, max_age_s: float = ORPHAN_TMP_S,
         return []
     now_ts = time.time() if now is None else now
     removed: list[str] = []
-    for f in out_dir.glob(".market-*.db.tmp*"):
-        try:
-            if now_ts - f.stat().st_mtime < max_age_s:
-                continue                      # 可能正在写，别动
-        except OSError:
-            continue
+
+    def _try_unlink(f: Path) -> bool:
+        """真删掉了才返回 True——**返回值和日志不能比事实乐观**。"""
         try:
             f.unlink()
-            removed.append(f.name)
+            return True
+        except OSError:
+            return False
+
+    # **glob 只匹配主体 `.tmp`，不带尾随 `*`**（Codex 复核抓到的）：
+    # 带 `*` 时 `-shm` / `-wal` 也是独立候选项，各自按自己的 mtime 判——
+    # 主文件还新鲜、伴生文件超过 2 小时，伴生就会被**单独删掉**，
+    # 而那份备份其实还在写，删掉 shm 等于破坏它。
+    for f in sorted(out_dir.glob(".market-*.db.tmp")):
+        try:
+            if now_ts - f.stat().st_mtime < max_age_s:
+                continue                      # 可能正在写，主体和伴生都别动
         except OSError:
             continue
-        # 伴生的 `-shm` / `-wal` **跟着主体走，不看它们自己的 mtime**：
-        # 主体都删了，它们已经是孤儿，留着只是垃圾。
-        # （实测里这三个文件的 mtime 相同，但 SQLite 关闭时可能重写 shm，
-        # 按 mtime 判会被当成"新鲜"而漏掉。）
+        if not _try_unlink(f):
+            continue
+        removed.append(f.name)
+        # 伴生文件**跟着主体走**：主体都删了它们就是孤儿。
+        # SQLite 关闭时可能重写 shm，按 mtime 判会被当成"新鲜"而漏掉。
         for ext in ("-shm", "-wal"):
             side = f.with_name(f.name + ext)
-            if side.exists():
-                try:
-                    side.unlink()
-                    removed.append(side.name)
-                except OSError:
-                    pass
+            if side.exists() and _try_unlink(side):
+                removed.append(side.name)
+
+    # 第二遍：**主体已经不在了的孤儿伴生文件**。第一遍碰不到它们
+    # （它们不匹配主体的 glob），不主动清就会一直留着。
+    for side in sorted(out_dir.glob(".market-*.db.tmp-*")):
+        main = side.with_name(side.name.rsplit("-", 1)[0])
+        if main.exists():
+            continue                          # 主体还在，交给第一遍按主体判
+        if _try_unlink(side):
+            removed.append(side.name)
+
     return removed
 
 

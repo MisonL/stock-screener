@@ -386,8 +386,12 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
                                            timezone=SH), id="archive", **JOB_DEFAULTS)
     sched.add_job(backup_job, CronTrigger(hour=23, minute=30, timezone=SH), id="backup",
                   misfire_grace_time=3600, coalesce=True, max_instances=1)
+    # **备份陈旧检查不能只在工作日跑**：周五 23:30 若被中断，
+    # 周六 08:55 不跑、周日也不跑，到周一才检查——那时 age 已经 80+ 小时，
+    # 当然会报，但**周末两天完全没有告警窗口**。数据库 7×24 在写，
+    # 备份检查没有理由跳过周末。
     sched.add_job(self_check_job,
-                  CronTrigger(hour=8, minute=55, day_of_week="mon-fri", timezone=SH),
+                  CronTrigger(hour=8, minute=55, timezone=SH),
                   id="self_check", **JOB_DEFAULTS)
     sched.add_job(members_job,
                   CronTrigger(hour=8, minute=50, day_of_week="mon-fri", timezone=SH),

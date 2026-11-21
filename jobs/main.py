@@ -924,7 +924,6 @@ def main() -> int:                                  # pragma: no cover - 进程�
 
     refine_actions, refine_susp = make_refresh_hooks(_westock, cfg, conn)
     startup_recovery(cfg, conn, clock, reg=reg, tick=tick, dispatcher=dispatcher, loops=loops,
-    data_dir=data_dir,
                         refresh_actions=refine_actions, refresh_suspensions=refine_susp)
     # **必须在 startup_recovery 之后再算一次**：它可能耗时数十分钟，
     # 而补跑任务的 run_date 是在 make_scheduler 里基于那时的 now 算的。

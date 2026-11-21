@@ -30,7 +30,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from jobs.backup import backup_db
-from jobs.cleanup import check_disk, cleanup
+from jobs.cleanup import check_backup_freshness, check_disk, cleanup
 from jobs.intraday import IntradayTick
 from jobs.snapshot import SnapshotLoops, calls_by_scope
 from core.clock import SH, SystemClock, TradingCalendar
@@ -265,6 +265,16 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
 
     def self_check_job():
         result = self_check(cfg, conn, clock, reg=reg)
+        # **备份陈旧检查放这里**（早上 08:55，备份应在昨晚 23:30 跑过）：
+        # 部署窗口压在 23:30 时那一晚会**静默跳过**备份，7 份保留位出现空洞
+        # 也没人知道（2026-11-21 实测：11-20 那天就缺了一份）。
+        try:
+            age = check_backup_freshness(conn, data_dir, now=clock.now(),
+                                         dispatcher=dispatcher)
+            if age is not None:
+                result["backup_age_h"] = round(age, 1)
+        except Exception:                      # noqa: BLE001 —— 自检不该被它拖死
+            log.warning("备份陈旧检查失败", exc_info=True)
         state["self_check"] = result        # 心跳下一次会把 self_check 一起写进去，不会互相覆盖
         with _write_lock(loops), _heartbeat_lock:
             row = conn.execute(

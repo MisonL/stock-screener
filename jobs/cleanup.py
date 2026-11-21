@@ -163,3 +163,43 @@ def disk_used_pct(path: str) -> float:
     except OSError:
         return 0.0
     return usage.used / usage.total * 100 if usage.total else 0.0
+
+
+#: 备份允许的最大陈旧时间（小时）。备份在 23:30 跑，次日 08:55 的自检若看到
+#: 最新备份超过这个时长，说明**昨晚那次没跑成**。
+#: 2026-11-21 实测到的真实缺口：`data/backups/` 里有 11-13/14/16/17/18/19，
+#: 独独缺了 11-20——那天晚上连着做了几次部署，jobs 容器在 23:30 前后被重建，
+#: 而 `misfire_grace_time=3600` 只兜一小时，过了就静默跳过。
+BACKUP_STALE_H = 36
+
+
+def check_backup_freshness(conn, data_dir, now=None, dispatcher=None,
+                           *, keep: int = 7, stale_h: int = BACKUP_STALE_H) -> float | None:
+    """返回最新备份距今的小时数；**超时则告警**。
+
+    为什么需要它：备份只有 `misfire_grace_time=3600` 的兜底，部署窗口正好压在
+    23:30 时那一晚的备份会被**静默跳过**——7 份保留位里出现一个空洞，
+    谁都不会发现，直到真要从备份恢复的那天。
+
+    只看文件时间，不碰数据库，所以不需要写锁。
+    """
+    from datetime import datetime, timezone
+    from pathlib import Path as _P
+
+    root = _P(data_dir) / "backups"
+    if not root.is_dir():
+        return None
+    files = sorted(root.glob("market-*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not files:
+        if dispatcher is not None:
+            dispatcher.alert("backup_stale", "没有任何数据库备份", "P1")
+        return None
+    newest = files[0]
+    now_ts = (now or datetime.now(timezone.utc)).timestamp()
+    age_h = (now_ts - newest.stat().st_mtime) / 3600
+    if dispatcher is not None and age_h > stale_h:
+        dispatcher.alert(
+            "backup_stale",
+            f"最新备份是 {newest.name}（{age_h:.0f} 小时前），超过 {stale_h} 小时",
+            "P1")
+    return age_h

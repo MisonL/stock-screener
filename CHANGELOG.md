@@ -1,5 +1,63 @@
 ## [Unreleased]
 
+### 修复（2026-11-21 磁盘写满事故）
+
+本机 Docker Desktop 虚拟磁盘写满（294.65/294.68 GB），PostgreSQL 起不来：
+`could not write lock file "postmaster.pid": No space left on device`。
+元凶是**项目自己的长期测试容器** `ss-dev-run`（`sleep infinity`，从不删除）：
+`docker system df` 显示容器占用 **230.4 GB**、其中 230.2 GB 可回收，
+而镜像只有 654 MB；`docker diff` 在它的 `/tmp` 下统计到 **33 万个变更路径**。
+
+根因两条，各修一条。**没有连续采样，所以不声称知道每一 GB 的归属**——
+能确认的是数据类型（临时 SQLite、审计快照、变异副本、`__pycache__`）和
+"长期复用 + 从不清理"这个工作方式。
+
+- **测试写出来的临时目录从不清理**。`tests/chat/test_session.py` 12 处、
+  `tests/jobs/test_main_scheduler.py` 1 处直接 `tempfile.mkdtemp()`。
+  → `tests/conftest.py` 加 autouse fixture，把 `tempfile.mkdtemp` 重定向到
+  本用例的 `tmp_path`（pytest 自动清理）。**用猴补而不是逐个改调用点**：
+  以后新写的测试自动受约束，不靠人记得。`tests/test_no_manual_internal_state.py`
+  里加一条测试钉住它（取消重定向就红）。
+
+- **容器长期不删**。`make test` 用的是 `docker run --rm`，但日常是
+  `docker exec` 进一个 `sleep infinity` 的容器，**绕过了清理**。
+  → `Makefile` 的 `test` 加 `--tmpfs /tmp:rw,exec,size=2g`：临时文件进内存、
+  随容器销毁、容量封顶。**`exec` 不能省**——Docker 的 `--tmpfs` 默认 `noexec`，
+  `/tmp` 里的脚本执行不了，`tests/test_release_script.py` 的 fake git 正好在那，
+  会静默退回真实 git 然后报 `fatal: not a git repository`（实测 4 条假红）。
+  → 新增 `scripts/test_remote.sh`：只在测试机上跑，必须 `--rm`、每次独立目录、
+  **不 `docker exec` 进生产容器**（往生产容器写文件正是这次事故的形状）。
+
+### 修复（监控前移：原来一天只查一次）
+
+- **磁盘巡检从"每日 16:00 一次"改成"每 10 分钟一次"**。原来它埋在
+  `cleanup` 里、阈值 85/95；而磁盘从 70% 涨到 100% 只花了几个小时，
+  等 cleanup 跑起来已经晚了。现在 `jobs/cleanup.py::check_disk()` 独立成任务
+  （`jobs/main.py` 的 `disk_job`，**与交易日和盘中窗口无关**——磁盘不看开市），
+  三档 75/85/95，75% 就提前喊。监控的是**宿主机根分区**：容器里 `df /`
+  看到的就是宿主机文件系统，Docker 的 `/var/lib/docker` 也在上面。
+
+- **新增 `scripts/host_disk_guard.sh`（宿主机侧）**。容器里看不到
+  `/var/lib/docker` 的可写层明细（该目录在容器内是空的），所以"某个容器在偷偷长"
+  这个信号只能在宿主机拿。它盯三件事：分区水位、**单容器可写层**、
+  Docker 可回收空间。**只报告，不自动删**——删什么属于运维决策。
+
+- **备份漏跑会被喊出来**。2026-11-21 实测的真实缺口：`data/backups/` 里有
+  11-13/14/16/17/18/19，独独缺 **11-20**——那晚连着几次部署，jobs 容器在
+  23:30 前后被重建，而备份只有 `misfire_grace_time=3600` 兜底，过了就静默跳过。
+  7 份保留位出现空洞，直到真要恢复的那天才发现。
+  → `check_backup_freshness()` 在每天 08:55 的自检里查最新备份时间，
+  超 36 小时告警。
+
+- **dev 镜像补 `git`**：`tests/test_version.py` / `test_release_script.py` /
+  `test_scan_secrets.py` 都要读 git 历史与 tag，缺 git 不是跳过而是假红。
+
+- **`deploy/RUNBOOK.md` 加 §12.1**：测试容器不许长期留守，附事故数字与
+  两条硬规矩（`--rm`；临时文件落 tmpfs / `tmp_path`）。
+
+**没有做的事**：没有连续空间采样，也没有删除前各目录的大小清单，
+所以**无法给出真实增长曲线、也不能断言 230 GB 全部来自 `/tmp`**。
+
 ### 清理（死代码，审计清单里的低危项）
 
 - **`core/db.py::connect_lite()`**：零调用。`api/main.py` 走的是

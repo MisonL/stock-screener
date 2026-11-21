@@ -86,3 +86,25 @@ def test_no_test_assigns_derived_internal_state():
         "请改成从**生产路径的输入**出发（例如把 `llm_budget` 写到用完，"
         "让 `_budget_exhausted_now()` 自己算出 True）。\n\n"
         + "\n".join(offenders))
+
+
+def test_mkdtemp_is_redirected_into_pytest_tmp(tmp_path):
+    """**`tempfile.mkdtemp()` 必须落在 `tmp_path` 里**（v0.2.108）。
+
+    2026-11-21：本机长期测试容器 `ss-dev-run` 的可写层涨到 230 GB，撑爆
+    Docker 虚拟磁盘，PostgreSQL 起不来。`docker diff` 在它的 `/tmp` 下统计到
+    约 33 万个变更路径——`tests/chat/test_session.py` 12 处、
+    `tests/jobs/test_main_scheduler.py` 1 处直接 `tempfile.mkdtemp()`，
+    **从不清理**，每次跑测试都留十几个目录和 SQLite 文件。
+
+    `tests/conftest.py` 的 autouse fixture 把 `mkdtemp` 重定向到 `tmp_path`。
+    这条测试钉住那个 fixture：删掉它、或改成不重定向，这里就必须红。
+    """
+    import tempfile
+    from pathlib import Path
+
+    made = Path(tempfile.mkdtemp())
+    assert made.exists(), "mkdtemp 没建出目录"
+    assert tmp_path in made.parents or made.parent == tmp_path, (
+        f"mkdtemp 建到了 {made}，不在本用例的 tmp_path {tmp_path} 下——"
+        "conftest 的重定向 fixture 失效了，临时目录会跨用例泄漏")

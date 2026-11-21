@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.2.120] - 2026-11-21
+
 ###文档（RUNBOOK §9.3.1：把新的部署验收与回滚写清楚）
 
 评审列的轻微项：`deploy/RUNBOOK.md`仍在教老的回滚法（`git checkout tag`

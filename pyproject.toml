@@ -1,6 +1,6 @@
 [project]
 name = "stock-screener"
-version = "0.2.118"
+version = "0.2.119"
 description = "A 股盘后选池与盘中盯盘 agent"
 requires-python = ">=3.12"
 

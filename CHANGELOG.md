@@ -1,5 +1,23 @@
 ## [Unreleased]
 
+###文档（RUNBOOK §9.3.1：把新的部署验收与回滚写清楚）
+
+评审列的轻微项：`deploy/RUNBOOK.md`仍在教老的回滚法（`git checkout tag`
++ build），没写 `stock-screener:rollback`标签、没写 `.last_good_image`、
+也没提醒 `docker image prune -a`会删掉回滚镜像。
+
+新增 §9.3.1：
+
+-完整七步流程（快照 →构建 →验收四段 →写好镜像 →失败回滚 →UNKNOWN只报警）；
+- **为什么必须 settle与 health**：`up -d`返回时容器就是 `Up0 seconds`，
+旧实现实测0.8秒就放行；
+-手工排障开关（`--no-verify` / `--settle0 --verify-wait30`）；
+-跨多个版本时的 `git checkout tag`老路（作为备用，而非默认）；
+- **⚠️ `docker image prune -a`会删掉回滚镜像**：`-f`（不带 `-a`）
+只删 dangling，`-a`会把没被容器引用的标签镜像一起清掉；
+- **⚠️回滚只回代码，不回数据**：`migrate()`只前进没有 down，
+跨大版本回滚前先按 §9.2备库。
+
 ## [0.2.119] - 2026-11-21
 
 ###修复（build/up失败时不回滚——Codex两次评审都点到的最后一条）

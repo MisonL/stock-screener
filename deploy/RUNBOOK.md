@@ -465,6 +465,60 @@ git checkout main
 `[0.1.0]` 小节说明）。事故中先 `git tag --list --sort=-v:refname` 看真实落点，
 再动手。
 
+###9.3.1部署现在会自己验收、自己回滚
+
+`scripts/deploy.py`从 v0.2.116起带部署后验收，v0.2.117修掉了
+「0.8秒就放行」的假验收，v0.2.119补上 build/up失败也回滚。
+
+**流程**：
+
+1.构建前把 `stock-screener:rollback`指向**上一次验收通过的镜像**
+ （记在目标机的 `.last_good_image`；没有这个文件时才退回用当前 `latest`）。
+2. `compose build` + `up -d --force-recreate`。
+3. **验收**（最多 `--verify-wait`秒，默认90）：
+ -先无条件观察 `--settle`秒（默认20），期间任何容器
+ `Restarting` / `unhealthy` →立即失败；
+ - `api`/`jobs`/`agent`必须都在 running；
+ -有 healthcheck的必须变成 `healthy`；
+ - **容器跑的镜像 ID必须等于这次构建的 ID**；
+ -最近4分钟启动日志里不能有 `Traceback`。
+4.通过 →把镜像 ID写进 `.last_good_image`，退出0。
+5.确认失败（`FAIL:`）→自动回滚并**再验收一次**，退出1。
+6. **无法确认**（`UNKNOWN:`，ssh抖动/脚本异常）→ **只报警，不自动回滚**。
+自动回滚会把一次成功的部署强行切回旧版本，代价比报警大。
+
+**为什么要 settle和 health**：`up -d`返回时容器状态就是 `Up0 seconds`。
+旧实现「看到 running就通过」实测 **0.8秒**就返回 OK——部署后30秒
+才崩的容器根本等不到。
+
+**手工排障**：
+
+```bash
+python3 scripts/deploy.py --host <ip> --dir <path> --no-verify #跳过验收（仅排障）
+python3 scripts/deploy.py --host <ip> --dir <path> --settle0 --verify-wait30
+```
+
+**回到某个历史版本**（跨多个版本、或 `rollback`标签已经不对时）：
+
+```bash
+git tag --list --sort=-v:refname #先看真实落点，别凭记忆写版本号
+git checkout <上一个 tag>
+docker compose -f deploy/docker-compose.yml --project-directory . build api
+docker compose -f deploy/docker-compose.yml --project-directory . up -d --force-recreate api jobs agent
+curl -s https://stock.example.com/healthz # version应变成回滚到的版本
+git checkout main
+```
+
+⚠️ **`docker image prune -a`会删掉回滚镜像**。`stock-screener:rollback`
+是带标签的镜像，`docker image prune -f`（不带 `-a`）只删 dangling，
+不会动它；但 `-a` / `system prune -a`会把"没有被容器引用"的标签镜像
+一并清掉，回滚能力随之消失。`scripts/host_disk_guard.sh`建议的是
+不带 `-a`的那条，别自作主张加。
+
+⚠️ **回滚只回代码，不回数据**。`data/market.db`是 bind mount，
+`core/db.py`的 `migrate()`只前进没有 down。跨大版本回滚前，
+先按 §9.2备一份库。
+
 **三个坑**（都踩过）：
 
 1. `docker compose build` 输出被 `tail -1` 吞掉时可能静默失败（拉 Docker Hub token

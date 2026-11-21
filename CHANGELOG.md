@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.2.110] - 2026-11-21
+
 ### 修复（Codex 复核的剩余三项）
 
 - **CI 的 pytest 也没挂 `--tmpfs`**。上一版只改了 `Makefile test` 与

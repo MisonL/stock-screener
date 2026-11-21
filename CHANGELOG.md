@@ -1,5 +1,34 @@
 ## [Unreleased]
 
+###修复（第三轮评审：三项窄范围复核）
+
+对 v0.2.121做的五项窄范围复核确认：**四项已修**（marker读取、Exited判据、
+空镜像ID、UNKNOWN退出码3），六条变异全部红在断言。但仍有三个缺口：
+
+- **`health: starting`被判成功**。[严重]
+等健康的循环写作 `while [ now -lt deadline ]`；一旦进入这一步时 deadline
+已过（`--settle`接近或超过 `--verify-wait`、或前面等 running耗掉了预算），
+循环**一次都不执行**，`pending`停在初始值0 →直接判「健康检查通过」。
+ →在末尾**直接再查一次**每个服务的状态，见 `*health:*`即判 FAIL，
+不再依赖循环是否执行过。
+
+- **回滚后的复验因空镜像 ID判 UNKNOWN**。[中等]
+回滚分支调用 `verify_deployment(..., image_id=None)`，而 v0.2.121刚加了
+「EXPECT为空直接判 UNKNOWN」——于是**每次回滚后的复验都白做**。
+ →回滚会把 `latest`指回旧镜像，所以复验时**重新取一次**镜像 ID传入。
+
+- **「回滚后必须复验」没有被测试钉住**。[中等]
+原测试只在 `verify_deployment` **被调用时**才断言「此时已有 rollback」——
+把那行调用整个删掉，断言根本不执行，20条照样全绿。
+ →加 `verifies`计数器，最后断言 `assert verifies`。
+变异验证：把复验调用改成 `back = "OK"` →
+ `AssertionError:回滚后没有复验——把那行删掉测试必须红`。
+
+另补一条真脚本测试 `test_real_script_fails_while_health_is_still_starting`：
+假 docker让容器停在 `Up3 seconds (health: starting)`，脚本必须判 FAIL。
+
+**测试**：21条。81.4全量 **1371 passed,3 skipped**。
+
 ## [0.2.121] - 2026-11-22
 
 ###修复（第二轮评审：marker从没被读出来过）

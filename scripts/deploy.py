@@ -275,8 +275,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
  sleep 2
 done
 
-# ----3.等健康检查（有 healthcheck的必须变 healthy） ----
-pending=0
+# ----3.等健康检查（有 healthcheck的必须变 healthy）
 while [ "$(date +%s)" -lt "$deadline" ]; do
  check_svc || exit 0
  pending=0
@@ -286,18 +285,21 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
  done
  if [ "$pending" = "0" ]; then break; fi
  sleep 2
-done
+ done
 
-# ----4.最后再确认一次：还在跑、且不是 restarting ----
+# ----4.最后再确认一次：还在跑、不是 restarting、healthcheck已过 ----
 check_svc || exit 0
 for c in $SVC; do
  docker ps --filter "name=$c" --filter status=running \
  --format '{{{{.Names}}}}' | grep -qx "$c" \
  || {{ echo "SS_VERIFY=FAIL:容器未运行 $c"; exit 0; }}
+ # **这里必须再直接查一次**：上面那个等健康的循环一旦因为 deadline已过
+ #而一次都没执行，pending会停在0——等于「没等过就判通过」。
+ st=$(docker ps -a --format '{{{{.Names}}}}|{{{{.Status}}}}' | grep -E "^$c\\|" | head -1)
+ case "$st" in
+ *health:*) echo "SS_VERIFY=FAIL:健康检查未通过 $st"; exit 0 ;;
+ esac
 done
-if [ "$pending" = "1" ]; then
- echo "SS_VERIFY=FAIL:健康检查在预算内未通过"; exit 0
-fi
 
 # ----5.跑的是不是这次构建的镜像 ----
 if [ -z "$EXPECT" ]; then
@@ -461,8 +463,10 @@ def main(argv: list[str] | None = None) -> int:
         ok, code = rollback(args.host, args.dir, args.services)
         if ok:
             print("已回退到上一个镜像（stock-screener:rollback）")
+            #回滚会把 latest指回旧镜像，所以**重新取一次**镜像 ID；
+            #传 None会让 EXPECT为空 →复验直接判 UNKNOWN，等于白验。
             back = verify_deployment(args.host, args.services, args.verify_wait,
-            image_id=None, settle_s=args.settle)
+            image_id=_image_id(args.host), settle_s=args.settle)
             print("回滚后验收：" + ("通过" if back == "OK" else back))
         else:
             print("**回退失败**： " + code)
@@ -505,8 +509,10 @@ def main(argv: list[str] | None = None) -> int:
             print("已回退到上一个镜像（stock-screener:rollback）")
             # **回滚后也要再验收一次**：回滚本身也可能失败（旧镜像也起不来、
             #数据被新版本改过结构）。只打印一句「请人工确认」等于把验证又甩给人。
+            #回滚会把 latest指回旧镜像，所以**重新取一次**镜像 ID；
+            #传 None会让 EXPECT为空 →复验直接判 UNKNOWN，等于白验。
             back = verify_deployment(args.host, args.services, args.verify_wait,
-             image_id=None, settle_s=args.settle)
+             image_id=_image_id(args.host), settle_s=args.settle)
             if back == "OK":
              print("回滚后验收通过：已恢复到上一个可用版本")
             else:

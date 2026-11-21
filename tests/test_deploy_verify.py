@@ -232,6 +232,7 @@ def test_build_failure_also_rolls_back(monkeypatch, capsys):
     """
     calls = []
 
+    verifies = []
     def boom(cmd):
         joined = " ".join(cmd)
         if "build api" in joined:
@@ -249,9 +250,10 @@ def test_build_failure_also_rolls_back(monkeypatch, capsys):
     monkeypatch.setattr(deploy, "snapshot_image", lambda h, d: "MARKER")
     monkeypatch.setattr(deploy, "_run", boom)
     monkeypatch.setattr(deploy, "config_drift_script", lambda d: "true")
+    monkeypatch.setattr(deploy, "_image_id", lambda h: "sha256:old")
     monkeypatch.setattr(deploy, "rollback", fake_rollback)
     def verify_after_rollback(*args, **kwargs):
-        #回滚之后**必须**再验一次（M6）；回滚之前不该验收
+        verifies.append(1)
         assert "rollback" in calls, "验收跑在回滚之前了"
         return "OK"
     monkeypatch.setattr(deploy, "verify_deployment", verify_after_rollback)
@@ -261,6 +263,7 @@ def test_build_failure_also_rolls_back(monkeypatch, capsys):
     assert code !=0, "构建失败却返回成功"
     assert "rollback" in calls, "构建失败但没有回滚——会留下半新半旧的栈"
     assert "构建或重启失败" in out
+    assert verifies, "回滚后没有复验——把那行删掉测试必须红"
 
 FAKE_DOCKER = """#!/bin/bash
 #假 docker：只实现验收脚本用到的几个子命令。
@@ -363,3 +366,15 @@ def test_real_script_fails_when_unhealthy(tmp_path):
  status="Up2 minutes (unhealthy)")
  assert "SS_VERIFY=FAIL" in got, got
  assert "不健康" in got, got
+    
+
+def test_real_script_fails_while_health_is_still_starting(tmp_path):
+    """**`health: starting`不能判通过**。
+
+    第三轮评审复现：如果等健康的循环因为 deadline已过而一次都没执行，
+    `pending`会停在0，等于「没等过就判通过」。现在结尾会**直接再查一次**状态。
+    """
+    got = _run_verify(tmp_path, "sha256:new", "sha256:new",
+    status="Up3 seconds (health: starting)")
+    assert "SS_VERIFY=FAIL" in got, got
+    assert "健康检查未通过" in got, got

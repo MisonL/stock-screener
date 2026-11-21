@@ -51,9 +51,9 @@ cd "\$WORK"
 # **关键**：新开一次性容器，而不是 docker exec 进生产容器——
 # 后者会把测试文件写进生产容器的可写层，正是这次事故的形状。
 docker run --rm \\
-    --tmpfs /tmp:rw,size=2g \\
+    --tmpfs /tmp:rw,exec,size=2g \\
     -v "\$WORK":/app -w /app \\
-    $IMAGE pytest -q $ARGS
+    $IMAGE bash scripts/_remote_pytest.sh $ARGS
 EOF
 
 scp -q -o BatchMode=yes "$TARBALL" "$HOST:/tmp/ss-src.tar"

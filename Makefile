@@ -12,9 +12,12 @@ NET ?= ss-test-$$$$
 # 挂成 tmpfs 后，测试写的任何临时文件**随容器销毁而消失**，且容量被
 # `size=` 封顶——再怎么写也撑不爆宿主机磁盘。
 # `--rm` 保证容器不残留（长期 `sleep infinity` 的守护容器不享受这个清理）。
+# **`exec` 不能省**：Docker 的 `--tmpfs` 默认带 `noexec`，于是 `/tmp` 里的脚本
+# 执行不了——`tests/test_release_script.py` 的 fake `git` 正好在 /tmp 下，
+# 会静默退回真实 git 然后报 `fatal: not a git repository`（实测 4 条假红）。
 test:
 	docker build --target dev -t $(IMAGE) -f deploy/Dockerfile .
-	docker run --rm --tmpfs /tmp:rw,size=2g -v "$$PWD":/app -w /app $(IMAGE) pytest -q
+	docker run --rm --tmpfs /tmp:rw,exec,size=2g -v "$$PWD":/app -w /app $(IMAGE) pytest -q
 
 # 测试进程本身也在容器里，必须与 ntfy 同网络才解析得到容器名；不发布任何端口。
 test-integration:

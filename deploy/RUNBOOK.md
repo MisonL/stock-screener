@@ -603,3 +603,35 @@ df -h /                          # 目标：可用空间 > 30G
 ```
 
 **不需要**动 `data/backups/`（7 份日备份 ≈8.5 GB，是恢复演练依赖的资产）。
+
+### 12.1 测试容器不许长期留守（2026-11-21 事故）
+
+> 本机 Docker Desktop 虚拟磁盘写满（294.65/294.68 GB），PostgreSQL 起不来：
+> `could not write lock file "postmaster.pid": No space left on device`。
+> 元凶是项目自己的长期测试容器 `ss-dev-run`（`sleep infinity`，**从不删除**）：
+> `docker system df` 显示容器占用 **230.4 GB**、其中 230.2 GB 可回收，
+> 而那个镜像只有 654 MB。`/tmp` 下统计到 33 万个变更路径。
+
+两条硬规矩：
+
+1. **不要在测试机上养一个常驻容器**。跑测试用 `make test`（内部是
+   `docker run --rm`）或 `scripts/test_remote.sh`（远端 `--rm`）。
+   `docker run --rm` 会收拾，`sleep infinity` 的守护容器不会。
+2. **临时文件必须落在 tmpfs 或 `pytest` 的 `tmp_path` 里**。
+   `Makefile` 的 `test` 已带 `--tmpfs /tmp:rw,size=2g`——临时文件进内存、
+   随容器销毁、容量封顶。代码侧由 `tests/conftest.py` 的 autouse fixture
+   兜底：任何 `tempfile.mkdtemp()` 都会被重定向到本用例的 `tmp_path`。
+
+应用侧巡检（每 10 分钟）：`jobs` 的 `disk` 任务查宿主机根分区，
+75% 预警 / 85% P1 / 95% P0。阈值在 `jobs/cleanup.py`。
+
+宿主机侧护栏（容器**看不到** `/var/lib/docker` 的可写层明细，该目录在容器内为空）：
+
+```bash
+# 每 30 分钟，crontab 里加一行
+*/30 * * * * NTFY_URL=<ntfy 地址> NTFY_TOPIC=<主题> \
+  /home/qdm/stock-screener/scripts/host_disk_guard.sh >> /var/log/ss-disk-guard.log 2>&1
+```
+
+它检查三项：宿主机分区水位、**单个容器可写层是否异常增长**（230 GB 那种）、
+Docker 可回收空间。**只报告，不自动删**——删什么属于运维决策。

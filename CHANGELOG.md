@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.2.131] - 2026-11-23
+
 ###修复（v0.2.130的api口径改错了：分子也用了bavail）
 
 - `api/routes.py` 的分子改成 `f_blocks - f_bfree`（**不含**保留块），

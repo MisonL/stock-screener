@@ -518,6 +518,12 @@ git checkout main
 一并清掉，回滚能力随之消失。`scripts/host_disk_guard.sh`建议的是
 不带 `-a`的那条，别自作主张加。
 
+- **回滚后会自动比对库结构**：`deploy.py`部署前读一次 `schema_version`，
+ 回滚后再读一次；如果这次部署**应用了新迁移**，会打印
+ 「**警告：数据库结构已经前进，回滚只回代码、不回数据**」并列出具体的迁移名。
+ 看到这条就去查：加列/加表通常无碍，重建过表的（如 `004_fetch_log_gap.sql`）
+ 可能让旧代码读不了，此时按 §9.2 用 `data/market.db.pre-upgrade` 恢复。
+
 ⚠️ **回滚只回代码，不回数据**。`data/market.db`是 bind mount，
 `core/db.py`的 `migrate()`只前进没有 down。跨大版本回滚前，
 先按 §9.2备一份库。

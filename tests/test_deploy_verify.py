@@ -36,6 +36,9 @@ def _patch_common(monkeypatch, verify="OK", rollback_ok=True, calls=None):
         lambda h, d, i: calls.append("record:" + i) or True)
     monkeypatch.setattr(deploy, "_run",
         lambda cmd: calls.append("run:" + " ".join(cmd)))
+    #部署前后都会读一次库结构；测试里不能真去 ssh。
+    monkeypatch.setattr(deploy, "read_schema_version",
+        lambda h, d: ["001_batch1.sql"])
     monkeypatch.setattr(deploy, "config_drift_script", lambda d: "true")
     monkeypatch.setattr(deploy, "verify_deployment",
         lambda h, s, w, **kw: verify)
@@ -251,6 +254,7 @@ def test_build_failure_also_rolls_back(monkeypatch, capsys):
     monkeypatch.setattr(deploy, "_run", boom)
     monkeypatch.setattr(deploy, "config_drift_script", lambda d: "true")
     monkeypatch.setattr(deploy, "_image_id", lambda h: "sha256:old")
+    monkeypatch.setattr(deploy, "read_schema_version", lambda h, d: [])
     monkeypatch.setattr(deploy, "rollback", fake_rollback)
     def verify_after_rollback(*args, **kwargs):
         verifies.append(1)
@@ -512,3 +516,68 @@ def test_public_health_rejects_a_stale_version(monkeypatch):
     got = deploy.check_public_health("https://x/healthz", expect_version="1.2.3")
     assert got.startswith("FAIL:"), got
     assert "对外版本不是这次部署的" in got, got
+
+
+def test_read_schema_version_parses_the_remote_output(monkeypatch):
+    """远端输出的 `a|b|c` 要解析成列表。"""
+    monkeypatch.setattr(deploy, "_capture",
+     lambda cmd: "001_batch1.sql|002_batch2.sql\n")
+    got = deploy.read_schema_version("h", "/srv/app")
+    assert got == ["001_batch1.sql", "002_batch2.sql"], got
+
+
+def test_read_schema_version_returns_none_when_it_cannot_tell(monkeypatch):
+    """**问不到要返回 None，不能返回 []**：[]是"库是空的"，
+    None是"没问到"。回滚告警依赖这个区别，混了就会漏报。"""
+    monkeypatch.setattr(deploy, "_capture",
+     lambda cmd: "ssh: connect to host: Connection refused\n")
+    assert deploy.read_schema_version("h", "/srv/app") is None
+
+
+def test_schema_drift_warning_is_silent_without_drift():
+    """没应用新迁移就不该刷屏。"""
+    v = ["001_batch1.sql", "002_batch2.sql"]
+    assert deploy.schema_drift_warning(v, v) == ""
+
+
+def test_schema_drift_warning_is_silent_when_unreadable():
+    """读不到（None）时不能瞎告警，也不能假装没问题。"""
+    assert deploy.schema_drift_warning(None, ["001_batch1.sql"]) == ""
+    assert deploy.schema_drift_warning(["001_batch1.sql"], None) == ""
+
+
+def test_schema_drift_warning_names_the_new_migrations():
+    """告警里必须点出**具体是哪几个迁移**，运维才知道去查什么。"""
+    warn = deploy.schema_drift_warning(
+     ["001_batch1.sql"], ["001_batch1.sql", "009_new.sql"])
+    assert "009_new.sql" in warn
+    assert "只回代码" in warn
+    assert "RUNBOOK" in warn
+
+
+
+
+def test_rollback_after_a_new_migration_warns_about_schema_drift(monkeypatch, capsys):
+    """**回滚只回代码不回数据**：这次部署应用了新迁移时，
+    回退后必须告警——旧代码面对新结构可能读不了。
+    """
+    calls = _patch_common(monkeypatch, verify="FAIL:jobs起不来")
+    seq = iter([["001_batch1.sql"], ["001_batch1.sql", "009_new.sql"]])
+    monkeypatch.setattr(deploy, "read_schema_version",
+        lambda h, d: next(seq))
+    code = deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"])
+    out = capsys.readouterr().out
+    assert code !=0
+    assert "数据库结构已经前进" in out, f"没告警 schema漂移：{out[-400:]}"
+    assert "009_new.sql" in out
+
+
+def test_rollback_without_a_new_migration_does_not_warn(monkeypatch, capsys):
+    """没应用新迁移时不该刷无意义的告警。"""
+    calls = _patch_common(monkeypatch, verify="FAIL:jobs起不来")
+    monkeypatch.setattr(deploy, "read_schema_version",
+     lambda h, d: ["001_batch1.sql"])
+    code = deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"])
+    out = capsys.readouterr().out
+    assert code !=0
+    assert "数据库结构已经前进" not in out

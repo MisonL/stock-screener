@@ -426,6 +426,54 @@ def check_public_health(url: str, timeout_s: int =20, expect_version: str = "") 
     return "OK"
 
 
+    
+
+def read_schema_version(host: str, target: str) -> list[str] | None:
+ """读目标机 `data/market.db`里已应用的迁移名；读不到返回 None。
+
+ **只读**打开（`mode=ro`），不建库、不迁移。用 python3 + sqlite3模块，
+不依赖宿主机有没有 sqlite3 CLI（容器里就没有）。
+
+ 返回 None与返回 [] 必须区分：None是「问不到」，[]是「库是空的」。
+ """
+ db = target.rstrip("/") + "/data/market.db"
+ code = (
+ "import sqlite3,sys;"
+ "c=sqlite3.connect('file:" + db + "?mode=ro',uri=True);"
+ "print('|'.join(r[0] for r in c.execute('select name from schema_version order by name')))"
+ )
+ out = _capture(["ssh", "-o", "BatchMode=yes", host,
+ "python3 -c " + _sh_quote(code) + " || true"])
+ for line in out.splitlines():
+    if "|" in line or line.strip().startswith("0"):
+        return [x for x in line.strip().split("|") if x]
+    if line.strip() == "":
+        continue
+ return None
+
+
+def schema_drift_warning(before: list[str] | None, after: list[str] | None) -> str:
+ """回滚后比较迁移集合，返回告警文本；没有漂移返回空串。
+
+ **回滚只回代码，不回数据**：如果这次部署应用了新迁移，回退代码后
+旧代码面对的是**新结构**的库。加列/加表通常无碍，但重建过表
+（如 004_fetch_log_gap.sql）就可能让旧代码读不了。
+ """
+ if before is None or after is None:
+    return ""
+ new = [x for x in after if x not in before]
+ if not new:
+    return ""
+ return (
+ "**警告：数据库结构已经前进，回滚只回代码、不回数据**\n"
+ " 本次部署新应用的迁移：" + "、".join(new) + "\n"
+ " 旧代码现在面对的是新结构的库。加列/加表通常无碍，"
+ "重建过表的（如 004）可能读不了。\n"
+ " 处理：先确认 /healthz 与日志；必要时按 RUNBOOK §9.2 用"
+ " data/market.db.pre-upgrade 恢复数据库（会丢这次部署后的新数据）。"
+ )
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="部署已提交的内容到 VM")
     ap.add_argument("--host", default=DEFAULT_HOST)
@@ -491,6 +539,8 @@ def main(argv: list[str] | None = None) -> int:
     # 直接 `set -o pipefail` 会报 `Illegal option -o pipefail` 并整个中止。
     # **先给当前镜像打 rollback标签**：新构建会直接覆盖 latest，
     #没有这一步就没得回滚。
+    # **记下部署前的库结构**：回滚只回代码不回数据，回退后要比对
+    schema_before = read_schema_version(args.host, args.dir)
     snapshot_image(args.host, args.dir)
     body = (f"set -o pipefail; cd {args.dir} && "
             f"{compose}build api 2>&1 | tail -1 && "
@@ -506,6 +556,10 @@ def main(argv: list[str] | None = None) -> int:
         ok, code = rollback(args.host, args.dir, args.services)
         if ok:
             print("已回退到上一个镜像（stock-screener:rollback）")
+            schema_after = read_schema_version(args.host, args.dir)
+            warn = schema_drift_warning(schema_before, schema_after)
+            if warn:
+                print(warn)
             #回滚会把 latest指回旧镜像，所以**重新取一次**镜像 ID；
             #传 None会让 EXPECT为空 →复验直接判 UNKNOWN，等于白验。
             back = verify_deployment(args.host, args.services, args.verify_wait,
@@ -564,6 +618,10 @@ def main(argv: list[str] | None = None) -> int:
         ok, code = rollback(args.host, args.dir, args.services)
         if ok:
             print("已回退到上一个镜像（stock-screener:rollback）")
+            schema_after = read_schema_version(args.host, args.dir)
+            warn = schema_drift_warning(schema_before, schema_after)
+            if warn:
+                print(warn)
             # **回滚后也要再验收一次**：回滚本身也可能失败（旧镜像也起不来、
             #数据被新版本改过结构）。只打印一句「请人工确认」等于把验证又甩给人。
             #回滚会把 latest指回旧镜像，所以**重新取一次**镜像 ID；

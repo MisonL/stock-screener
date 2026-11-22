@@ -38,6 +38,8 @@ def _patch_common(monkeypatch, verify="OK", rollback_ok=True, calls=None):
         lambda cmd: calls.append("run:" + " ".join(cmd)))
     #部署前后都会读一次库结构；测试里不能真去 ssh。
     #迁移分类与备份：测试里不能真去读仓库 schema / 真备份。
+    #清理旧镜像也会 ssh；默认替身成「没删任何东西」。
+    monkeypatch.setattr(deploy, "prune_old_images", lambda h: "0")
     monkeypatch.setattr(deploy, "pending_risky_migrations",
         lambda applied, d: [])
     monkeypatch.setattr(deploy, "read_schema_version",
@@ -709,3 +711,51 @@ def test_extract_failure_also_stops(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert code !=0
     assert "上传或解压失败" in out
+
+
+def test_prune_only_targets_dangling_images_of_this_project(monkeypatch):
+    """**只删本项目的悬空镜像**：用 `com.docker.compose.project`标签筛。
+        这台机器上还跑着 WeKnora / selfhost / langbot；
+        `docker image prune -f` 会把它们的悬空镜像一起删掉（实测有一个
+        129MB 的 nginx 悬空镜像不是我们的）。
+    """
+    seen = []
+    monkeypatch.setattr(deploy, "_capture",
+        lambda cmd: (seen.append(" ".join(cmd)), "SS_PRUNED=abc\nSS_PRUNED=def")[1])
+    assert deploy.prune_old_images("h") == "2"
+    cmd = seen[0]
+    assert "dangling=true" in cmd, "没限定悬空"
+    assert "com.docker.compose.project" in cmd, "没按项目标签筛"
+    assert "stock-screener" in cmd
+def test_prune_never_uses_prune_a_or_touches_the_rollback_tag(monkeypatch):
+    """**绝不能出现 `image prune -a`**：那会删掉 `stock-screener:rollback`，
+        回滚能力随之消失。也不能显式 rmi 那个标签。"""
+    seen = []
+    monkeypatch.setattr(deploy, "_capture",
+        lambda cmd: (seen.append(" ".join(cmd)), "")[1])
+    deploy.prune_old_images("h")
+    cmd = seen[0]
+    assert "prune -a" not in cmd and "prune --all" not in cmd, "用了 -a，会删掉回滚镜像"
+    assert "stock-screener:rollback" not in cmd, "动了回滚标签"
+def test_prune_returns_zero_when_nothing_matches(monkeypatch):
+    """没有可删的就返回 "0"，调用方据此不打印。"""
+    monkeypatch.setattr(deploy, "_capture", lambda cmd: "")
+    assert deploy.prune_old_images("h") == "0"
+def test_successful_deploy_prunes_old_images(monkeypatch, capsys):
+    """验收通过之后才清理。"""
+    calls = _patch_common(monkeypatch, verify="OK")
+    monkeypatch.setattr(deploy, "prune_old_images",
+        lambda h: (calls.append("prune"), "3")[1])
+    code = deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"])
+    out = capsys.readouterr().out
+    assert code ==0
+    assert "prune" in calls
+    assert "已清理 3 个" in out
+def test_failed_deploy_does_not_prune(monkeypatch):
+    """**失败时不能清理**：这时 rollback标签是刚需。"""
+    calls = _patch_common(monkeypatch, verify="FAIL:jobs起不来")
+    monkeypatch.setattr(deploy, "prune_old_images",
+        lambda h: (calls.append("prune"), "3")[1])
+    code = deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"])
+    assert code !=0
+    assert "prune" not in calls, "验收失败却清理了镜像"

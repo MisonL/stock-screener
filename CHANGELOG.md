@@ -1,5 +1,33 @@
 ## [Unreleased]
 
+###修复（每次发版留下的悬空镜像在偷磁盘）
+
+盘点81.4磁盘：根分区87%（80G/98G），其中 `/var/lib/containerd` 占44G。
+**直接归因到本项目**的泄漏：11个悬空镜像中有9个是 639MB 的
+`com.docker.compose.project=stock-screener`（今天13次发版留下的，约5.7GB）。
+
+- `prune_old_images(host)`：遍历悬空镜像，用
+ `docker image inspect '{{index .Config.Labels "com.docker.compose.project"}}'`
+ 筛出 `stock-screener` 再 `docker rmi`。
+- **不能无差别 `docker image prune -f`**：同机还跑着 WeKnora / selfhost /
+ langbot；实测有一个 129MB 的 nginx 悬空镜像不是我们的，会被一起删掉。
+- **绝不能 `prune -a`**：那会删掉 `stock-screener:rollback`
+（带标签但没被容器引用），回滚能力随之消失。
+-只在**验收通过之后**清理：失败时 rollback是刚需。
+
+实测：9个本项目悬空镜像删除，两个非本项目的原样保留，
+`latest`/`rollback` 标签镜像未受影响。
+
+**这轮踩的坑**：第一版在 bash 模板里写了 `{{{{index .Config.Labels ...}}}}`
+（四层花括号，pyflakes查不出），远端实际收到四层 → docker不认 →
+删了0个。打印渲染后的命令才发现花括号层数不对，改成两层后成功。
+
+测试5条（只筛本项目、不用 -a、没有就返回0、成功才清理、失败不清理）。
+变异：部署后不清理 →红；把清理改成无差别 `prune -a` →
+ `AssertionError:用了 -a，会删掉回滚镜像`。
+
+**测试**：54条。81.4全量 **1404 passed,3 skipped**。
+
 ## [0.2.128] - 2026-11-22
 
 ###修复（上传/解压失败只有堆栈，没有一句人话）

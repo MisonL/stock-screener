@@ -554,6 +554,37 @@ def schema_drift_warning(before: list[str] | None, after: list[str] | None) -> s
  )
 
 
+PROJECT = "stock-screener"
+
+
+def prune_old_images(host: str) -> str:
+    """只删**本项目**的悬空镜像；返回删掉了几个。
+
+    每次 `compose build` 都会产生新镜像，上一次的 `rollback`标签被新镜像
+    顶掉后就成了悬空镜像。实测一天13次发布留下9个639MB悬空镜像（约5.7GB）。
+
+    **只按 `com.docker.compose.project` 标签筛**：这台机器上还跑着
+    WeKnora / selfhost / langbot 等项目，`docker image prune -f` 会把它们的
+    悬空镜像一起删掉（实测有一个 nginx 的129MB悬空镜像，不是我们的）。
+
+    **绝不删 `latest` / `rollback`**：它们有标签，本来就不在悬空列表里；
+    这里也不再调 `docker image prune -a`——那会把 `rollback` 一起抹掉，
+    回滚能力随之消失。
+
+    只在**验收通过之后**调用：部署失败时 `rollback` 是刚需。
+    """
+    code = (
+     "for id in $(docker images -f dangling=true -q); do "
+     "p=$(docker image inspect --format '{{index .Config.Labels \"com.docker.compose.project\"}}' $id 2>/dev/null); "
+     f"if [ \"$p\" = \"{PROJECT}\" ]; then "
+     "docker rmi $id >/dev/null 2>&1 && echo SS_PRUNED=$id; "
+     "fi; done"
+     )
+    out = _capture(["ssh", "-o", "BatchMode=yes", host, "bash -c " + _sh_quote(code)])
+    n = sum(1 for line in out.splitlines() if line.startswith("SS_PRUNED="))
+    return str(n)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="部署已提交的内容到 VM")
     ap.add_argument("--host", default=DEFAULT_HOST)
@@ -708,6 +739,11 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print("（未配置 --public-url，本次没有验公网可达性）")
         print("已重启容器。建议再确认一次 /healthz（见 RUNBOOK §9）")
+        # **只在验收通过之后清理**：失败时 rollback标签是刚需。
+        #只删本项目的悬空镜像——同机还有 WeKnora/selfhost/langbot 等项目。
+        pruned = prune_old_images(args.host)
+        if pruned != "0":
+            print(f"已清理 {pruned} 个本项目的旧镜像（悬空，不影响回滚）")
     else:
         print(f"**验收未通过**：{reason}")
         if reason.startswith("UNKNOWN"):

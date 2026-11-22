@@ -2,6 +2,11 @@
 
 ###修复（v0.2.130的api口径改错了：分子也用了bavail）
 
+- `api/routes.py` 的分子改成 `f_blocks - f_bfree`（**不含**保留块），
+分母 `used + f_bavail`。实测与 jobs、与 `df` 三者对齐（84.69% / 84.69% / 85%）。
+-补 `test_api_disk_used_pct_matches_df_on_ext4`，**造出保留块**来测；
+变异（分子错 / 分母错）各自红在断言。
+
 v0.2.130 部署后立刻核对生产，发现 api 报 **90.1%** 而 `df` 是 84.6%——
 **改错了**。`(f_blocks - f_bavail)` 这个分子把 ext4 给 root 保留的 5%
 （本机 5.02 GB）当成了"已用"。

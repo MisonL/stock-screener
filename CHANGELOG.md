@@ -1,5 +1,33 @@
 ## [Unreleased]
 
+###修复（磁盘百分比口径错了4.3个点，P0永远到不了线）
+
+查 81.4 的磁盘告警时发现两个数对不上：应用侧 `push_log` 报 **81%**、
+`df` 报 **85%**，同一块盘。根因是 **ext4 给 root 保留 5% 空间**
+（本机 5.02 GB / 98 GB），而两个实现都把保留区算进了分母：
+
+| 实现 | 公式 | 实测 |
+|---|---|---|
+| `jobs/cleanup.py` | `used/total` | 80.3% |
+| `api/routes.py` | `(blocks-bavail)/blocks` | 85.4% |
+| `df`（基准） | `used/(used+free)` | 84.6% |
+
+**后果不是数字难看，而是告警永远按时不触发**：P1（85%）要等 `df` 到 89.5%，
+P0（95%）要等 `df` 到 **100.2%**——磁盘写满那一刻 P0 还没到线。
+2026-11-21 那次撑爆正是这个形态（那次是"一天只查一次"，
+这次是"口径不对"，结果一样）。
+
+- `jobs/cleanup.py::disk_used_pct`：改成 `used/(used+free)`。
+- `api/routes.py::_disk_used_pct`：分母改成 `f_bavail + (f_blocks - f_bfree)`。
+- 两个公式现在**实测完全一致**（0.0000 个百分点差），也与 `df` 同口径，
+ 符合 RUNBOOK §571「与 df 一致（±2%）」的既有约定——此前两边都违反了。
+-补测试 `test_disk_used_pct_matches_df_not_used_over_total`：
+ 模拟一块 100G 的盘（used 80G / free 10G / 保留 10G），
+ 断言结果 ≈88.9% 且**不等于** 80.0%。变异（改回 `used/total`）
+ → `AssertionError:应该是 used/(used+free)=88.9%，实际80.0%`。
+
+**测试**：55条（本文件）。81.4全量 **1405 passed,3 skipped**。
+
 ## [0.2.129] - 2026-11-22
 
 ###修复（每次发版留下的悬空镜像在偷磁盘）

@@ -627,7 +627,12 @@ def _disk_used_pct(path: str) -> float:
         st = os.statvfs(path)
     except OSError:
         return 0.0
-    return 100.0 * (st.f_blocks - st.f_bavail) / st.f_blocks if st.f_blocks else 0.0
+    # 分母用 `f_bavail`（非 root 可用），与 `df` 的 Use% 同口径。
+    # 用 `f_blocks` 会把 ext4 给 root 保留的 5% 算进分母：
+    # 本机实测同一磁盘 api 报 85.4%（已经越 P1 线）、jobs 报 80.3%，
+    # 而 `df` 是 84.6%——两个接口各说各话，运维无法判断该信谁。
+    usable = st.f_bavail + (st.f_blocks - st.f_bfree)
+    return 100.0 * (st.f_blocks - st.f_bavail) / usable if usable else 0.0
 
 
 def _yaml(path: Path) -> dict:

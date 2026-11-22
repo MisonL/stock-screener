@@ -164,12 +164,27 @@ def check_disk(conn, dispatcher=None, path: str | None = None) -> float:
 
 
 def disk_used_pct(path: str) -> float:
-    """`/app/data` 的占用百分比；**独立于表清理，无论如何都要算**。"""
+    """`/app/data` 的占用百分比；**独立于表清理，无论如何都要算**。
+
+    **必须用 `used/(used+free)`，不能用 `used/total`**：ext4 默认给 root
+    保留 5% 空间（本机实测 5.02 GB / 98 GB）。`total` 把这块保留区算进分母，
+    于是同一个磁盘本函数报 80.3%、`df` 报 84.6%——**差 4.3 个百分点**。
+
+    后果不是"数字难看"，而是**告警永远不会按时触发**：
+    P1（85%）要等 `df` 到 89.5%，P0（95%）要等 `df` 到 100.2%——
+    磁盘写满那一刻 P0 还没到线。2026-11-21 那次撑爆正是这个形态
+    （那时是"一天只查一次"，这次是"口径不对"，同一个结果）。
+
+    RUNBOOK §571 的约定也是「与 df 一致（±2%）」，本函数此前违反了它。
+    """
     try:
         usage = shutil.disk_usage(path)
     except OSError:
         return 0.0
-    return usage.used / usage.total * 100 if usage.total else 0.0
+    # `free` 是给非 root 的可用量（f_bavail），保留块不在其中——
+    # 用它做分母才和 `df` 的 Use% 同口径。
+    usable = usage.used + usage.free
+    return usage.used / usable * 100 if usable else 0.0
 
 
 #: 备份允许的最大陈旧时间（小时）。备份在 23:30 跑，次日 08:55 的自检若看到

@@ -304,3 +304,28 @@ def test_cleanup_alarm_day_cutoff_matches_sweep(tmp_path):
     assert "边界样本" in notes, (
         "边界样本被删了：cleanup 用的仍是 '满 72 小时' 口径，"
         "与 sweep_stale_alarms 的「按日期」口径不一致")
+
+
+def test_disk_used_pct_matches_df_not_used_over_total(monkeypatch):
+    """**必须与 `df` 同口径**（`used/(used+free)`），不是 `used/total`。
+
+    ext4 默认给 root 保留 5%。`total` 把保留区算进分母，于是同一个磁盘
+    本函数报 80.3%、`df` 报 84.6%——差 4.3 个百分点。
+
+    后果不是数字难看，而是**告警永远按时不触发**：P1（85%）要等 df 到 89.5%，
+    P0（95%）要等 df 到 100.2%——磁盘写满时 P0 还没到线。
+    """
+    import shutil as _sh
+
+    usage = _sh.disk_usage
+    # 模拟一块 100G 的盘：used=80G，非 root 可用 free=10G，另 10G 是保留区
+    class Fake:
+        total = 100 * 2**30
+        used = 80 * 2**30
+        free = 10 * 2**30
+    monkeypatch.setattr(_sh, "disk_usage", lambda p: Fake())
+
+    got = disk_used_pct("/")
+    assert abs(got - 88.9) < 0.2, f"应该是 used/(used+free)=88.9%，实际 {got:.1f}%"
+    # 用旧公式（used/total）会得到 80.0%——必须**不等于**它
+    assert abs(got - 80.0) > 5, f"还在用 used/total：{got:.1f}%"

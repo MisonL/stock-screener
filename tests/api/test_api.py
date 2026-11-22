@@ -689,3 +689,29 @@ def test_no_password_configured_keeps_open(api, tmp_db, monkeypatch):
             return await client.get("/api/status")
 
     assert asyncio.run(run()).status_code == 200
+
+
+def test_api_disk_used_pct_matches_df_on_ext4(monkeypatch):
+    """**分子分母都要对**，且必须与 `df` 同口径。
+
+    ext4 给 root 保留 5%。踩过两次，都在**真实 ext4 才暴露**：
+     ① 分子写成 `blocks-bavail` → 保留块被算成"已用"，报 90.1%（df 84.6%）
+     ② 分母写成 `blocks` → 保留块进分母，报 85.5%
+    macOS 的 HFS/APFS 没有保留块（`f_bfree == f_bavail`），
+    三种写法在本机结果相同——所以必须**造出保留块**来测。
+    """
+    import os as _os
+
+    class FakeStat:
+        # 100G 盘：已用 80G、非 root 可用 10G、保留 10G
+        f_frsize = 1
+        f_blocks = 100 * 2**30
+        f_bfree = 20 * 2**30          # 含保留块
+        f_bavail = 10 * 2**30         # 不含保留块
+    monkeypatch.setattr(_os, "statvfs", lambda p: FakeStat())
+
+    from api.routes import _disk_used_pct
+    got = _disk_used_pct("data")
+    assert abs(got - 88.9) < 0.2, f"应该是 used/(used+free)=88.9%，实际 {got:.1f}%"
+    assert abs(got - 80.0) > 5, f"分子用了 blocks-bavail（保留块算成已用）：{got:.1f}%"
+    assert abs(got - 85.5) > 2, f"分母用了 blocks（保留块进分母）：{got:.1f}%"

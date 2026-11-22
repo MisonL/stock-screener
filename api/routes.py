@@ -627,12 +627,18 @@ def _disk_used_pct(path: str) -> float:
         st = os.statvfs(path)
     except OSError:
         return 0.0
-    # 分母用 `f_bavail`（非 root 可用），与 `df` 的 Use% 同口径。
-    # 用 `f_blocks` 会把 ext4 给 root 保留的 5% 算进分母：
-    # 本机实测同一磁盘 api 报 85.4%（已经越 P1 线）、jobs 报 80.3%，
-    # 而 `df` 是 84.6%——两个接口各说各话，运维无法判断该信谁。
-    usable = st.f_bavail + (st.f_blocks - st.f_bfree)
-    return 100.0 * (st.f_blocks - st.f_bavail) / usable if usable else 0.0
+    # **分子分母都要用对**，与 `df` 的 Use% 同口径：
+    #   used = f_blocks - f_bfree  （真正被文件占用的；**不含**保留块）
+    #   free = f_bavail            （非 root 能用的；**不含**保留块）
+    # ext4 给 root 保留 5%（本机 5.01 GB/98 GB）。踩过两次：
+    #   ① 分子写成 `f_blocks - f_bavail` —— 把保留块也算成"已用"，
+    #      实测报 90.1%，而 df 是 84.6%；
+    #   ② 分母写成 `f_blocks` —— 保留块进了分母，报 85.5%。
+    # **这两个错在 macOS 上测不出来**：HFS/APFS 没有保留块，
+    # `f_bfree == f_bavail`，三种写法结果相同。只有真实 ext4 才暴露。
+    used = st.f_blocks - st.f_bfree
+    usable = used + st.f_bavail
+    return 100.0 * used / usable if usable else 0.0
 
 
 def _yaml(path: Path) -> dict:

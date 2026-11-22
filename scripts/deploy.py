@@ -603,16 +603,23 @@ def main(argv: list[str] | None = None) -> int:
         # `tar -x` 本身是覆盖语义：归档里有的文件更新，没有的原样保留——这才是要的。
         # **首次部署时 data/market.db 可能还不存在**（新建机器），此时 `test -f` 返回非零
         # 会让 ssh 命令失败并中止部署。所以只做提示、不把它当前置条件。
-        _run(["ssh", "-o", "BatchMode=yes", args.host,
-              f"mkdir -p {args.dir} {args.dir}/data/logs {args.dir}/ntfy/cache {args.dir}/ntfy/auth {args.dir}/cf; "
-              f"if test -f {args.dir}/data/market.db; then "
-              f"echo '目标库存在，将原地覆盖代码（不动数据）'; "
-              f"else echo '目标无数据库：首次部署，库会在首次启动时创建'; fi"])
-        _run(["scp", "-q", str(tarball), f"{args.host}:/tmp/src-{sha}.tar.gz"])
-        # **备份 → 正常解压 → 恢复**：不能给 tar 加任何「跳过」类选项
-        # （`--skip-old-files` 会连代码一起跳过，部署变成空操作）。
-        _run(["ssh", "-o", "BatchMode=yes", args.host,
-              remote_extract_script(sha, args.dir)])
+        # **上传/解压失败要如实报告**：此前任何一步失败都会抛 SystemExit，
+        #退出码非零（正确），但只有堆栈没有一句人话。此时容器还没动，
+        #不存在回滚问题，只需要说清楚「部署停在哪一步」。
+        try:
+            _run(["ssh", "-o", "BatchMode=yes", args.host,
+            f"mkdir -p {args.dir} {args.dir}/data/logs {args.dir}/ntfy/cache {args.dir}/ntfy/auth {args.dir}/cf; "
+            f"if test -f {args.dir}/data/market.db; then "
+            f"echo '目标库存在，将原地覆盖代码（不动数据）'; "
+            f"else echo '目标无数据库：首次部署，库会在首次启动时创建'; fi"])
+            _run(["scp", "-q", str(tarball), f"{args.host}:/tmp/src-{sha}.tar.gz"])
+            # **备份 → 正常解压 → 恢复**：不能给 tar 加任何「跳过」类选项
+            # （`--skip-old-files` 会连代码一起跳过，部署变成空操作）。
+            _run(["ssh", "-o", "BatchMode=yes", args.host,
+            remote_extract_script(sha, args.dir)])
+        except SystemExit as exc:
+            print(f"**上传或解压失败，部署中止（容器未动，无需回滚）**：{exc}")
+            return 1
 
     compose = ("docker compose -f deploy/docker-compose.yml --project-directory . ")
     # **不能 `build ... | tail -1`**：管道取的是 `tail` 的退出码，构建失败也会

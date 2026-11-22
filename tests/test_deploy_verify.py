@@ -678,3 +678,34 @@ def test_backup_failure_aborts_the_deploy(monkeypatch, capsys):
     assert code !=0
     assert "已中止部署" in out
     assert not any("build api" in c for c in calls), "备份失败却还是构建了"
+
+
+def test_scp_failure_stops_the_deploy_before_any_build(monkeypatch, capsys):
+    """**scp失败要给人话，且绝不能继续构建/重启**。"""
+    calls = _patch_common(monkeypatch, verify="OK")
+    def boom(cmd):
+        joined = " ".join(cmd)
+        if "scp" in joined:
+            raise SystemExit("命令失败（1）：scp …")
+        calls.append(joined)
+    monkeypatch.setattr(deploy, "_run", boom)
+    code = deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"])
+    out = capsys.readouterr().out
+    assert code !=0
+    assert "上传或解压失败" in out, f"没有一句人话：{out[-300:]}"
+    assert "容器未动" in out
+    assert not any("build api" in c for c in calls), "scp失败却还构建了"
+
+def test_extract_failure_also_stops(monkeypatch, capsys):
+    """解压失败同样中止——半套新代码的目录比没有更危险。"""
+    calls = _patch_common(monkeypatch, verify="OK")
+    def only_extract(cmd):
+        joined = " ".join(cmd)
+        if "src-deadbeef" in joined and "tar -xzf" in joined:
+            raise SystemExit("命令失败（2）：ssh … tar -xzf")
+        calls.append(joined)
+    monkeypatch.setattr(deploy, "_run", only_extract)
+    code = deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"])
+    out = capsys.readouterr().out
+    assert code !=0
+    assert "上传或解压失败" in out

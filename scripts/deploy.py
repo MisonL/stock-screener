@@ -428,6 +428,86 @@ def check_public_health(url: str, timeout_s: int =20, expect_version: str = "") 
 
     
 
+SCHEMA_DIR = Path(__file__).resolve().parent.parent / "core" / "schema"
+
+
+def strip_sql_comments(sql: str) -> str:
+    """去掉 `--` 行注释，避免注释里的 "drop table" 造成误判。"""
+    out = []
+    for line in sql.splitlines():
+        out.append(line.split("--",1)[0])
+    return "\n".join(out)
+
+
+def classify_migration(sql: str) -> str:
+    """把一份迁移归类为 `additive` 或 `irreversible`。
+
+    **additive**（加表/加索引/加列）可以安全地被「回滚代码」跨过：
+    旧代码不认识新列，它读自己用到的那些照样工作。
+
+    **irreversible** 有两类，都不是「回退代码」能撤销的：
+
+    1. **改结构**（`DROP TABLE` / `RENAME TO`）：表被整张换过，旧代码可能读不了。
+       `004_fetch_log_gap.sql` 就是 `CREATE新的 → DROP旧的 → RENAME`。
+    2. **改数据**（`UPDATE` / `DELETE`）：表结构没变，但数据被改写了。
+       `006_gap_pending_target_day.sql` 就是一条 UPDATE，它修的是旧语义写坏的行——
+       回退代码之后，那些行已经被改成新语义了。
+
+    认不出来的语句一律按 `irreversible` 处理——宁可多备份一次。
+    """
+    body = strip_sql_comments(sql).upper()
+    if "DROP TABLE" in body or "RENAME TO" in body:
+        return "irreversible"
+    for stmt in body.split(";"):
+        s = stmt.strip()
+        if not s:
+            continue
+        if s.startswith(("CREATE ", "ALTER TABLE", "PRAGMA", "INSERT ")):
+            continue
+        return "irreversible"
+    return "additive"
+
+
+def pending_risky_migrations(applied: list[str] | None, schema_dir: Path) -> list[str]:
+    """返回「还没应用、且不可逆」的迁移文件名。
+
+    `applied` 为 None（问不到远端状态）时**全部视为待应用**：
+    宁可多备份一次，也不要因为读不到就跳过备份。
+    """
+    have = set(applied or [])
+    risky: list[str] = []
+    for path in sorted(schema_dir.glob("*.sql"), key=lambda p: p.name):
+        if path.name in have:
+            continue
+        if classify_migration(path.read_text(encoding="utf-8")) == "irreversible":
+            risky.append(path.name)
+    return risky
+
+
+def backup_before_upgrade(host: str, target: str) -> str:
+    """在目标机上用 sqlite3 的 backup API 复制一份 `.pre-upgrade`。
+
+    **不能用 `cp`**：WAL 模式下未 checkpoint 的数据在 `-wal` 里，
+    `cp` 出来的库会缺最近的事务，甚至在被写入时拷出半个页。
+
+    返回 "OK" / "FAIL:<原因>"。
+    """
+    db = target.rstrip("/") + "/data/market.db"
+    dst = db + ".pre-upgrade"
+    code = (
+     "import sqlite3;"
+     "s=sqlite3.connect('file:" + db + "?mode=ro',uri=True);"
+     "d=sqlite3.connect('" + dst + "');"
+     "s.backup(d);d.close();s.close();"
+     "print('SS_BACKUP=OK')"
+     )
+    out = _capture(["ssh", "-o", "BatchMode=yes", host,
+     "python3 -c " + _sh_quote(code) + " || true"])
+    if "SS_BACKUP=OK" not in out:
+        return "FAIL:" + (out.strip()[:200] or "没有输出")
+    return "OK"
+
+
 def read_schema_version(host: str, target: str) -> list[str] | None:
  """读目标机 `data/market.db`里已应用的迁移名；读不到返回 None。
 
@@ -487,6 +567,8 @@ def main(argv: list[str] | None = None) -> int:
  help="部署后最多等多少秒让容器稳定")
     ap.add_argument("--settle", type=int, default=20,
         help="验收前先无条件观察多少秒（让启动期异常暴露）")
+    ap.add_argument("--skip-backup", action="store_true",
+        help="不可逆迁移前不备份（危险，仅用于已知无数据的空库）")
     ap.add_argument("--no-verify", action="store_true",
         help="跳过部署后验收（仅排障用）")
     ap.add_argument("--public-url", default=os.environ.get("SS_PUBLIC_HEALTHZ", ""),
@@ -540,7 +622,22 @@ def main(argv: list[str] | None = None) -> int:
     # **先给当前镜像打 rollback标签**：新构建会直接覆盖 latest，
     #没有这一步就没得回滚。
     # **记下部署前的库结构**：回滚只回代码不回数据，回退后要比对
+    # **不可逆迁移前自动备份**：RUNBOOK只是「要求」运维升级前手工备份，
+    #而「记不记得」正是故障点。这里在真正动手前替他做掉。
     schema_before = read_schema_version(args.host, args.dir)
+    risky = pending_risky_migrations(schema_before, SCHEMA_DIR)
+    if risky:
+        print("**本次部署包含不可逆迁移**：" + "、".join(risky))
+        print("先做一份 data/market.db.pre-upgrade（sqlite backup API，不是 cp）")
+        bk = backup_before_upgrade(args.host, args.dir)
+        if bk == "OK":
+            print("备份完成：data/market.db.pre-upgrade")
+        else:
+            print("**备份失败**：" + bk)
+            if not args.skip_backup:
+                print("**已中止部署**：不可逆迁移前没有备份，先修好备份再上线")
+                return 1
+            print("--skip-backup已指定，继续（风险自担）")
     snapshot_image(args.host, args.dir)
     body = (f"set -o pipefail; cd {args.dir} && "
             f"{compose}build api 2>&1 | tail -1 && "

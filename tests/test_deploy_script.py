@@ -219,7 +219,9 @@ def test_build_failure_is_not_masked_by_tail():
     assert "set -o pipefail" in src, "远端构建没有 pipefail，失败会被 tail 吞掉"
     # pipefail 必须与 build 在**同一条** ssh 命令里
     line = next((ln for ln in src.splitlines() if "set -o pipefail" in ln), "")
-    tail_block = src[src.index("set -o pipefail"):]
+    #找**代码里**的那处（f-string），跳过注释里的同名文字
+    code_at = src.index('f"set -o pipefail')
+    tail_block = src[code_at:]
     assert "build api" in tail_block[:400], "pipefail 没有包住 build 命令"
 
 

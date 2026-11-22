@@ -1,5 +1,36 @@
 ## [Unreleased]
 
+###新增（不可逆迁移前自动备份）
+
+RUNBOOK §9.2 只是**要求**运维升级前手工备份，而「记不记得」正是故障点。
+现在 `deploy.py` 在构建之前自动做掉：
+
+- `classify_migration(sql)`：把迁移归类为 `additive`（加表/加列/加索引，
+ 回退代码可安全跨过）或 `irreversible`。**irreversible 有两类**：
+改结构（`DROP TABLE` / `RENAME TO`，如004重建表）和**改数据**
+ （`UPDATE`/`DELETE`，如006修旧语义的行——表结构没动，
+看起来「安全」，但旧代码回来面对的是被改写过的行）。
+认不出来的语句一律按 irreversible——宁可多备份一次。
+- `pending_risky_migrations(applied, schema_dir)`：还没应用且不可逆的迁移。
+ `applied` 为 None（问不到远端）时**全部视为待应用**——
+ 宁可多备份一次，不要因为读不到就跳过。
+- `backup_before_upgrade(host, target)`：在目标机用 sqlite3 的 **backup API**
+生成 `data/market.db.pre-upgrade`。**不能用 `cp`**：WAL 下未 checkpoint
+的事务在 `-wal` 里，`cp` 会缺数据甚至拷出半个页。
+- `main()`：命中不可逆迁移 →先备份 →失败**中止部署**
+ （`--skip-backup` 可绕过，风险自担）。备份必须在构建之前。
+
+实测（81.4）：真实备份1.3GB 成功；`pending_risky_migrations` 对当前
+8 个已应用迁移返回空，清空 applied 后正确指出004 和006。
+
+测试10条（additive/rebuild/数据UPDATE/注释误判/只挑未应用的/None全算/
+备份失败如实报/必须用 backup API/不可逆触发备份/备份失败中止）。
+变异：备份失败不中止 →`assert0 !=0` 红；
+认不出语句当 additive →`AssertionError: 'additive' == 'irreversible'`。
+（把 DROP检查删掉是**等价变异**——兜底分支同样判不可逆，行为不变。）
+
+**测试**：47条。81.4全量 **1397 passed,3 skipped**。
+
 ## [0.2.126] - 2026-11-22
 
 ###新增（回滚时检测数据库结构是否已前进）

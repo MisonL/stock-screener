@@ -37,6 +37,9 @@ def _patch_common(monkeypatch, verify="OK", rollback_ok=True, calls=None):
     monkeypatch.setattr(deploy, "_run",
         lambda cmd: calls.append("run:" + " ".join(cmd)))
     #部署前后都会读一次库结构；测试里不能真去 ssh。
+    #迁移分类与备份：测试里不能真去读仓库 schema / 真备份。
+    monkeypatch.setattr(deploy, "pending_risky_migrations",
+        lambda applied, d: [])
     monkeypatch.setattr(deploy, "read_schema_version",
         lambda h, d: ["001_batch1.sql"])
     monkeypatch.setattr(deploy, "config_drift_script", lambda d: "true")
@@ -254,6 +257,7 @@ def test_build_failure_also_rolls_back(monkeypatch, capsys):
     monkeypatch.setattr(deploy, "_run", boom)
     monkeypatch.setattr(deploy, "config_drift_script", lambda d: "true")
     monkeypatch.setattr(deploy, "_image_id", lambda h: "sha256:old")
+    monkeypatch.setattr(deploy, "pending_risky_migrations", lambda a, d: [])
     monkeypatch.setattr(deploy, "read_schema_version", lambda h, d: [])
     monkeypatch.setattr(deploy, "rollback", fake_rollback)
     def verify_after_rollback(*args, **kwargs):
@@ -581,3 +585,96 @@ def test_rollback_without_a_new_migration_does_not_warn(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert code !=0
     assert "数据库结构已经前进" not in out
+
+
+def test_classify_migration_treats_add_column_as_additive():
+    """加列是 additive：旧代码不认识新列，读自己用的那些照样工作。"""
+    assert deploy.classify_migration(
+     "ALTER TABLE agent_schedule ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;"
+     ) == "additive"
+
+
+def test_classify_migration_treats_table_rebuild_as_irreversible():
+    """`CREATE新的 → DROP旧的 → RENAME` 换掉了整张表，旧代码可能读不了。"""
+    sql = ("CREATE TABLE fetch_log_new(id INTEGER);"
+     "DROP TABLE fetch_log;"
+     "ALTER TABLE fetch_log_new RENAME TO fetch_log;")
+    assert deploy.classify_migration(sql) == "irreversible"
+
+
+def test_classify_migration_treats_data_update_as_irreversible():
+    """**改数据也算不可逆**：006是一条 UPDATE，回退代码撤销不了它。
+
+    这是最容易漏的一类——表结构没动，看起来「安全」，
+    但旧代码回来面对的是被改写成新语义的行。
+    """
+    assert deploy.classify_migration(
+     "UPDATE gap_pending SET missing_through = 1 WHERE missing_through IS NOT NULL;"
+     ) == "irreversible"
+
+
+def test_classify_migration_ignores_drop_in_comments():
+    """注释里出现 "DROP TABLE" 不能误判。"""
+    sql = "-- 这里说明为什么要 DROP TABLE 旧表\nCREATE TABLE t(a INTEGER);"
+    assert deploy.classify_migration(sql) == "additive"
+
+
+def test_pending_risky_migrations_only_returns_unapplied_ones(tmp_path):
+    """已应用的不可逆迁移不该再触发备份。"""
+    (tmp_path / "001_a.sql").write_text("CREATE TABLE t(a INTEGER);")
+    (tmp_path / "002_b.sql").write_text("DROP TABLE t;")
+    assert deploy.pending_risky_migrations(["001_a.sql", "002_b.sql"], tmp_path) == []
+    assert deploy.pending_risky_migrations(["001_a.sql"], tmp_path) == ["002_b.sql"]
+
+
+def test_pending_risky_migrations_treats_unknown_state_as_all_pending(tmp_path):
+    """读不到远端状态（None）时**全部视为待应用**：
+    宁可多备份一次，也不要因为读不到就跳过备份。"""
+    (tmp_path / "002_b.sql").write_text("DROP TABLE t;")
+    assert deploy.pending_risky_migrations(None, tmp_path) == ["002_b.sql"]
+
+
+def test_backup_before_upgrade_reports_failure(monkeypatch):
+    """备份失败要如实返回，不能假装成功。"""
+    monkeypatch.setattr(deploy, "_capture", lambda cmd: "sqlite3.OperationalError: disk I/O error")
+    assert deploy.backup_before_upgrade("h", "/srv/app").startswith("FAIL:")
+
+
+def test_backup_before_upgrade_uses_the_backup_api_not_cp(monkeypatch):
+    """**必须用 sqlite3.backup()，不能用 cp**：
+    WAL 下未 checkpoint 的数据在 -wal 里，cp 出来的库会缺事务。"""
+    seen = []
+    monkeypatch.setattr(deploy, "_capture",
+     lambda cmd: (seen.append(" ".join(cmd)), "SS_BACKUP=OK")[1])
+    assert deploy.backup_before_upgrade("h", "/srv/app") == "OK"
+    assert "backup(" in seen[0], seen[0]
+    assert "cp " not in seen[0], "用了 cp"
+
+
+def test_irreversible_migration_triggers_a_backup_before_deploy(monkeypatch, capsys):
+    """待应用不可逆迁移 →部署前先备份。"""
+    calls = _patch_common(monkeypatch, verify="OK")
+    monkeypatch.setattr(deploy, "pending_risky_migrations",
+     lambda applied, d: ["009_drop.sql"])
+    monkeypatch.setattr(deploy, "backup_before_upgrade",
+     lambda h, d: (calls.append("backup"), "OK")[1])
+    code = deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"])
+    out = capsys.readouterr().out
+    assert code ==0
+    assert "backup" in calls, "不可逆迁移前没备份"
+    build_i = next(i for i, c in enumerate(calls) if "build api" in c)
+    assert calls.index("backup") < build_i, "备份必须在构建之前"
+
+
+def test_backup_failure_aborts_the_deploy(monkeypatch, capsys):
+    """备份失败 →**中止部署**。没备份就上线不可逆迁移是赌博。"""
+    calls = _patch_common(monkeypatch, verify="OK")
+    monkeypatch.setattr(deploy, "pending_risky_migrations",
+     lambda applied, d: ["009_drop.sql"])
+    monkeypatch.setattr(deploy, "backup_before_upgrade",
+     lambda h, d: "FAIL:disk I/O error")
+    code = deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"])
+    out = capsys.readouterr().out
+    assert code !=0
+    assert "已中止部署" in out
+    assert not any("build api" in c for c in calls), "备份失败却还是构建了"

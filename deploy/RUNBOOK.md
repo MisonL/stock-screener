@@ -406,6 +406,19 @@ ls data/backups/          # 期望：market-YYYYMMDD.db，≤ 7 份
 
 > 备份落在同一块盘上挡不住磁盘故障，定期把 `data/backups/` 同步到另一台机。
 
+### 9.2.1 不可逆迁移前会自动备份
+
+`deploy.py`在构建之前会读一次目标机的 `schema_version`，找出**还没应用、
+且不可逆**的迁移（改结构：`DROP TABLE`/`RENAME TO`；或改数据：`UPDATE`/`DELETE`），
+命中时**自动**用 `sqlite3` 的 backup API 生成 `data/market.db.pre-upgrade`。
+备份失败会**中止部署**（除非显式 `--skip-backup`）。
+
+为什么不用 `cp`：WAL 模式下未 checkpoint 的事务在 `-wal` 里，`cp` 出来的库
+会缺最近的数据，正在写入时还可能拷出半个页。
+
+§9.2 的手工备份仍然保留——自动备份只覆盖「不可逆迁移」这一种情形，
+跨大版本升级仍建议先手工备一份。
+
 ### 9.2 升级前手工备份
 
 ```bash

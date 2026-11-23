@@ -528,8 +528,8 @@ git checkout main
 ⚠️ **`docker image prune -a`会删掉回滚镜像**。`stock-screener:rollback`
 是带标签的镜像，`docker image prune -f`（不带 `-a`）只删 dangling，
 不会动它；但 `-a` / `system prune -a`会把"没有被容器引用"的标签镜像
-一并清掉，回滚能力随之消失。`scripts/host_disk_guard.sh`建议的是
-不带 `-a`的那条，别自作主张加。
+一并清掉，回滚能力随之消失。`deploy.py` 的 `prune_old_images()` 只按项目标签删悬空镜像，
+从不用 `-a`；手工清理时也别加。
 
 - **回滚后会自动比对库结构**：`deploy.py`部署前读一次 `schema_version`，
  回滚后再读一次；如果这次部署**应用了新迁移**，会打印
@@ -708,13 +708,35 @@ docker volume prune -f
 应用侧巡检（每 10 分钟）：`jobs` 的 `disk` 任务查宿主机根分区，
 75% 预警 / 85% P1 / 95% P0。阈值在 `jobs/cleanup.py`。
 
-宿主机侧护栏（容器**看不到** `/var/lib/docker` 的可写层明细，该目录在容器内为空）：
+### 磁盘防护全部在容器内完成（不用宿主机 crontab）
 
-```bash
-# 每 30 分钟，crontab 里加一行
-*/30 * * * * NTFY_URL=<ntfy 地址> NTFY_TOPIC=<主题> \
-  /home/qdm/stock-screener/scripts/host_disk_guard.sh >> /var/log/ss-disk-guard.log 2>&1
-```
+本项目是**容器化部署**，不引入宿主机级的 cron / 脚本。三层防护都在容器或
+部署链路里：
 
-它检查三项：宿主机分区水位、**单个容器可写层是否异常增长**（230 GB 那种）、
-Docker 可回收空间。**只报告，不自动删**——删什么属于运维决策。
+**① 应用侧巡检（`jobs` 容器，每 10 分钟）**
+
+`jobs/main.py` 的 `disk_job` 调 `jobs/cleanup.py::check_disk`，监控宿主机根分区
+（容器内 `df /` 看到的就是宿主机文件系统，Docker 的可写层也在上面）。
+75% / 85% / 95% 三档推 ntfy，`kind` 带档位（`disk_p2/p1/p0`）以免低档去重压掉高档。
+
+> ⚠️ **口径**：必须用 `used/(used+free)`，与 `df -P` 的 Use% 一致。
+> ext4 给 root 保留 5%，把保留块算进分母会让读数偏低 4 个多点，
+> 于是 P1 要等 `df` 到 89.5%、**P0 要等到 100.2%（永远触发不了）**。
+> 详见 `jobs/cleanup.py::disk_used_pct` 的注释。
+
+**② 部署链路回收镜像（`scripts/deploy.py`）**
+
+每次验收通过后自动 `prune_old_images()`：只删带
+`com.docker.compose.project=stock-screener` 标签的悬空镜像。
+失败时**不清理**——那时 `rollback` 标签是刚需。
+
+**③ 部署链路回收构建缓存（按磁盘压力触发）**
+
+磁盘 ≥ 80% 时才 `docker builder prune -f --filter until=72h`。
+构建缓存**无法按项目筛**（缓存记录不带 compose 项目标签），所以这条会
+连带影响同机其它项目——代价只是它们下次构建慢一点。正因如此才要
+「越线才动」，平时清纯属自找麻烦。
+
+**不再需要宿主机 crontab。** 早前的 `scripts/host_disk_guard.sh` 已删除：
+它唯一不可替代的能力是「指出**哪个**容器在长」，而对本项目来说
+总量告警 + 部署时自动回收已经够用，不值得为它引入宿主机级依赖。

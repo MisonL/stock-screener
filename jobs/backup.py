@@ -156,6 +156,20 @@ def prune_orphan_tmp(out_dir: Path, *, max_age_s: float = ORPHAN_TMP_S,
 
 
 def _prune(out_dir: Path, keep: int) -> None:
+    """只保留最新的 `keep` 份归档备份，连**伴生文件**一起删。
+
+    **必须显式删 `-shm` / `-wal` / `-journal`**：它们的名字是
+    `market-YYYYMMDD.db-shm` 这种，**不匹配** `market-*.db`
+    （`*` 不跨过 `-shm` 后缀到结尾，因为 glob 要求以 `.db` 结尾）。
+    所以主体删掉后伴生会永远留着——实测 81.4 上就有一对
+    `market-20261121.db-shm`（32KB）/ `-wal`（0B），是某次打开归档
+    校验时产生的，`_prune` 跑了几个月都没碰它们。
+
+    单看体积不大，但这是**无界增长**：每天一份、永不回收。
+    """
     files = sorted(out_dir.glob("market-*.db"))
     for old in files[:-keep] if keep >0 else files:
         old.unlink(missing_ok=True)
+        # 伴生文件跟着主体走：主体都没了，它们就是孤儿。
+        for ext in ("-shm", "-wal", "-journal"):
+            old.with_name(old.name + ext).unlink(missing_ok=True)

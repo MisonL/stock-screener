@@ -39,6 +39,10 @@ def _patch_common(monkeypatch, verify="OK", rollback_ok=True, calls=None):
     #部署前后都会读一次库结构；测试里不能真去 ssh。
     #迁移分类与备份：测试里不能真去读仓库 schema / 真备份。
     #清理旧镜像也会 ssh；默认替身成「没删任何东西」。
+    #磁盘百分比也会 ssh；默认替身成「很空闲」，避免误触缓存回收。
+    monkeypatch.setattr(deploy, "host_disk_pct", lambda h: 10.0)
+    #构建缓存回收同理：默认不触发（host_disk_pct替身返回10%）。
+    monkeypatch.setattr(deploy, "prune_build_cache", lambda h, keep_hours=72: "")
     monkeypatch.setattr(deploy, "prune_old_images", lambda h: "0")
     monkeypatch.setattr(deploy, "pending_risky_migrations",
         lambda applied, d: [])
@@ -759,3 +763,69 @@ def test_failed_deploy_does_not_prune(monkeypatch):
     code = deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"])
     assert code !=0
     assert "prune" not in calls, "验收失败却清理了镜像"
+
+
+def test_host_disk_pct_uses_df_semantics(monkeypatch):
+    """**必须与 `df -P` 同口径**：`used/(used+avail)`。
+
+    ext4 给 root 保留 5%，把它算进分母会让读数偏低 4 个多点——
+    那正是 P0（95%）永远触发不了的原因（详见 jobs/cleanup.py 的教训）。
+    """
+    monkeypatch.setattr(deploy, "_capture",
+     lambda cmd: "/dev/sda2 102400000 81920000 12288000 87% /\n")
+    got = deploy.host_disk_pct("h")
+    # 81920000/(81920000+12288000) = 86.96%
+    assert abs(got - 86.96) < 0.1, got
+    assert abs(got - 80.0) > 5, f"还在用 used/total：{got}"
+
+
+def test_host_disk_pct_returns_zero_when_unreadable(monkeypatch):
+    """读不到就返回 0（不告警），不能抛异常打断部署。"""
+    monkeypatch.setattr(deploy, "_capture", lambda cmd: "")
+    assert deploy.host_disk_pct("h") == 0.0
+    monkeypatch.setattr(deploy, "_capture", lambda cmd: "garbage")
+    assert deploy.host_disk_pct("h") == 0.0
+
+
+def test_build_cache_prune_keeps_recent_cache(monkeypatch):
+    """**必须带 `until` 过滤器**：清掉最近三天会让出错后的重建变慢。"""
+    seen = []
+    monkeypatch.setattr(deploy, "_capture",
+     lambda cmd: (seen.append(" ".join(cmd)), "Total: 0B")[1])
+    deploy.prune_build_cache("h")
+    assert "builder prune" in seen[0]
+    assert "until=72h" in seen[0], f"没限定时间：{seen[0]}"
+
+
+def test_deploy_reclaims_build_cache_only_when_disk_is_high(monkeypatch, capsys):
+    """**越线才动**：80% 以上才回收构建缓存。
+
+    构建缓存无法按项目筛，会牵连同机其它项目；平时清纯属自找麻烦。
+    """
+    calls = _patch_common(monkeypatch, verify="OK")
+    monkeypatch.setattr(deploy, "host_disk_pct", lambda h: 85.0)
+    monkeypatch.setattr(deploy, "prune_build_cache",
+     lambda h, keep_hours=72: (calls.append("cache"), "9.9GB")[1])
+    assert deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"]) == 0
+    assert "cache" in calls, "磁盘85%却没回收构建缓存"
+    assert "9.9GB" in capsys.readouterr().out
+
+
+def test_deploy_does_not_reclaim_cache_when_disk_is_fine(monkeypatch):
+    """磁盘没压力时**不该动**构建缓存。"""
+    calls = _patch_common(monkeypatch, verify="OK")
+    monkeypatch.setattr(deploy, "host_disk_pct", lambda h: 40.0)
+    monkeypatch.setattr(deploy, "prune_build_cache",
+     lambda h, keep_hours=72: (calls.append("cache"), "0B")[1])
+    assert deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"]) == 0
+    assert "cache" not in calls, "磁盘40%却清理了构建缓存"
+
+
+def test_failed_deploy_does_not_reclaim_cache(monkeypatch):
+    """验收失败时不清理——那时 rollback标签是刚需。"""
+    calls = _patch_common(monkeypatch, verify="FAIL:jobs起不来")
+    monkeypatch.setattr(deploy, "host_disk_pct", lambda h: 95.0)
+    monkeypatch.setattr(deploy, "prune_build_cache",
+     lambda h, keep_hours=72: (calls.append("cache"), "1GB")[1])
+    assert deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"]) != 0
+    assert "cache" not in calls

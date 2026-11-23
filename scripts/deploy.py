@@ -585,6 +585,45 @@ def prune_old_images(host: str) -> str:
     return str(n)
 
 
+#: 磁盘越过这个百分比才回收构建缓存。**平时不主动清**：
+#: 清掉缓存只是让下次构建变慢，没坏处但也没好处——只在真有压力时动手。
+DISK_RECLAIM_PCT = 80.0
+
+
+def host_disk_pct(host: str) -> float:
+    """读目标机 `/` 的占用百分比，**与 `df -P` 同口径**；读不到返回 0。
+
+    用 `100*(used)/(used+avail)`：ext4 给 root 保留 5%，把它算进分母
+    会让读数偏低 4 个多点（详见 `jobs/cleanup.py::disk_used_pct` 的教训）。
+    """
+    out = _capture(["ssh", "-o", "BatchMode=yes", host, "df -P / | tail -1"])
+    parts = out.split()
+    if len(parts) < 4:
+        return 0.0
+    try:
+        used = float(parts[2])
+        avail = float(parts[3])
+    except (TypeError, ValueError):
+        return 0.0
+    return 100.0 * used / (used + avail) if used + avail else 0.0
+
+
+def prune_build_cache(host: str, keep_hours: int = 72) -> str:
+    """删掉超过 `keep_hours` 的构建缓存，返回 `docker` 报的回收量。
+
+    **构建缓存无法按项目筛**（`docker buildx` 的缓存记录不带 compose 项目标签），
+    所以这条会连带影响同机的 WeKnora / selfhost / langbot——代价只是它们
+    下次构建慢一点，不会中断任何正在跑的东西。
+
+    正因如此，**只在磁盘越线时才调**（见 `DISK_RECLAIM_PCT`）：
+    平时清缓存纯属自找麻烦。`until` 过滤器保证最近三天的缓存还在，
+    出错后立刻重新构建仍然快。
+    """
+    code = f"docker builder prune -f --filter until={keep_hours}h 2>&1 | tail -1"
+    out = _capture(["ssh", "-o", "BatchMode=yes", host, "bash -c " + _sh_quote(code)])
+    return out.strip().splitlines()[-1] if out.strip() else ""
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="部署已提交的内容到 VM")
     ap.add_argument("--host", default=DEFAULT_HOST)
@@ -744,6 +783,13 @@ def main(argv: list[str] | None = None) -> int:
         pruned = prune_old_images(args.host)
         if pruned != "0":
             print(f"已清理 {pruned} 个本项目的旧镜像（悬空，不影响回滚）")
+        # **构建缓存无法按项目筛**，只在磁盘越线时才回收：平时清纯属自找麻烦。
+        pct = host_disk_pct(args.host)
+        if pct >= DISK_RECLAIM_PCT:
+            print(f"目标机磁盘 {pct:.1f}%（>= {DISK_RECLAIM_PCT:.0f}%），回收 72h 前的构建缓存")
+            freed = prune_build_cache(args.host)
+            if freed:
+                print(f"构建缓存：{freed}")
     else:
         print(f"**验收未通过**：{reason}")
         if reason.startswith("UNKNOWN"):

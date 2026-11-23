@@ -329,3 +329,31 @@ def test_disk_used_pct_matches_df_not_used_over_total(monkeypatch):
     assert abs(got - 88.9) < 0.2, f"应该是 used/(used+free)=88.9%，实际 {got:.1f}%"
     # 用旧公式（used/total）会得到 80.0%——必须**不等于**它
     assert abs(got - 80.0) > 5, f"还在用 used/total：{got:.1f}%"
+
+
+def test_prune_removes_sidecar_files_of_deleted_backups(tmp_path):
+    """**伴生文件必须跟主体一起删**。
+
+    `market-*.db` 这个 glob **匹配不到** `market-20261121.db-shm`
+    （要求以 `.db` 结尾），所以主体删掉后伴生会永远留着。
+    实测 81.4 上就有一对 `-shm`(32KB)/`-wal`(0B)，`_prune` 跑了几个月没碰。
+    单看体积小，但每天一份、永不回收 = 无界增长。
+    """
+    from jobs.backup import _prune
+
+    out = tmp_path
+    for d in ("20261101", "20261102", "20261103"):
+        (out / f"market-{d}.db").write_bytes(b"x")
+        (out / f"market-{d}.db-shm").write_bytes(b"x")
+        (out / f"market-{d}.db-wal").write_bytes(b"x")
+
+    _prune(out, keep=1)
+
+    left = sorted(p.name for p in out.iterdir())
+    # 只剩最新那一份（主体 + 它的伴生）。旧的两份连同伴生全部消失。
+    assert left == ["market-20261103.db", "market-20261103.db-shm",
+                   "market-20261103.db-wal"], left
+    # 最新那份的伴生**必须还在**（删了会破坏正在用的归档）
+    # 最新那份的伴生**必须还在**（主体还在，删伴生等于破坏归档）
+    assert (out / "market-20261103.db-shm").exists()
+    assert (out / "market-20261103.db-wal").exists()

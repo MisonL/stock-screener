@@ -305,3 +305,26 @@ def test_pipefail_runs_under_explicit_bash():
     src = (ROOT / "scripts" / "deploy.py").read_text(encoding="utf-8")
     assert "bash -c " in src, "没用显式 bash -c：远端 dash 会让 pipefail 直接失败"
     assert "_sh_quote" in src, "远端脚本没有正确加引号"
+
+
+def test_every_service_caps_its_log_files():
+    """**每个 service 都必须挂 `x-logging`**：不挂的那个会用 json-file 默认
+    （无上限），日志能撑到把盘写满。
+
+    2026-11-21 那次事故的直接原因就是容器可写层疯长到 230GB。
+    本项目现在的容器可写层只有几十 kB（写入都落在 bind mount 上），
+    日志上限是最后一道"容器自己能长大"的口子——必须逐服务盯住。
+    """
+    import yaml
+
+    compose = yaml.safe_load(
+     (ROOT / "deploy" / "docker-compose.yml").read_text(encoding="utf-8"))
+    services = compose["services"]
+    missing = [name for name, svc in services.items() if "logging" not in svc]
+    assert not missing, f"这些服务没有日志上限，会无限增长：{missing}"
+
+    # 上限值也要真的存在，不能只写个空的 logging:
+    for name, svc in services.items():
+        opts = svc["logging"].get("options") or {}
+        assert opts.get("max-size"), f"{name} 没有 max-size"
+        assert opts.get("max-file"), f"{name} 没有 max-file"

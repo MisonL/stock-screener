@@ -1,5 +1,33 @@
 ## [Unreleased]
 
+###决策（放弃「指出哪个容器在长」，并写清依据）
+
+删掉 `host_disk_guard.sh` 前逐条核实了**它唯一不可替代的能力**到底值不值：
+
+| 核实项 | 结论 |
+|---|---|
+| 本项目容器可写层 | **28.7kB ~ 41kB**（`docker ps -s` 实测） |
+| 为什么这么小 | 写入全在 bind mount：`./data:/app/data`（api/jobs/agent/backfill）、`./ntfy/cache`；cloudflared 只挂只读 `cf/` |
+| 容器内能否自查 | **不能**：`jobs` 没有 docker CLI，也看不到 `/var/lib/docker` |
+| 日志会不会撑爆 | 全部服务挂 `x-logging`（50m × 3），**上限 150MB/服务** |
+
+结论：**本项目不存在「容器可写层疯长」这个故障模式**。要写的东西都写在
+bind mount 上，那部分由应用侧总量巡检覆盖，`data/backups` 还有 `keep=7`
+保留策略兜着。
+
+真正的风险形状是「**别的容器**在不相关的项目里长」——那种情况下
+「哪个容器」有用，但要为此在 jobs 里挂 `/var/run/docker.sock`（等于给
+root 权限）或引入 cAdvisor（多一个服务维护），代价明显大于收益。
+
+- 决策与依据写进 `deploy/RUNBOOK.md`（含「将来 `docker ps -s` 出现 GB 级
+ 再引入 cAdvisor」的复评条件）。
+-补 `test_every_service_caps_its_log_files`：**逐服务**断言挂了
+ `x-logging` 且 `max-size`/`max-file` 非空。日志是容器唯一能自己长大的口子，
+ 漏一个就是无界增长。变异（删掉 agent 的 logging）→
+ `AssertionError:这些服务没有日志上限，会无限增长：['agent']`。
+
+**测试**：14条（deploy_script）。81.4全量 **1414 passed,3 skipped**。
+
 ## [0.2.132] - 2026-11-23
 
 ###变更（磁盘防护全部搬进容器，删除系统级脚本）

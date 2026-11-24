@@ -7,10 +7,13 @@
 from __future__ import annotations
 
 import fcntl # POSIX-only；本项目只跑 Linux容器
+import logging
 import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 #:半截备份的保留时长。**它们必须以 `.`开头**（保证 `_prune`的
 #: `market-*.db`不会把它们当成正式备份），但代价是**永远不会被任何清理逻辑
@@ -156,20 +159,39 @@ def prune_orphan_tmp(out_dir: Path, *, max_age_s: float = ORPHAN_TMP_S,
 
 
 def _prune(out_dir: Path, keep: int) -> None:
-    """只保留最新的 `keep` 份归档备份，连**伴生文件**一起删。
+    """只保留最新的 `keep` 份归档备份，并清掉**孤儿伴生文件**。
 
-    **必须显式删 `-shm` / `-wal` / `-journal`**：它们的名字是
-    `market-YYYYMMDD.db-shm` 这种，**不匹配** `market-*.db`
-    （`*` 不跨过 `-shm` 后缀到结尾，因为 glob 要求以 `.db` 结尾）。
-    所以主体删掉后伴生会永远留着——实测 81.4 上就有一对
-    `market-20261121.db-shm`（32KB）/ `-wal`（0B），是某次打开归档
-    校验时产生的，`_prune` 跑了几个月都没碰它们。
+    **`-shm` / `-wal` / `-journal` 必须显式处理**：它们的名字是
+    `market-YYYYMMDD.db-shm`，**不匹配** `market-*.db`
+    （glob 要求以 `.db` 结尾，`*` 不会拐过 `-shm` 后缀）。
+    实测 81.4 上就有一对 `-shm`(32KB)/`-wal`(0B)，`_prune` 跑了几个月没碰。
 
-    单看体积不大，但这是**无界增长**：每天一份、永不回收。
+    分两步，缺一不可：
+    ① **先删伴生、再删主体**。顺序反过来的话，中途被杀就留下
+         「主体没了、伴生还在」的孤儿，而第二步的 glob 永远捞不到它。
+    ② **扫一遍孤儿**。上一版（或手工 `rm market-*.db`）已经造出的孤儿，
+         没有任何主体可依附，只能靠这一遍捞。不加这遍，**修完也只防未来**。
+
+    `keep < 1` 直接报错：`os.replace` 已经把今天这份改好名了，
+    此时删全部会让"备份成功"变成"目录里一份都没有"，且调用方看不出来。
     """
+    if keep < 1:
+        raise ValueError(f"keep 必须 >= 1，否则会把刚写好的备份也删掉（got {keep}）")
+
     files = sorted(out_dir.glob("market-*.db"))
-    for old in files[:-keep] if keep >0 else files:
-        old.unlink(missing_ok=True)
-        # 伴生文件跟着主体走：主体都没了，它们就是孤儿。
-        for ext in ("-shm", "-wal", "-journal"):
-            old.with_name(old.name + ext).unlink(missing_ok=True)
+    try:
+        for old in files[:-keep]:
+            # **先伴生、后主体**：反过来被杀会留下捞不回的孤儿。
+            for ext in ("-shm", "-wal", "-journal"):
+                old.with_name(old.name + ext).unlink(missing_ok=True)
+            old.unlink(missing_ok=True)
+        # 第二遍：主体已经不在的孤儿伴生文件。
+        for side in out_dir.glob("market-*.db-*"):
+            body = out_dir / (side.name.split(".db-", 1)[0] + ".db")
+            if not body.exists():
+                side.unlink(missing_ok=True)
+    except OSError as e:
+        # `missing_ok` 挡不住 EACCES/EROFS/EIO。这里抛出去会让
+        # `backup_db` 报「备份失败」——但 `os.replace` 早就成功了，
+        # 备份其实是好的。删不掉旧文件不值得谎报备份失败。
+        log.warning("清理旧备份时出错（备份本身已成功）：%s", e)

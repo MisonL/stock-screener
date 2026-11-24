@@ -576,7 +576,7 @@ def create_app(cfg, conn_factory, clock, dispatcher=None, mcp=None, chat_llm=Non
             "upstream_1h": upstream,
             "notify_ok": notify_ok,
             "notify_last_error": notify_last_error,
-            "disk_used_pct": _disk_used_pct("data"),
+            "disk_used_pct": _disk_used_pct(_data_dir()),
             "maintenance": bool(flag) and str(flag[0]) == "1",
             "budget_exhausted": budget_exhausted,
             # 前端首页状态栏：`agent_last_turn_at` 为 ISO 串，`agent_turn_stale_min`
@@ -621,12 +621,28 @@ def _row_market(row: dict) -> str | None:
     return classify_market(code) if isinstance(code, str) else None
 
 
-def _disk_used_pct(path: str) -> float:
-    """`data/` 所在文件系统的占用百分比（`os.statvfs`；容器里也拿得到）。"""
+def _data_dir() -> str:
+    """`data/` 目录的绝对路径（拿不到就退回相对路径）。
+
+    `statvfs` 对相对路径依赖进程 CWD：容器里 `WORKDIR /app` 所以碰巧对，
+    但换启动方式（从 `/` 起 uvicorn、systemd）就会 ENOENT——而那会
+    被 `_disk_used_pct` 变成 `None`，接口显示"读不到"而不是报 0%。
+    这里显式优先 `/app/data`，让磁盘读写点与 CWD 解耦。
+    """
+    return "/app/data" if Path("/app/data").is_dir() else "data"
+
+
+def _disk_used_pct(path: str) -> float | None:
+    """`data/` 所在文件系统的占用百分比（`os.statvfs`；容器里也拿得到）。
+
+    **读不到返回 `None`，不返回 `0.0`**：`0` 的含义是"磁盘很空"，
+    而它在这里只会出现在「压根读不到」的时候（路径不存在、EIO）。
+    把它当 0 上报，接口会显示"磁盘 0%"，让人以为一切正常。
+    """
     try:
         st = os.statvfs(path)
     except OSError:
-        return 0.0
+        return None
     # **分子分母都要用对**，与 `df` 的 Use% 同口径：
     #   used = f_blocks - f_bfree  （真正被文件占用的；**不含**保留块）
     #   free = f_bavail            （非 root 能用的；**不含**保留块）
@@ -638,7 +654,10 @@ def _disk_used_pct(path: str) -> float:
     # `f_bfree == f_bavail`，三种写法结果相同。只有真实 ext4 才暴露。
     used = st.f_blocks - st.f_bfree
     usable = used + st.f_bavail
-    return 100.0 * used / usable if usable else 0.0
+    if not usable:
+        return None
+    # 夹到 [0,100]：配额/网络文件系统的 `f_bavail` 可能是负的。
+    return min(100.0, max(0.0, 100.0 * used / usable))
 
 
 def _yaml(path: Path) -> dict:

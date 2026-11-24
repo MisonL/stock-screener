@@ -713,5 +713,9 @@ def test_api_disk_used_pct_matches_df_on_ext4(monkeypatch):
     from api.routes import _disk_used_pct
     got = _disk_used_pct("data")
     assert abs(got - 88.9) < 0.2, f"应该是 used/(used+free)=88.9%，实际 {got:.1f}%"
-    assert abs(got - 80.0) > 5, f"分子用了 blocks-bavail（保留块算成已用）：{got:.1f}%"
-    assert abs(got - 85.5) > 2, f"分母用了 blocks（保留块进分母）：{got:.1f}%"
+    # 该 fixture 下错误的写法只有两种，各自对应一个真会出现的错法：
+    assert abs(got - 90.0) > 1, f"分子用了 blocks-bavail（保留块算成已用）：{got:.1f}%"
+    assert abs(got - 80.0) > 5, f"分母用了 blocks（保留块进分母）：{got:.1f}%"
+    # 读不到时必须是 None，不能是 0（0 会让所有告警阈值失效）
+    monkeypatch.setattr(_os, "statvfs", lambda p: (_ for _ in ()).throw(OSError("boom")))
+    assert _disk_used_pct("data") is None

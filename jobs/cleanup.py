@@ -113,7 +113,7 @@ def cleanup(conn, clock, dispatcher=None, data_dir: str = "/app/data") -> dict[s
         log.warning("PRAGMA optimize 失败：%s", e)
 
     used = disk_used_pct(data_dir)
-    out["disk_used_pct"] = int(used)
+    out["disk_used_pct"] = None if used is None else int(used)
     if dispatcher is not None:
         _alert_disk(dispatcher, used)
     return out
@@ -131,8 +131,12 @@ DISK_HIGH_PCT = 85.0
 DISK_CRIT_PCT = 95.0
 
 
-def _alert_disk(dispatcher, used: float) -> None:
+def _alert_disk(dispatcher, used: float | None) -> None:
     """按水位发告警。
+
+    **`used is None`（读不到）必须单独告警，不能当成 0% 静默**：
+    读不到的常见原因是 bind mount 丢失 / 路径不存在 / EIO，
+    这时磁盘可能已经满了，而 0% 会让 75/85/95 三档全部不触发。
 
     **kind 必须带档位**（`disk_p2` / `disk_p1` / `disk_p0`）。
     `Dispatcher.alert` 的 30 分钟去重判据是 `kind + 时间`，**不看 level**：
@@ -140,7 +144,9 @@ def _alert_disk(dispatcher, used: float) -> None:
     "同 kind 刚发过"直接压掉——最该升级的那次反而发不出去。
     分档 kind 让它们各自去重，升级一定发得出去。
     """
-    if used >= DISK_CRIT_PCT:
+    if used is None:
+        dispatcher.alert("disk_unknown", "读不到磁盘占用（statvfs 失败），无法判断水位", "P1")
+    elif used >= DISK_CRIT_PCT:
         dispatcher.alert("disk_p0", f"磁盘水位 {used:.0f}%（{DISK_CRIT_PCT:.0f}% 以上，随时可能写不进）", "P0")
     elif used >= DISK_HIGH_PCT:
         dispatcher.alert("disk_p1", f"磁盘水位 {used:.0f}%（{DISK_HIGH_PCT:.0f}% 以上）", "P1")
@@ -148,23 +154,36 @@ def _alert_disk(dispatcher, used: float) -> None:
         dispatcher.alert("disk_p2", f"磁盘水位 {used:.0f}%（{DISK_WARN_PCT:.0f}% 以上，建议清理）", "P2")
 
 
-def check_disk(conn, dispatcher=None, path: str | None = None) -> float:
+def check_disk(conn, dispatcher=None, path: str | None = None) -> float | None:
     """**独立于每日 cleanup 的磁盘巡检**（每 10 分钟一次）。
 
     监控的是**宿主机根分区**而不是只看 `/app/data`：容器里 `df /` 看到的就是
     宿主机文件系统（Docker 的 `/var/lib/docker` 也在上面），所以 Docker 自身的
     可写层膨胀也会被算进来——2026-11-21 那次就是这么被撑爆的。
 
-    返回占用百分比，供调用方记录。
+    `/app/data` 不存在时（bind mount 丢失）**明确记一条警告**再退到 `/`：
+    悄悄换测量对象会让人以为监控一直正常。
     """
-    used = disk_used_pct(path or ("/" if Path("/app/data").exists() else "."))
+    if path is None:
+        if Path("/app/data").exists():
+            path = "/"
+        else:
+            log.warning("/app/data 不存在（bind mount 丢了？），改测 /")
+            path = "."
+    used = disk_used_pct(path)
     if dispatcher is not None:
         _alert_disk(dispatcher, used)
     return used
 
 
-def disk_used_pct(path: str) -> float:
+def disk_used_pct(path: str) -> float | None:
     """`/app/data` 的占用百分比；**独立于表清理，无论如何都要算**。
+
+    **读不到时返回 `None`，绝不返回 `0.0`**：0 是"磁盘很空"，
+    它同时意味着所有阈值（75/85/95）都不触发——**告警彻底静默**，
+    而 `push_log` 里只会留下一条"磁盘 0%"的假记录。这和本函数
+    刚修掉的"口径偏低导致 P0 永不触发"是同一个后果，只是触发条件
+    从"算错"换成了"读不到"（bind mount 没挂上、路径不存在、EIO）。
 
     **必须用 `used/(used+free)`，不能用 `used/total`**：ext4 默认给 root
     保留 5% 空间（本机实测 5.02 GB / 98 GB）。`total` 把这块保留区算进分母，
@@ -180,11 +199,15 @@ def disk_used_pct(path: str) -> float:
     try:
         usage = shutil.disk_usage(path)
     except OSError:
-        return 0.0
+        return None
     # `free` 是给非 root 的可用量（f_bavail），保留块不在其中——
     # 用它做分母才和 `df` 的 Use% 同口径。
     usable = usage.used + usage.free
-    return usage.used / usable * 100 if usable else 0.0
+    if not usable:
+        return None
+    # 夹到 [0,100]：部分网络/配额文件系统 `f_bavail` 可能为负，
+    # 不夹会写出 `-3%` 这种日志，让人以为读数坏了。
+    return min(100.0, max(0.0, usage.used / usable * 100))
 
 
 #: 备份允许的最大陈旧时间（小时）。备份在 23:30 跑，次日 08:55 的自检若看到

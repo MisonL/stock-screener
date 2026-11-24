@@ -57,7 +57,10 @@ services:
         - python
         - -c
         - import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5000/healthz',timeout=3).status==200 else 1)
-      interval: 30s
+      # 30s→60s：每次健康检查都起一个 python 解释器（slim 镜像没 curl），
+      # 约 80ms CPU + 一次内存分配；30s 一天 2880 次≈4 分钟纯启动开销。
+      # 60s 仍能在一分钟内发现挂掉（配合 retries=3 + cloudflared 探活足够）。
+      interval: 60s
       timeout: 5s
       retries: 3
       start_period: 30s

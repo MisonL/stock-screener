@@ -557,8 +557,8 @@ def schema_drift_warning(before: list[str] | None, after: list[str] | None) -> s
 PROJECT = "stock-screener"
 
 
-def prune_old_images(host: str) -> str:
-    """只删**本项目**的悬空镜像；返回删掉了几个。
+def prune_old_images(host: str) -> str | None:
+    """只删**本项目**的悬空镜像；返回删掉了几个，没跑成返回 `None`。
 
     每次 `compose build` 都会产生新镜像，上一次的 `rollback`标签被新镜像
     顶掉后就成了悬空镜像。实测一天13次发布留下9个639MB悬空镜像（约5.7GB）。
@@ -578,50 +578,115 @@ def prune_old_images(host: str) -> str:
      "p=$(docker image inspect --format '{{index .Config.Labels \"com.docker.compose.project\"}}' $id 2>/dev/null); "
      f"if [ \"$p\" = \"{PROJECT}\" ]; then "
      "docker rmi $id >/dev/null 2>&1 && echo SS_PRUNED=$id; "
-     "fi; done"
+     "fi; done; echo SS_DONE"
      )
     out = _capture(["ssh", "-o", "BatchMode=yes", host, "bash -c " + _sh_quote(code)])
+    # **必须区分「删了 0 个」和「根本没跑成」**：ssh 连不上、docker 挂了
+    # 时 `SS_PRUNED=` 一行也没有，只看计数会把两者混成"0"，
+    # 于是清理失败也静默。用结尾哨兵判断是否真的跑完。
+    if "SS_DONE" not in out:
+        return None
     n = sum(1 for line in out.splitlines() if line.startswith("SS_PRUNED="))
     return str(n)
 
 
 #: 磁盘越过这个百分比才回收构建缓存。**平时不主动清**：
 #: 清掉缓存只是让下次构建变慢，没坏处但也没好处——只在真有压力时动手。
-DISK_RECLAIM_PCT = 80.0
+#:
+#: **不能定得比稳态水位低**：本机常年 85~90%，定 80 等于每次部署都去清
+#: 同机 WeKnora/selfhost/langbot 的缓存（构建缓存无法按项目筛）。
+#:
+#: **更不能随便清**：清缓存会连带删掉本项目的 pip/npm/vite 层，下次
+#: 部署就得完整重跑（`pip install pandas/numpy/TA-Lib` + 两次 `npm ci` +
+#: `vite build`）——这是**满核几分钟**的 CPU 尖峰。这台机器的痛点是
+#: 负载（曾实测 ssh 卡住、healthz 530），不是磁盘写满（常年还有 10G）。
+#: **用 CPU 换磁盘是换错方向**。所以阈值定在 95——真正逼近写满、
+#: 不回收就要出事时才动，而不是每次发版都付重建代价。
+DISK_RECLAIM_PCT = 95.0
 
 
-def host_disk_pct(host: str) -> float:
-    """读目标机 `/` 的占用百分比，**与 `df -P` 同口径**；读不到返回 0。
+def host_disk_pct(host: str) -> float | None:
+    """读目标机 `/` 的占用百分比，**与 `df -P` 同口径**；读不到返回 `None`。
 
     用 `100*(used)/(used+avail)`：ext4 给 root 保留 5%，把它算进分母
     会让读数偏低 4 个多点（详见 `jobs/cleanup.py::disk_used_pct` 的教训）。
+
+    **读不到必须返回 `None` 而不是 0.0**：0 会被当成"磁盘很空"，
+    于是缓存回收被静默跳过，一行日志都没有。这台机器的盘位常年在
+    80% 以上，恰恰是最需要它工作的时候。
+
+    解析要求**最后一行**且有 6 个字段、第 5 个以 `%` 结尾：
+    `_capture` 是 `stdout + stderr` 拼接，stderr（`Warning: Permanently
+    added ...`、`ssh: connect ... refused`）若恰好有 6+ 个含数字的 token
+    就会被当成 df 数据。加这些约束让失败宁可误判成"读不到"。
     """
     out = _capture(["ssh", "-o", "BatchMode=yes", host, "df -P / | tail -1"])
-    parts = out.split()
-    if len(parts) < 4:
-        return 0.0
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    parts = lines[-1].split()
+    if len(parts) < 6 or not parts[4].endswith("%"):
+        return None # df 头行 / stderr 里恰好凑够字段的
     try:
         used = float(parts[2])
         avail = float(parts[3])
     except (TypeError, ValueError):
-        return 0.0
-    return 100.0 * used / (used + avail) if used + avail else 0.0
+        return None
+    if used + avail <= 0:
+        return None
+    return min(100.0, max(0.0, 100.0 * used / (used + avail)))
 
 
-def prune_build_cache(host: str, keep_hours: int = 72) -> str:
-    """删掉超过 `keep_hours` 的构建缓存，返回 `docker` 报的回收量。
+def prune_build_cache(host: str, keep_gb: int = 5) -> str:
+    """把构建缓存**压到 `keep_gb` 以内**，返回 `docker` 报的回收量。
 
-    **构建缓存无法按项目筛**（`docker buildx` 的缓存记录不带 compose 项目标签），
+    **构建缓存无法按项目筛**（buildx 的缓存记录不带 compose 项目标签），
     所以这条会连带影响同机的 WeKnora / selfhost / langbot——代价只是它们
-    下次构建慢一点，不会中断任何正在跑的东西。
+    下次构建慢一点，不会中断任何正在跑的东西。正因如此，
+    **只在磁盘越线时才调**（见 `DISK_RECLAIM_PCT`）。
 
-    正因如此，**只在磁盘越线时才调**（见 `DISK_RECLAIM_PCT`）：
-    平时清缓存纯属自找麻烦。`until` 过滤器保证最近三天的缓存还在，
-    出错后立刻重新构建仍然快。
+    **为什么不用 `--filter until=72h`**：`until` 判的是**创建时间**，
+    不是最后使用时间。这台机器一天发十几次版，缓存几乎都是新的——
+    实测跑下来返回 `Total: 0B`，也就是**磁盘越线时它一个字节都收不回来**，
+    白跑一趟。`--keep-storage` 判的是总量，行为可预测：
+    跑完之后缓存上限就是 `keep_gb`，且由 docker 自己按最旧的先删。
     """
-    code = f"docker builder prune -f --filter until={keep_hours}h 2>&1 | tail -1"
+    code = (
+     f"docker builder prune -f --keep-storage {keep_gb}GB 2>&1 | tail -1"
+     )
     out = _capture(["ssh", "-o", "BatchMode=yes", host, "bash -c " + _sh_quote(code)])
     return out.strip().splitlines()[-1] if out.strip() else ""
+
+
+def _post_deploy_cleanup(host: str) -> None:
+    """验收通过后的清理：悬空镜像 + （磁盘越线时）构建缓存。
+
+    **失败只打印警告，不影响部署结论**：这两件事都不是部署的一部分，
+    但它们都会 ssh 出去，ssh 卡住/超时会抛异常。让清理把一次成功的
+    部署变成失败，代价远大于它省下的磁盘。
+    """
+    # 只删本项目的悬空镜像——同机还有 WeKnora/selfhost/langbot 等项目。
+    pruned = prune_old_images(host)
+    if pruned is None:
+        print("警告：镜像清理没跑成（ssh 或 docker 失败），本次跳过")
+    elif pruned != "0":
+        print(f"已清理 {pruned} 个本项目的旧镜像（悬空，不影响回滚）")
+
+    # **构建缓存无法按项目筛**，只在磁盘越线时才回收：平时清纯属自找麻烦。
+    pct = host_disk_pct(host)
+    if pct is None:
+        print("警告：读不到目标机磁盘水位，跳过构建缓存回收")
+        return
+    if pct < DISK_RECLAIM_PCT:
+        return
+    print(f"目标机磁盘 {pct:.1f}%（>= {DISK_RECLAIM_PCT:.0f}%），回收构建缓存")
+    freed = prune_build_cache(host)
+    # **只把 `Total:` 那行当回收量**：docker 挂了时最后一行是
+    # `Cannot connect to the Docker daemon...`，直接打出来像"回收了这么多"。
+    if freed.startswith("Total:"):
+        print(f"构建缓存：{freed}")
+    elif freed:
+        print(f"警告：构建缓存回收失败：{freed[:120]}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -779,17 +844,14 @@ def main(argv: list[str] | None = None) -> int:
             print("（未配置 --public-url，本次没有验公网可达性）")
         print("已重启容器。建议再确认一次 /healthz（见 RUNBOOK §9）")
         # **只在验收通过之后清理**：失败时 rollback标签是刚需。
-        #只删本项目的悬空镜像——同机还有 WeKnora/selfhost/langbot 等项目。
-        pruned = prune_old_images(args.host)
-        if pruned != "0":
-            print(f"已清理 {pruned} 个本项目的旧镜像（悬空，不影响回滚）")
-        # **构建缓存无法按项目筛**，只在磁盘越线时才回收：平时清纯属自找麻烦。
-        pct = host_disk_pct(args.host)
-        if pct >= DISK_RECLAIM_PCT:
-            print(f"目标机磁盘 {pct:.1f}%（>= {DISK_RECLAIM_PCT:.0f}%），回收 72h 前的构建缓存")
-            freed = prune_build_cache(args.host)
-            if freed:
-                print(f"构建缓存：{freed}")
+        # 清理不是部署的一部分——**绝不能反过来否决一次成功的部署**：
+        # ssh 卡住会抛 TimeoutExpired、ssh 不存在会抛 FileNotFoundError，
+        # 未捕获就是「部署成功却以非零码+traceback 结束」，CI/值班会去
+        # 回滚一个健康的新版本。所以整段包住，失败只警告。
+        try:
+            _post_deploy_cleanup(args.host)
+        except Exception as exc:                        # noqa: BLE001
+            print(f"警告：清理跳过（{type(exc).__name__}: {exc}），不影响本次部署")
     else:
         print(f"**验收未通过**：{reason}")
         if reason.startswith("UNKNOWN"):

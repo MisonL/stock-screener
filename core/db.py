@@ -34,6 +34,14 @@ def connect(path: Path | None = None, readonly: bool = False) -> sqlite3.Connect
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA foreign_keys = ON")
+    # **临时表/b-tree 放内存，不落盘**：默认 `temp_store = 0`（用文件）会把
+    # SQLite 的中间结果写进 `$TMPDIR`，也就是**容器的可写层**——那里没有任何
+    # 监控（`/app/data` 才是 bind mount）。大 `GROUP BY` 或 `ANALYZE` 时
+    # 可能写出几百 MB，正常退出会清，**被 OOM/重启杀掉就会残留**，
+    # 而残留只会体现为"某个容器在长"，这正是我们放弃的那项能力。
+    # 代价是内存占用：jobs 容器 `mem_limit 1g`，实测最大查询的排序集
+    # 远小于此。设成 MEMORY 后临时文件不再成为盲区。
+    conn.execute("PRAGMA temp_store = MEMORY")
     return conn
 
 

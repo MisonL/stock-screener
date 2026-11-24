@@ -352,6 +352,13 @@ _ALERT_TITLE = {
     "confirm": "确认执行失败",
     # 定时任务自报（jobs/*）
     "disk": "磁盘水位告警",
+    # `jobs/cleanup.py::_alert_disk` 的按档位 kind（去重键必须分档，
+    # 否则 P2 会把 10 分钟后的 P1/P0 压掉）。这些 kind 也要有中文标题，
+    # 不然手机推的是裸 `disk_p1`。新增 kind 时记得同步这里。
+    "disk_p2": "磁盘水位告警（P2）",
+    "disk_p1": "磁盘水位告警（P1）",
+    "disk_p0": "磁盘水位告警（P0）",
+    "disk_unknown": "磁盘水位无法读取",
     "backup": "备份失败",
     "members": "成分股刷新失败",
     "archive": "agent_turn 归档失败",

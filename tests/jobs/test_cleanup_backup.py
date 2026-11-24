@@ -100,8 +100,14 @@ def test_disk_alert_thresholds(conn, monkeypatch):
     assert disp3.alerts == []
 
 
-def test_disk_used_pct_returns_zero_on_bad_path():
-    assert disk_used_pct("/definitely/not/here") == 0.0
+def test_disk_used_pct_returns_none_on_bad_path():
+    """**读不到必须是 `None`，绝不能是 `0.0`。**
+
+    0 的含义是"磁盘很空"，它让 75/85/95 三档全部不触发——
+    告警彻底静默，而 `push_log` 里只会留下"磁盘 0%"的假记录。
+    这和"口径偏低导致 P0 永不触发"是同一个后果。
+    """
+    assert disk_used_pct("/definitely/not/here") is None
 
 
 # ---- 备份 ----------------------------------------------------------------
@@ -357,3 +363,98 @@ def test_prune_removes_sidecar_files_of_deleted_backups(tmp_path):
     # 最新那份的伴生**必须还在**（主体还在，删伴生等于破坏归档）
     assert (out / "market-20261103.db-shm").exists()
     assert (out / "market-20261103.db-wal").exists()
+
+
+def test_check_disk_alerts_when_unreadable(monkeypatch):
+    """读不到磁盘时要发 **P1 disk_unknown**，不能静默。"""
+    import jobs.cleanup as cleanup_mod
+
+    class FakeDispatcher:
+        def __init__(self):
+            self.calls = []
+
+        def alert(self, kind, body, level):
+            self.calls.append((kind, level))
+
+    d = FakeDispatcher()
+    # **必须 monkeypatch，不能直接赋值模块属性**：直接赋值不会在测试后恢复，
+    # 后面的用例会拿到这个假函数——实测出现过"单跑通过、合跑失败"。
+    monkeypatch.setattr(cleanup_mod, "disk_used_pct", lambda p: None)
+    cleanup_mod.check_disk(None, d, "/nope")
+    assert ("disk_unknown", "P1") in d.calls, d.calls
+
+
+def test_prune_removes_orphan_sidecars_whose_body_is_gone(tmp_path):
+    """**主体早已不在的孤儿伴生文件也必须清掉。**
+
+    只删主体时连带的伴生（上一版的做法）只能防未来：如果某次 `_prune`
+    在删主体之后、删伴生之前被杀，或者有人手工 `rm market-*.db`，
+    留下的 `-shm`/`-wal` 没有主体可依附，`market-*.db` 的 glob 永远
+    匹配不到它们——81.4 上那对 32KB 残留就是这个形态。
+    """
+    from jobs.backup import _prune
+
+    out = tmp_path
+    (out / "market-20260101.db").write_bytes(b"x")
+    # 只有伴生、没有主体
+    (out / "market-20251231.db-shm").write_bytes(b"y")
+    (out / "market-20251231.db-wal").write_bytes(b"z")
+
+    _prune(out, keep=1)
+
+    left = sorted(p.name for p in out.iterdir())
+    assert left == ["market-20260101.db"], f"孤儿伴生没清掉：{left}"
+
+
+def test_prune_refuses_keep_zero(tmp_path):
+    """**`keep < 1` 必须报错**：`os.replace` 已经把今天这份改好名了，
+    此时删全部会让"备份成功"变成"目录里一份都没有"，而调用方看不出来。
+    """
+    import pytest
+
+    from jobs.backup import _prune
+
+    (tmp_path / "market-20260101.db").write_bytes(b"x")
+    with pytest.raises(ValueError, match="keep"):
+        _prune(tmp_path, keep=0)
+    assert (tmp_path / "market-20260101.db").exists(), "报错前不该先删文件"
+
+
+def test_api_and_jobs_agree_on_the_same_statvfs(monkeypatch):
+    """**两个实现必须对同一块盘给出同一个数。**
+
+    v0.2.130→0.2.131 的真实事故就是"jobs 改了、api 没改"：
+    jobs 报 84.7%、api 报 90.1%，运维不知道该信谁。两边各自硬编码
+    88.9% 只是巧合式守护；这条把两者**接在同一组 statvfs 数据**上比对。
+    """
+    import os as _os
+
+    import jobs.cleanup as cleanup_mod
+    from api.routes import _disk_used_pct
+
+    class FakeStat:
+        f_frsize = 1
+        f_blocks = 100 * 2**30
+        f_bfree = 20 * 2**30          # 含保留块
+        f_bavail = 10 * 2**30         # 不含保留块
+
+    total = FakeStat.f_blocks
+    free = FakeStat.f_bavail
+    used = total - FakeStat.f_bfree
+
+    class FakeUsage:
+        pass
+
+    usage = FakeUsage()
+    usage.total = total
+    usage.used = used
+    usage.free = free
+
+    monkeypatch.setattr(_os, "statvfs", lambda p: FakeStat())
+    monkeypatch.setattr("shutil.disk_usage", lambda p: usage)
+    monkeypatch.setattr(cleanup_mod.shutil, "disk_usage", lambda p: usage)
+
+    a = cleanup_mod.disk_used_pct("/app/data")
+    b = _disk_used_pct("/app/data")
+    assert a is not None and b is not None
+    assert abs(a - b) < 0.01, f"两个接口口径分叉了：jobs={a:.2f}% api={b:.2f}%"

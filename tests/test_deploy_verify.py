@@ -42,7 +42,7 @@ def _patch_common(monkeypatch, verify="OK", rollback_ok=True, calls=None):
     #磁盘百分比也会 ssh；默认替身成「很空闲」，避免误触缓存回收。
     monkeypatch.setattr(deploy, "host_disk_pct", lambda h: 10.0)
     #构建缓存回收同理：默认不触发（host_disk_pct替身返回10%）。
-    monkeypatch.setattr(deploy, "prune_build_cache", lambda h, keep_hours=72: "")
+    monkeypatch.setattr(deploy, "prune_build_cache", lambda h, keep_gb=5: "")
     monkeypatch.setattr(deploy, "prune_old_images", lambda h: "0")
     monkeypatch.setattr(deploy, "pending_risky_migrations",
         lambda applied, d: [])
@@ -717,20 +717,91 @@ def test_extract_failure_also_stops(monkeypatch, capsys):
     assert "上传或解压失败" in out
 
 
-def test_prune_only_targets_dangling_images_of_this_project(monkeypatch):
-    """**只删本项目的悬空镜像**：用 `com.docker.compose.project`标签筛。
-        这台机器上还跑着 WeKnora / selfhost / langbot；
-        `docker image prune -f` 会把它们的悬空镜像一起删掉（实测有一个
-        129MB 的 nginx 悬空镜像不是我们的）。
+def _fake_docker_env(tmp_path, monkeypatch, images):
+    """把 `prune_old_images` 真正跑一遍：造一个假 `docker` 丢进 PATH。
+
+    **为什么不能只断言命令字符串**：上一版测试是"我在 fake `_capture` 里写
+    几行 `SS_PRUNED=`，函数就数出几"，对**过滤逻辑零覆盖**——把
+    `[ "$p" = "stock-screener" ]` 改成 `!=`（会删光别人的镜像）它照样绿，
+    把标签模板写成四层花括号（历史上真发生过，删 0 个）它也照样绿。
+
+    images: [(id, label 或 None)]，None 表示该镜像**没有** compose 项目标签。
+    返回被 `rmi` 掉的 ID 列表（读文件，不靠 print）。
     """
-    seen = []
-    monkeypatch.setattr(deploy, "_capture",
-        lambda cmd: (seen.append(" ".join(cmd)), "SS_PRUNED=abc\nSS_PRUNED=def")[1])
+    import os
+    import shlex
+    import subprocess
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    labels = tmp_path / "labels.txt"
+    labels.write_text("\n".join(f"{i}\t{l or ''}" for i, l in images), encoding="utf-8")
+    removed = tmp_path / "removed.txt"
+    removed.write_text("", encoding="utf-8")
+
+    # 假 docker：用 python 写，避免多层引号（bash+awk+f-string）互相打架。
+    fake = bin_dir / "docker"
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys, pathlib\n"
+        f"labels = pathlib.Path({str(labels)!r})\n"
+        f"removed = pathlib.Path({str(removed)!r})\n"
+        "m = {}\n"
+        "for line in labels.read_text().splitlines():\n"
+        "    i, _, lab = line.partition(chr(9))\n"
+        "    m[i] = lab\n"
+        "if sys.argv[1] == 'images':\n"
+        "    print(chr(10).join(m))\n"
+        "elif sys.argv[1] == 'image' and sys.argv[2] == 'inspect':\n"
+        "    print(m.get(sys.argv[-1], ''))\n"
+        "elif sys.argv[1] == 'rmi':\n"
+        "    with removed.open('a') as fh:\n"
+        "        fh.write(sys.argv[2] + chr(10))\n",
+        encoding="utf-8")
+    fake.chmod(0o755)
+
+    def fake_capture(cmd):
+        # cmd = ["ssh","-o","BatchMode=yes","h","bash -c <code>"]
+        code = shlex.split(cmd[-1])[-1]
+        env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}")
+        p = subprocess.run(["bash", "-c", code], capture_output=True, text=True,
+                           env=env, timeout=30)
+        return (p.stdout or "") + (p.stderr or "")
+
+    monkeypatch.setattr(deploy, "_capture", fake_capture)
+    return removed
+
+
+def test_prune_only_targets_dangling_images_of_this_project(tmp_path, monkeypatch):
+    """**只删本项目的悬空镜像**：真跑一遍假 `docker`，看它 rmi 了谁。
+
+    这台机器上还跑着 WeKnora / selfhost / langbot，`docker image prune -f`
+    会把它们的悬空镜像一起删掉（实测有一个 129MB 的 nginx 悬空镜像不是我们的）。
+    """
+    images = [
+        ("aaa111", "stock-screener"),
+        ("bbb222", "weknora-app"),# 别人的悬空镜像，不能动
+        ("ccc333", None),# 没有 compose 项目标签，不能动
+        ("ddd444", "stock-screener"),
+    ]
+    removed = _fake_docker_env(tmp_path, monkeypatch, images)
+
     assert deploy.prune_old_images("h") == "2"
-    cmd = seen[0]
-    assert "dangling=true" in cmd, "没限定悬空"
-    assert "com.docker.compose.project" in cmd, "没按项目标签筛"
-    assert "stock-screener" in cmd
+    已删 = removed.read_text(encoding="utf-8").split()
+    assert sorted(已删) == ["aaa111", "ddd444"], f"删错了：{已删}"
+
+
+def test_prune_reports_failure_instead_of_zero(tmp_path, monkeypatch):
+    """**「删了 0 个」和「根本没跑成」必须分得开。**
+
+    ssh 连不上 / docker 挂了时一行 `SS_PRUNED=` 都没有，只看计数会把
+    两者混成 "0"，于是清理失败也静默——这台机器的盘位常年在 85% 以上。
+    """
+    monkeypatch.setattr(deploy, "_capture",
+     lambda cmd: "ssh: connect to host h port 22: Connection refused\n")
+    assert deploy.prune_old_images("h") is None
+
+
 def test_prune_never_uses_prune_a_or_touches_the_rollback_tag(monkeypatch):
     """**绝不能出现 `image prune -a`**：那会删掉 `stock-screener:rollback`，
         回滚能力随之消失。也不能显式 rmi 那个标签。"""
@@ -742,8 +813,12 @@ def test_prune_never_uses_prune_a_or_touches_the_rollback_tag(monkeypatch):
     assert "prune -a" not in cmd and "prune --all" not in cmd, "用了 -a，会删掉回滚镜像"
     assert "stock-screener:rollback" not in cmd, "动了回滚标签"
 def test_prune_returns_zero_when_nothing_matches(monkeypatch):
-    """没有可删的就返回 "0"，调用方据此不打印。"""
-    monkeypatch.setattr(deploy, "_capture", lambda cmd: "")
+    """没有可删的就返回 "0"，调用方据此不打印。
+
+    但**跑完了却没删到**和**根本没跑成**必须分开：
+    哨兵 `SS_DONE` 在就说明命令跑完了，返回 "0"；不在就返回 None。
+    """
+    monkeypatch.setattr(deploy, "_capture", lambda cmd: "SS_DONE\n")
     assert deploy.prune_old_images("h") == "0"
 def test_successful_deploy_prunes_old_images(monkeypatch, capsys):
     """验收通过之后才清理。"""
@@ -779,22 +854,25 @@ def test_host_disk_pct_uses_df_semantics(monkeypatch):
     assert abs(got - 80.0) > 5, f"还在用 used/total：{got}"
 
 
-def test_host_disk_pct_returns_zero_when_unreadable(monkeypatch):
-    """读不到就返回 0（不告警），不能抛异常打断部署。"""
-    monkeypatch.setattr(deploy, "_capture", lambda cmd: "")
-    assert deploy.host_disk_pct("h") == 0.0
-    monkeypatch.setattr(deploy, "_capture", lambda cmd: "garbage")
-    assert deploy.host_disk_pct("h") == 0.0
+def test_build_cache_prune_caps_total_size(monkeypatch):
+    """**按总量封顶（`--keep-storage`），不按创建时间（`until`）。**
 
+    `until` 判的是**创建时间**：这台机器一天发十几次版，缓存几乎都是新的，
+    实测跑下来返回 `Total: 0B`——**磁盘越线时一个字节都收不回来**，白跑一趟。
+    `--keep-storage` 判总量，跑完缓存上限就是给定值，行为可预测。
 
-def test_build_cache_prune_keeps_recent_cache(monkeypatch):
-    """**必须带 `until` 过滤器**：清掉最近三天会让出错后的重建变慢。"""
+    另：**必须有 `-f`**。少了它 ssh 无 TTY，`builder prune` 会等确认
+    然后 900s 超时抛异常，把一次成功的部署变成 traceback。
+    """
     seen = []
     monkeypatch.setattr(deploy, "_capture",
      lambda cmd: (seen.append(" ".join(cmd)), "Total: 0B")[1])
-    deploy.prune_build_cache("h")
-    assert "builder prune" in seen[0]
-    assert "until=72h" in seen[0], f"没限定时间：{seen[0]}"
+    deploy.prune_build_cache("h", keep_gb=5)
+    cmd = seen[0]
+    assert "builder prune" in cmd
+    assert "-f" in cmd.split() or "--force" in cmd, f"没有 -f，会卡在确认：{cmd}"
+    assert "--keep-storage 5GB" in cmd, f"没按总量封顶：{cmd}"
+    assert "until=" not in cmd, f"别再按创建时间判（实测收不回东西）：{cmd}"
 
 
 def test_deploy_reclaims_build_cache_only_when_disk_is_high(monkeypatch, capsys):
@@ -803,11 +881,11 @@ def test_deploy_reclaims_build_cache_only_when_disk_is_high(monkeypatch, capsys)
     构建缓存无法按项目筛，会牵连同机其它项目；平时清纯属自找麻烦。
     """
     calls = _patch_common(monkeypatch, verify="OK")
-    monkeypatch.setattr(deploy, "host_disk_pct", lambda h: 85.0)
+    monkeypatch.setattr(deploy, "host_disk_pct", lambda h: 96.0)
     monkeypatch.setattr(deploy, "prune_build_cache",
-     lambda h, keep_hours=72: (calls.append("cache"), "9.9GB")[1])
+     lambda h, keep_gb=5: (calls.append("cache"), "9.9GB")[1])
     assert deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"]) == 0
-    assert "cache" in calls, "磁盘85%却没回收构建缓存"
+    assert "cache" in calls, "磁盘96%却没回收构建缓存"
     assert "9.9GB" in capsys.readouterr().out
 
 
@@ -816,9 +894,20 @@ def test_deploy_does_not_reclaim_cache_when_disk_is_fine(monkeypatch):
     calls = _patch_common(monkeypatch, verify="OK")
     monkeypatch.setattr(deploy, "host_disk_pct", lambda h: 40.0)
     monkeypatch.setattr(deploy, "prune_build_cache",
-     lambda h, keep_hours=72: (calls.append("cache"), "0B")[1])
+     lambda h, keep_gb=5: (calls.append("cache"), "0B")[1])
     assert deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"]) == 0
     assert "cache" not in calls, "磁盘40%却清理了构建缓存"
+
+
+def test_deploy_does_not_reclaim_cache_at_steady_state(monkeypatch):
+    """**稳态 90% 绝不能清缓存**：本机常年 85~90%，这是"每次发版都满核重建"
+    那条坑的回归锁。清缓存换磁盘 = 用 CPU 尖峰换几个 GB，方向就错了。"""
+    calls = _patch_common(monkeypatch, verify="OK")
+    monkeypatch.setattr(deploy, "host_disk_pct", lambda h: 90.0)
+    monkeypatch.setattr(deploy, "prune_build_cache",
+     lambda h, keep_gb=5: (calls.append("cache"), "9.9GB")[1])
+    assert deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"]) == 0
+    assert "cache" not in calls, "稳态90%就清缓存，会让每次发版都满核重建"
 
 
 def test_failed_deploy_does_not_reclaim_cache(monkeypatch):
@@ -826,6 +915,63 @@ def test_failed_deploy_does_not_reclaim_cache(monkeypatch):
     calls = _patch_common(monkeypatch, verify="FAIL:jobs起不来")
     monkeypatch.setattr(deploy, "host_disk_pct", lambda h: 95.0)
     monkeypatch.setattr(deploy, "prune_build_cache",
-     lambda h, keep_hours=72: (calls.append("cache"), "1GB")[1])
+     lambda h, keep_gb=5: (calls.append("cache"), "1GB")[1])
     assert deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"]) != 0
     assert "cache" not in calls
+
+
+def test_host_disk_pct_returns_none_when_it_cannot_parse(monkeypatch):
+    """**解析失败必须返回 `None`，不能是 0**。
+
+    `_capture` 是 `stdout + stderr` 拼接，ssh 的警告/错误会混进来。
+    0 会被当成"磁盘很空"，于是缓存回收被静默跳过、一行日志都没有——
+    而这台机器的盘位常年在 85% 以上，恰恰最需要它工作。
+    """
+    for bad in [
+        "",                                                    # 空输出
+        "ssh: connect to host h port 22: Connection refused",  # ssh 挂了
+        "Filesystem 1024-blocks Used Available Capacity Mounted on",  # df 头行
+        "/dev/sda2 102400000 81920000",                        # 字段不足
+        "/dev/sda2 102400000 x y 87% /",                        # 数字不合法
+        "/dev/sda2 0 0 0 0% /",                                 # 分母为 0
+    ]:
+        monkeypatch.setattr(deploy, "_capture", lambda cmd, b=bad: b)
+        assert deploy.host_disk_pct("h") is None, f"这个输入应该判为读不到：{bad!r}"
+
+
+def test_host_disk_pct_ignores_stderr_appended_after_df(monkeypatch):
+    """stderr 追加在 df 行之后时，**取最后一行会取错**——所以要校验列形状。"""
+    mixed = ("/dev/sda2 102400000 81920000 12288000 87% /\n"
+             "Warning: Permanently added 'h' (ED25519) to known hosts.\n")
+    monkeypatch.setattr(deploy, "_capture", lambda cmd: mixed)
+    # 最后一行没有 `87%` 这种形状 → 判为读不到，而不是把警告里的数字当数据
+    assert deploy.host_disk_pct("h") is None
+
+
+def test_cleanup_failure_does_not_flip_a_successful_deploy(monkeypatch, capsys):
+    """**清理炸了不能把成功的部署变成失败。**
+
+    `_capture` 是 `subprocess.run(..., timeout=900)`：ssh 卡住抛
+    `TimeoutExpired`、ssh 不存在抛 `FileNotFoundError`。未捕获就是
+    「部署成功却以非零码 + traceback 结束」，CI/值班会去回滚一个健康的新版本。
+    """
+    _patch_common(monkeypatch, verify="OK")
+
+    def boom(host):
+        raise TimeoutError("ssh 卡住了")
+
+    monkeypatch.setattr(deploy, "prune_old_images", boom)
+    assert deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"]) == 0
+    assert "不影响本次部署" in capsys.readouterr().out
+
+
+def test_cleanup_warns_when_cache_prune_reports_an_error(monkeypatch, capsys):
+    """docker 挂了时最后一行是报错文本，**不能当回收量打出来**。"""
+    _patch_common(monkeypatch, verify="OK")
+    monkeypatch.setattr(deploy, "host_disk_pct", lambda h: 95.0)
+    monkeypatch.setattr(deploy, "prune_build_cache",
+                        lambda h, keep_gb=5: "Cannot connect to the Docker daemon")
+    assert deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"]) == 0
+    out = capsys.readouterr().out
+    assert "回收失败" in out, out
+    assert "构建缓存：Cannot" not in out, "把报错当成了回收量"

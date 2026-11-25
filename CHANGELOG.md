@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.2.135] - 2026-11-25
+
 ###修复（自选股告警长期整体静默 —— 生产实测确认）
 
 `jobs/intraday.py::_watch_hist` 原来是 `ORDER BY date DESC LIMIT 60`，

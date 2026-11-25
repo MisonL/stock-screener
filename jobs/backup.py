@@ -15,6 +15,12 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
+#: 每日备份的触发时刻（**与 `jobs/main.py` 的 CronTrigger 必须一致**）。
+#: 放在这里是因为 `catch_up_missed_backup` 要用它判断"今天该不该已备过"——
+#: 两处写死两个数字迟早分叉，所以单一定义、两处引用。
+BACKUP_HOUR = 23
+BACKUP_MINUTE = 30
+
 #:半截备份的保留时长。**它们必须以 `.`开头**（保证 `_prune`的
 #: `market-*.db`不会把它们当成正式备份），但代价是**永远不会被任何清理逻辑
 #:匹配到**——2026-11-21实测：11-15和11-20各留了1.2~1.3 GB的
@@ -195,3 +201,54 @@ def _prune(out_dir: Path, keep: int) -> None:
         # `backup_db` 报「备份失败」——但 `os.replace` 早就成功了，
         # 备份其实是好的。删不掉旧文件不值得谎报备份失败。
         log.warning("清理旧备份时出错（备份本身已成功）：%s", e)
+
+
+def catch_up_missed_backup(conn, data_dir, clock, *, keep: int =7,
+                           stale_h: int =29) -> Path | None:
+    """启动时补一次**错过了的**每日备份；不需要补就返回 `None`。
+
+    **为什么必须有这一条**：`backup_job` 的 `misfire_grace_time=3600` 只在
+    "调度器在跑但被阻塞"时生效。进程在 23:30 那一刻**不在**（部署重启、
+    崩溃、VM 重启），那次备份就**永久丢了**。这个判断在 `jobs/main.py`
+    的注释里早就写着，但当时只补了"备份陈旧**检查**"，没补"备份**本身**"：
+    2026-11-24 部署恰好压在 23:30:14，当晚备份被静默跳过，46 小时内
+    没有任何自愈动作，只在次日 08:55 报了一条 `backup_stale`。
+
+    **两个触发条件**（缺一个就会漏掉一半场景）：
+    ① **当晚过点**：今天该有的文件不在，且已过 `BACKUP_HOUR:MINUTE`。
+       覆盖"23:30 那一刻进程不在、几秒/几分钟后起来"（11-24 那次）。
+    ② **隔天发现**：最新备份已经超过 `stale_h`(29) 小时。
+       覆盖"23:00 关、次日 09:00 才起"——那种情况下 ① 永远不成立
+       （今天还没到 23:30），而漏掉的那一天已经补不回来了，
+       但**必须立刻备一份止血**，否则空洞会一天天变大。
+
+    补出来的按 `clock` 当天命名（`backup_db` 的既有约定），内容是
+    **此刻的一致性快照**——不会伪装成"昨天 23:30 那一天"。
+    当晚 23:30 的定时任务照常再跑一次（同名覆盖，无害）。
+    """
+    from datetime import time as _time
+
+    root = Path(data_dir) / "backups"
+    if not root.is_dir():
+        return None
+    now = clock.now()
+    today_file = root / f"market-{now.strftime('%Y%m%d')}.db"
+
+    conflict = False
+    if not today_file.exists() and now.time() >= _time(BACKUP_HOUR, BACKUP_MINUTE):
+        conflict = True                              # 条件①：当晚过点还没备
+
+    if not conflict:
+        newest = sorted(root.glob("market-*.db"),
+                        key=lambda p: p.stat().st_mtime, reverse=True)
+        if newest:
+            age_h = (now.timestamp() - newest[0].stat().st_mtime) / 3600
+            conflict = age_h > stale_h               # 条件②：已经断档
+        elif root.is_dir():
+            conflict = True                          # 一份都没有：必须立刻备
+
+    if not conflict:
+        return None
+    log.warning("检测到备份缺失（今日 %s 未备或已断档），启动补备一次",
+                now.strftime("%Y-%m-%d"))
+    return backup_db(conn, Path(data_dir), keep=keep, clock=clock)

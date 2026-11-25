@@ -458,3 +458,88 @@ def test_api_and_jobs_agree_on_the_same_statvfs(monkeypatch):
     b = _disk_used_pct("/app/data")
     assert a is not None and b is not None
     assert abs(a - b) < 0.01, f"两个接口口径分叉了：jobs={a:.2f}% api={b:.2f}%"
+
+
+def _setup(tmp_path, now_str, existing=None):
+    """造一个最小库 + backups 目录，返回 (catch_up 结果, backups 目录, conn)。
+
+    `existing`: [(ymd_str, "YYYY-MM-DD HH:MM")] —— 预置的历史备份文件。
+    """
+    import os
+    from datetime import datetime as _dt
+
+    from core.clock import SH, FixedClock
+    from core.db import connect, migrate
+    from jobs.backup import catch_up_missed_backup
+
+    root = tmp_path / "backups"
+    root.mkdir(exist_ok=True)
+    for ymd, mtime in (existing or []):
+        f = root / f"market-{ymd}.db"
+        f.write_bytes(b"x")
+        # **必须按 SH 时区解释**：容器 TZ 是 Asia/Shanghai 但 pytest 进程
+        # 未必，naive `.timestamp()` 会按本机时区算，偏差正好 8 小时——
+        # 那会把"断档 33 小时"变成"断档 25 小时"，测试就测不到真实的漏备。
+        ts = _dt.strptime(mtime, "%Y-%m-%d %H:%M").replace(tzinfo=SH).timestamp()
+        os.utime(f, (ts, ts))
+
+    conn = connect(tmp_path / "c.db")
+    migrate(conn)
+    # backup_db 会做 integrity_check，库必须至少有一张有数据的表
+    conn.execute(
+        "INSERT INTO pool(trade_date, market, code, rank, score, factors, box_days,"
+        " box_high_adj, box_low_adj, box_high_raw, box_low_raw, close_raw, box_vol_mean, pos_in_box)"
+        " VALUES (20261119,'cn_main','sh600519',1,82.9,'{}',40,10.14,9.86,10.14,9.86,10.04,6e6,0.5)")
+    conn.commit()
+
+    clock = FixedClock(_dt.strptime(now_str, "%Y-%m-%d %H:%M"))
+    return catch_up_missed_backup(conn, tmp_path, clock), root, conn
+
+
+def test_catch_up_backup_when_deploy_ate_the_2330_window(tmp_path):
+    """**2026-11-24 的真实事故**：部署压在 23:30:14，当晚备份被静默跳过。
+
+    `misfire_grace_time=3600` 只在"调度器在跑但被阻塞"时生效；进程在
+    23:30 那一刻**不在**，那次备份就永久丢。原来只补了"陈旧检查"，
+    没补"备份本身"。模拟：11-23 有备份，次日 09:00 启动 → 必须立刻补。
+    """
+    made, root, _ = _setup(tmp_path, "2026-11-25 09:00",
+                           existing=[("20261123", "2026-11-23 23:30")])
+    assert made is not None, "断档 33 小时后启动，却没有补备份"
+    assert made.exists() and made.stat().st_size > 0
+
+
+def test_catch_up_backup_when_restarting_right_after_2330(tmp_path):
+    """**11-24 事故的精确复现**：23:30:14 部署，23:33:12 新容器启动。
+
+    条件①：今天的文件不存在、且已过 23:30 → 立刻补。
+    这条和 `..._ate_the_2330_window` 覆盖的是**不同**条件：
+    那条走的是条件②（隔天发现已断档），这条走的是条件①（当晚过点）。
+    """
+    made, root, _ = _setup(tmp_path, "2026-11-24 23:33",
+                           existing=[("20261123", "2026-11-23 23:30")])
+    assert made is not None, "23:33 重启（错过 23:30），没有补备份"
+    assert (root / "market-20261124.db").exists(), "补出来的应叫今天的日期"
+
+
+def test_catch_up_does_nothing_before_the_window(tmp_path):
+    """23:30 之前重启**不该**提前备——否则当晚 23:30 的定时任务被占掉。
+
+    这是条件①的反面：今天还没到点，等定时任务即可。
+    """
+    made, _root, _ = _setup(tmp_path, "2026-11-25 23:00",
+                            existing=[("20261124", "2026-11-24 23:30")])
+    assert made is None
+
+
+def test_catch_up_does_nothing_when_today_already_backed_up(tmp_path):
+    """今天已有备份：不许重复备。"""
+    made, _root, _ = _setup(tmp_path, "2026-11-25 23:40",
+                            existing=[("20261125", "2026-11-25 23:31")])
+    assert made is None, "今天已经备过，不该再备"
+
+
+def test_catch_up_fires_when_the_directory_is_empty(tmp_path):
+    """一份备份都没有：必须立刻备（否则 stale 检查会一直报警却没人管）。"""
+    made, _root, _ = _setup(tmp_path, "2026-11-25 10:00")
+    assert made is not None, "没有任何备份时启动，应该立刻补一份"

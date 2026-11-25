@@ -293,3 +293,35 @@ def test_auction_gap_reports_for_watchlist_outside_pool(env):
     assert env.conn.execute(
         "SELECT count(*) FROM event_log WHERE kind='auction_anomaly'").fetchone()[0] == 1, (
         "自选票的高开没有产生事件")
+
+
+def test_watch_hist_returns_most_recent_60_in_ascending_order(env):
+    """`_watch_hist` 必须返回**最近 60 根、按日期升序**。
+
+    这条锁住一个真实生产事故：原来是 `ORDER BY date DESC LIMIT 60`，
+    于是 `hist[-1]` 是**60 个交易日前**的收盘。而 `watch_rules.py` 用
+    `abs(prev_close - hist[-1].close) > price_eps(0.011)` 做除权对齐判断，
+    结果几乎必然成立 → **整只自选股所有规则静默返回 []**，一条日志都没有。
+
+    实测生产 sh600519：最新收盘 1474.84、60 日前 1302.8，差 172.04。
+
+    只把 DESC 改成 ASC 也不行：那样 `LIMIT 60` 取的是**最早** 60 根。
+    正确写法是内层 DESC 限 60、外层 ASC。
+    """
+    # 造 70 根：日期递增，收盘价 = 序号，便于断言顺序
+    for i in range(70):
+        env.conn.execute(
+            "INSERT INTO daily_bars (code, date, open, high, low, close, volume, amount, source)"
+            " VALUES ('sh600001', ?, ?, ?, ?, ?, ?, ?, 'test')",
+            (20250101 + i, float(i), float(i), float(i), float(i), 1000, float(i)))
+    env.conn.commit()
+
+    hist, _ma20 = env.tick._watch_hist("sh600001")
+
+    assert len(hist) == 60, f"应该只取最近 60 根，实际 {len(hist)}"
+    dates = [b.date for b in hist]
+    assert dates == sorted(dates), f"必须升序，实际首={dates[0]} 末={dates[-1]}"
+    # 最后一根是**最新**（20250169），不是 60 天前、也不是 2019 年那批
+    assert hist[-1].date == 20250170, f"最后一根应是 20250170，实际 {hist[-1].date}"
+    # 最近 60 根 = 第 11..70 根；第一根不是 20250101（那是"最早 60 根"的错误）
+    assert hist[0].date == 20250111, f"第一根应是 20250111，实际 {hist[0].date}"

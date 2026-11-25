@@ -1,5 +1,78 @@
 ## [Unreleased]
 
+###修复（自选股告警长期整体静默 —— 生产实测确认）
+
+`jobs/intraday.py::_watch_hist` 原来是 `ORDER BY date DESC LIMIT 60`，
+于是 `hist[-1]` 是**60 个交易日前**的那根。而
+`core/intraday/watch_rules.py` 用「`hist[-1]` 是最近一根」来用：
+
+- `abs(prev_close - hist[-1].close) > price_eps(0.011)` —— 除权对齐判据，
+  **几乎必然成立** → 整只票 `return []`
+- `_crossed()` 的 MA20 穿越基准
+- `recent = hist[-extreme_days:]` 取最近 N 天
+
+**生产实测**（sh600519，唯一一只自选股）：
+最新收盘 1474.84、60 日前 1302.8，**差 172.04**；
+`event_log` 里 `watch_rule` 事件总数 = **0**。
+也就是说 pct / vol / near_extreme / ma20 四类告警**从来没触发过，一条日志都没有**。
+
+**为什么测试全绿**：`tests/core/test_watch_rules.py` 直接按 ASC 造数据喂给
+`eval_watch`，而端到端用例只插了 1 根 bar——DESC 顺序从没被覆盖。
+
+- 改为「内层 DESC 限 60 → 外层 ASC」。**只把 DESC 换成 ASC 也是错的**：
+  `ORDER BY date ASC LIMIT 60` 取的是**最早** 60 根（2019 年那批）。
+- 补回归测试，对两种错法都有断言（实测变异：退回 DESC → 「必须升序，
+  实际首=20250170」；纯 ASC → 「最后一根应是 20250170，实际 20250160」）。
+
+###修复（部署压掉 23:30 备份 → 那晚永久丢失）
+
+**这是真的丢了数据**。2026-11-24 的备份至今缺失：
+
+```
+部署时刻:   2026-11-24 23:30:14
+备份时刻:   每日 23:30
+新容器启动: 2026-11-24 23:33:12   （已错过 3 分钟）
+残留证据:   08:55「清理中断备份 3个：.market-20261124.db.tmp(-shm/-wal)」
+backups/:   最新是 market-20261123.db，11-24 没有
+```
+
+根因：`misfire_grace_time=3600` **只在「调度器在跑但被阻塞」时生效**。
+进程在 23:30 那一刻不在，这次备份就永久丢了。这句判断在
+`jobs/main.py` 的注释里**早就写着**，但当时只补了「备份陈旧**检查**」，
+没有补「备份**本身**」——于是系统正确报警（次日 08:55 `backup_stale`
+「33 小时前」），却**没有任何自愈动作**，46 小时过去备份仍是缺的。
+
+- 新增 `jobs/backup.py::catch_up_missed_backup`，启动时补一次。
+ **两个条件缺一不可**：
+ ① 今天该有的文件不在**且**已过 23:30 → 覆盖「23:30 那一刻不在，几分钟后起来」；
+ ② 最新备份已超过 29 小时 → 覆盖「23:00 关、次日 09:00 才起」（此时 ①
+ 永远不成立，但断档已经发生，必须立刻止血）。
+- `BACKUP_HOUR`/`BACKUP_MINUTE` 提到 `jobs/backup.py` 做**单一定义**，
+ `CronTrigger` 与补备判据共用，避免两处写死两个数字而分叉。
+- 变异验证：关掉条件① → 「23:33 重启（错过 23:30），没有补备份」；
+ 关掉条件② → 「断档 33 小时后启动，却没有补备份」。
+
+###修复（EOD 的 `skipped` 也写 marker → 该交易日永久失去补跑）
+
+`eod_job` 原来在 `if not report.skipped` **之外**无条件写
+`eod.<today>='done'`。而 `startup_recovery` 的补跑判据正是「marker 不存在」，
+于是 `skipped`（上游快照还是上一交易日的 / 时间门未到 / 宇宙未回填）的
+那一天**永远不会被补**：当天无 bar、无选股池，次日 `prev_day` 直接跨过去。
+`startup_recovery` 自己对 `skipped` 就是不写 marker 的，两处口径相反。
+
+- marker 写进 `if not report.skipped` 分支；`else` 记 warning（含 report）留痕。
+- 用 AST 断言「写 marker 的语句处于该 `if` 的 body 内」，并额外断言
+ `else` 里**没有**再写——变异（把 marker 移回 if 外）实测红在断言。
+
+###其它
+
+- `tests/jobs/test_main_scheduler.py` 的「文档时刻表 vs 代码」守卫改为
+ **认常量**（`CronTrigger(hour=BACKUP_HOUR, ...)`）+ 跨文件解析
+ `jobs/backup.py` 的模块级常量。只认字面量的话，把 23:30 提成常量会让
+ 守卫误报「23:30 不存在」——那是误报，不是文档失真。
+
+**测试**：81.4全量 **1430 passed, 3 skipped**。
+
 ## [0.2.134] - 2026-11-24
 
 ###修复（评审发现的「失败时静默退化成一个看起来正常的数字」）

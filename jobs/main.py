@@ -29,7 +29,8 @@ from types import SimpleNamespace
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from jobs.backup import BackupBusy, backup_db, prune_orphan_tmp
+from jobs.backup import (BACKUP_HOUR, BACKUP_MINUTE, BackupBusy, backup_db,
+                        catch_up_missed_backup, prune_orphan_tmp)
 from jobs.cleanup import check_backup_freshness, check_disk, cleanup
 from jobs.intraday import IntradayTick
 from jobs.snapshot import SnapshotLoops, calls_by_scope
@@ -151,11 +152,20 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
             report = run_eod(cfg, reg, conn, clock)
             if not report.skipped:
                 after_close(cfg, conn, clock, eod_report=report, dispatcher=dispatcher)
-            # marker 也必须在锁内：它是**写** `job_state`，与上面两段共用同一把锁
-            # （原先它写在 `with _write_lock` 之外，靠 `with conn` 单独提交）
-            with conn:
-                conn.execute("INSERT OR REPLACE INTO job_state(name, value) VALUES (?, 'done')",
-                                (f"eod.{clock.today()}",))
+                # **marker 只能在真跑完时写**：`skipped` 表示「这次没算」（上游快照
+                # 还是上一交易日的、时间门未到、宇宙未回填）。原来的写法在
+                # `if not report.skipped` **之外**无条件写 'done'，于是
+                # `startup_recovery` 的补跑判据（"`eod.<date>` marker 不存在"）
+                # 永远不成立 → **那个交易日永久失去补偿**，当天无 bar、无选股池，
+                # 次日 `prev_day` 直接跨过去。`startup_recovery` 自己
+                # 对 skipped 就是不写 marker 的，两处口径必须一致。
+                with conn:
+                    conn.execute("INSERT OR REPLACE INTO job_state(name, value) VALUES (?, 'done')",
+                                    (f"eod.{clock.today()}",))
+            else:
+                # 不写 marker，但要留痕——否则排障只能看到"今天没跑"
+                log.warning("EOD 跳过（不写 marker，留待 startup_recovery 补跑）：%s",
+                            report)
 
     def auction_job():
         """09:25:30：用 pool/market 快照缓存里的报价与 `auction_daily` 基线出简报。"""
@@ -389,8 +399,9 @@ def make_scheduler(cfg, conn, clock, *, loops=None, tick=None, dispatcher=None,
     # 批1 的 cleanup 不管这张表，回合表会无限增长
     sched.add_job(archive_job, CronTrigger(hour=15, minute=30, day_of_week="mon-fri",
                                             timezone=SH), id="archive", **JOB_DEFAULTS)
-    sched.add_job(backup_job, CronTrigger(hour=23, minute=30, timezone=SH), id="backup",
-                    misfire_grace_time=3600, coalesce=True, max_instances=1)
+    sched.add_job(backup_job,
+                    CronTrigger(hour=BACKUP_HOUR, minute=BACKUP_MINUTE, timezone=SH),
+                    id="backup", misfire_grace_time=3600, coalesce=True, max_instances=1)
     sched.add_job(self_check_job,
                     CronTrigger(hour=8, minute=55, day_of_week="mon-fri", timezone=SH),
                     id="self_check", **JOB_DEFAULTS)
@@ -657,7 +668,7 @@ def startup_recovery(cfg, conn, clock, *, reg, tick=None, dispatcher=None, loops
     data_dir="data") -> dict:
     """D10 启动恢复：盘中立即起循环；跨日补跑 eod；除权刷新按「距上次 ≥7 天」补。"""
     out = {"loops_started": False, "eod_days": [], "eod_ran": [], "eod_skipped": [],
-            "eod_failed": [], "refresh_actions": False}
+            "eod_failed": [], "refresh_actions": False, "backup_catch_up": None}
     now = clock.now()
     today = clock.today()
 
@@ -721,6 +732,17 @@ def startup_recovery(cfg, conn, clock, *, reg, tick=None, dispatcher=None, loops
     # `misfire_grace_time`只在「调度器在跑但被阻塞」时生效——进程在23:30
     #不在，那次备份就**永久丢了**；陈旧检查挂在08:55的单次 cron上，
     #容器若恰好那时不在，当天的检查也丢。启动补一次，代价接近零。
+    # **补备份，不只是检查**：上面这段注释说"永久丢了"，但当时只加了检查，
+    # 于是 2026-11-24 那次部署（23:30:14）真的把当晚备份弄丢了，
+    # 46 小时内没有任何自愈动作，只在次日 08:55 报了一条 backup_stale。
+    # `catch_up_missed_backup` 判断"今天该备但没备"就立刻补一份。
+    try:
+        made = catch_up_missed_backup(conn, data_dir, clock)
+        if made is not None:
+            out["backup_catch_up"] = str(made)
+            log.warning("启动补备完成：%s", made)
+    except Exception: # noqa: BLE001 ——补备失败不能拖死启动恢复
+        log.warning("启动补备失败", exc_info=True)
     try:
         with write_lock:
             check_backup_freshness(conn, data_dir, now=now, dispatcher=dispatcher)

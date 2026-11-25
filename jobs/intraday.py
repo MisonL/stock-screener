@@ -264,8 +264,26 @@ class IntradayTick:
         return out
 
     def _watch_hist(self, code: str):
+        # **必须 ASC**：`core/intraday/watch_rules.py` 按「`hist[-1]` 是最近一根」
+        # 来用（除权对齐的 `prev` 对照、`_crossed` 的 MA20 穿越基准、
+        # `recent = hist[-extreme_days:]` 取最近 N 天）。
+        #
+        # 这里原来是 `DESC`，于是 `hist[-1]` 是**60 个交易日前**的收盘。
+        # 后果不是"结果略偏"：`abs(prev - hist60[-1].close) > price_eps(0.011)`
+        # 这个除权对齐判据几乎必然成立 → **整只自选股所有规则静默返回 []**。
+        # 实测生产：sh600519 最新收盘 1474.84、60 日前 1302.8，差 172.04，
+        # 于是 pct/vol/near_extreme/ma20 四类告警从来没触发过，一条日志都没有。
+        #
+        # 单测没抓到是因为 `tests/core/test_watch_rules.py` 直接按 ASC 造数据，
+        # 而端到端用例只插了 1 根 bar——DESC 顺序从没被覆盖过。
+        # **先取「最近 60 根」再按 ASC 排**：直接 `ORDER BY date ASC LIMIT 60`
+        # 拿到的是**最早**的 60 根（2019 年那批），正好是要修的 bug 换了个方向。
+        # 子查询 DESC 限 60 → 外层 ASC，才是「最近 60 根、最后一个是昨天」。
         rows = self.conn.execute(
-            "SELECT date, high, low, close FROM daily_bars WHERE code = ? ORDER BY date DESC LIMIT 60",
+            "SELECT date, high, low, close FROM ("
+            "  SELECT date, high, low, close FROM daily_bars"
+            "  WHERE code = ? ORDER BY date DESC LIMIT 60"
+            ") ORDER BY date ASC",
             (code,)).fetchall()
         if not rows:
             return [], 0.0

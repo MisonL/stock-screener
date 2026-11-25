@@ -1133,6 +1133,51 @@ def test_members_job_does_not_fetch_inside_the_lock(env):
         "抓板块要几分钟，会把 tick 和心跳全堵住")
 
 
+def _cron_times(src: str) -> set[tuple[str, str]]:
+    """抽出代码里所有**固定时刻**的 CronTrigger（小时, 分钟）。
+
+    **两种写法都要认**：字面量 `CronTrigger(hour=15, minute=5, ...)`，
+    以及用常量的 `CronTrigger(hour=BACKUP_HOUR, minute=BACKUP_MINUTE, ...)`。
+    只认字面量的话，把备份时刻提成常量（为了和 `catch_up_missed_backup`
+    共用单一定义）会让这个守卫突然报"23:30 不存在"——那是误报，
+    不是文档失真。
+    """
+    import ast
+
+    # 常量表：模块级 `NAME = 整数`。
+    # **还要收 `jobs/backup.py` 的**：`BACKUP_HOUR/BACKUP_MINUTE` 定义在那边
+    # （为了和 `catch_up_missed_backup` 共用单一定义），`main.py` 只是 import。
+    consts: dict[str, int] = {}
+    base = Path(__file__).resolve().parents[2]
+    for extra in (None, "jobs/backup.py"):
+        text = src if extra is None else (base / extra).read_text(encoding="utf-8")
+        for node in ast.parse(text).body:
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                    and isinstance(node.targets[0], ast.Name) \
+                    and isinstance(node.value, ast.Constant) \
+                    and isinstance(node.value.value, int):
+                consts[node.targets[0].id] = node.value.value
+
+    out: set[tuple[str, str]] = set()
+    for node in ast.walk(ast.parse(src)):
+        if not (isinstance(node, ast.Call)
+                and getattr(node.func, "id", None) == "CronTrigger"):
+            continue
+        kw = {k.arg: k.value for k in node.keywords}
+
+        def _val(n):
+            if isinstance(n, ast.Constant) and isinstance(n.value, int):
+                return n.value
+            if isinstance(n, ast.Name):
+                return consts.get(n.id)
+            return None
+
+        h, m = _val(kw.get("hour")), _val(kw.get("minute"))
+        if h is not None and m is not None:
+            out.add((f"{h:02d}", f"{m:02d}"))
+    return out
+
+
 def test_docstring_does_not_claim_a_nonexistent_schedule():
     """模块注释不能声称存在一个不存在的定时任务。
 
@@ -1150,8 +1195,7 @@ def test_docstring_does_not_claim_a_nonexistent_schedule():
 
     # 注释里提到的每一次「HH:MM 做某事」，都必须能在 add_job 的 CronTrigger 里找到
     claimed = set(re.findall(r"(\d{2}):(\d{2})", doc))
-    triggers = set(re.findall(r"CronTrigger\(hour=(\d+), minute=(\d+)", src))
-    triggers = {(f"{int(h):02d}", f"{int(m):02d}") for h, m in triggers}
+    triggers = _cron_times(src)
     bogus = claimed - triggers
     assert not bogus, (
         f"模块注释声称的时刻 {sorted(bogus)} 在调度器里不存在"
@@ -1169,8 +1213,7 @@ def test_architecture_doc_schedule_matches_code():
 
     root = Path(__file__).resolve().parents[2]
     src = (root / "jobs" / "main.py").read_text(encoding="utf-8")
-    triggers = {(f"{int(h):02d}:{int(m):02d}")
-                for h, m in re.findall(r"CronTrigger\(hour=(\d+), minute=(\d+)", src)}
+    triggers = {f"{h}:{m}" for h, m in _cron_times(src)}
 
     doc = (root / "docs" / "architecture.md").read_text(encoding="utf-8")
     # 只抽表格首列的固定时刻（`| HH:MM |`），区间写法（HH:MM–HH:MM）不算
@@ -1766,3 +1809,46 @@ def test_disk_job_holds_the_write_lock():
     assert "_write_lock(loops)" in body, (
         "disk_job 没在写锁里：dispatcher.alert 会写 push_log，"
         "与 tick/心跳共用同一个 conn")
+
+
+def test_eod_job_does_not_write_marker_when_skipped():
+    """**`skipped` 时不能写 `eod.<date>='done'`**（AST 结构守卫）。
+
+    原来的写法在 `if not report.skipped` **之外**无条件写 marker，于是
+    `startup_recovery` 的补跑判据（"marker 不存在"）永远不成立 →
+    **那个交易日永久失去补偿**：当天无 bar、无选股池，次日 `prev_day`
+    直接跨过去。`startup_recovery` 自己对 skipped 就是不写 marker 的，
+    两处口径必须一致。
+
+    用 AST 检查"写 marker 的 `with conn:` 处于 `if not report.skipped`
+    的 body 内"，而不是比字符串缩进（历史上数缩进写过假绿测试）。
+    """
+    import ast
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[2] / "jobs" / "main.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "eod_job")
+
+    def _writes_marker(node) -> bool:
+        for n in ast.walk(node):
+            if isinstance(n, ast.Constant) and isinstance(n.value, str) \
+                    and "INSERT OR REPLACE INTO job_state" in n.value:
+                return True
+        return False
+
+    # 找所有 "if not report.skipped" 的 If 节点
+    guards = [n for n in ast.walk(fn)
+              if isinstance(n, ast.If)
+              and "skipped" in ast.dump(n.test)]
+    assert guards, "找不到 `if not report.skipped` 分支（结构变了？请更新本测试）"
+
+    guarded_marker = any(_writes_marker(stmt) for g in guards for stmt in g.body)
+    assert guarded_marker, (
+        "eod_job 在 `skipped` 时仍然写 eod marker —— "
+        "该交易日会永久失去补跑机会")
+
+    # 反面：`else` 分支里不能也写 marker（否则等于白改）
+    unguarded = any(_writes_marker(stmt) for g in guards for stmt in g.orelse)
+    assert not unguarded, "`else` 分支里也写了 marker，修复无效"

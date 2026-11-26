@@ -37,9 +37,28 @@ def _warn_if_placeholder_config(cfg) -> None:   # pragma: no cover - 进程入�
             "（网页按钮点了没反应）。改 config/notify.yaml 与 deploy/ntfy/server.yml", host)
     # `web.env` 只挂给 api，所以口令检查只能放在这里（jobs 侧查是恒真误报）
     if not (os.environ.get("SS_WEB_PASS") or "").strip():
-        logging.getLogger("api").warning(
-            "SS_WEB_PASS 未配置：网页不鉴权。公网部署务必在 "
-            "~/.config/stock-screener/web.env 里设置")
+        msg = ("SS_WEB_PASS 未配置：网页不鉴权。公网部署务必在 "
+               "~/.config/stock-screener/web.env 里设置")
+        # **公网部署必须 fail-closed，不能只 warning 后继续**。
+        #
+        # `api/auth.py` 的中间件在口令缺失时 `return await call_next(request)`
+        # ——**全站放行**。而表现是"一切正常、页面能用"，日志里一条 warning
+        # 没有人会看。`deploy/docker-compose.yml` 的 `web.env` 还写着
+        # `required: false`，文件不存在也能启动。
+        #
+        # 届时这条公网 URL 上：`/api/status`、`/api/push-log`、`/api/agent-log`
+        # 全量数据可读，`POST /api/chat` 能烧 LLM 预算，写 `watch` 能改状态。
+        # 路径写错、`chmod` 不对、迁移机器漏建文件，任何一处都会静默变成这样。
+        #
+        # 触发条件：`public_host` 已配成真域名（说明这是对外部署），
+        # 而不是仍为 RFC 2606 占位域 / 空（本地开发）。
+        if not is_placeholder_host(host):
+            raise SystemExit(
+                "SS_WEB_PASS 未配置且 public_host 已设为真域名 "
+                f"({host})：拒绝启动。这也是唯一一道「人在门外」的关口，"
+                "不能 fail-open。请创建 ~/.config/stock-screener/web.env 并写 "
+                "SS_WEB_PASS=<口令>。")
+        logging.getLogger("api").warning("%s（当前 public_host 仍是占位值，视为本地开发，继续启动）", msg)
 
 _cfg = load_config(Path("config"))
 _warn_if_placeholder_config(_cfg)

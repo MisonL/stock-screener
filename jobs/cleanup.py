@@ -131,7 +131,38 @@ DISK_HIGH_PCT = 85.0
 DISK_CRIT_PCT = 95.0
 
 
-def _alert_disk(dispatcher, used: float | None) -> None:
+#: 同一档位内，水位变化**超过这个百分点**才再告警一次。
+#:
+#: 为什么需要：`Dispatcher.alert` 的 30 分钟去重只按 `kind + 时间`，
+#: **不看内容**。生产实测 2026-11-25：磁盘一整天稳在 80~82%，
+#: `disk_p2` 却推了 **17 条**，每条都是同一句"磁盘水位 82%（75% 以上，
+#: 建议清理）"。这种推送比不推送更糟——它训练用户忽略告警，
+#: 真正该升到 P1/P0 的那条会被当成噪音划掉。
+DISK_RENOTIFY_PCT = 3.0
+
+
+def _disk_state(conn) -> tuple[str | None, float | None]:
+    """读出上次告警的档位与水位数（没有就 `(None, None)`）。"""
+    rows = dict(conn.execute(
+        "SELECT name, value FROM job_state WHERE name IN"
+        " ('disk_alert.kind', 'disk_alert.pct')").fetchall())
+    kind = rows.get("disk_alert.kind") or None
+    try:
+        pct = float(rows["disk_alert.pct"]) if rows.get("disk_alert.pct") else None
+    except (TypeError, ValueError):
+        pct = None
+    return kind, pct
+
+
+def _save_disk_state(conn, kind: str, pct: float) -> None:
+    with conn:
+        conn.execute("INSERT OR REPLACE INTO job_state(name, value) VALUES (?, ?)",
+                     ("disk_alert.kind", kind))
+        conn.execute("INSERT OR REPLACE INTO job_state(name, value) VALUES (?, ?)",
+                     ("disk_alert.pct", f"{pct:.2f}"))
+
+
+def _alert_disk(dispatcher, used: float | None, conn=None) -> None:
     """按水位发告警。
 
     **`used is None`（读不到）必须单独告警，不能当成 0% 静默**：
@@ -146,12 +177,41 @@ def _alert_disk(dispatcher, used: float | None) -> None:
     """
     if used is None:
         dispatcher.alert("disk_unknown", "读不到磁盘占用（statvfs 失败），无法判断水位", "P1")
-    elif used >= DISK_CRIT_PCT:
-        dispatcher.alert("disk_p0", f"磁盘水位 {used:.0f}%（{DISK_CRIT_PCT:.0f}% 以上，随时可能写不进）", "P0")
+        return
+
+    if used >= DISK_CRIT_PCT:
+        kind, level, text = ("disk_p0",
+                             "P0",
+                             f"磁盘水位 {used:.0f}%（{DISK_CRIT_PCT:.0f}% 以上，随时可能写不进）")
     elif used >= DISK_HIGH_PCT:
-        dispatcher.alert("disk_p1", f"磁盘水位 {used:.0f}%（{DISK_HIGH_PCT:.0f}% 以上）", "P1")
+        kind, level, text = ("disk_p1",
+                             "P1",
+                             f"磁盘水位 {used:.0f}%（{DISK_HIGH_PCT:.0f}% 以上）")
     elif used >= DISK_WARN_PCT:
-        dispatcher.alert("disk_p2", f"磁盘水位 {used:.0f}%（{DISK_WARN_PCT:.0f}% 以上，建议清理）", "P2")
+        kind, level, text = ("disk_p2",
+                             "P2",
+                             f"磁盘水位 {used:.0f}%（{DISK_WARN_PCT:.0f}% 以上，建议清理）")
+    else:
+        # 回到安全线以下：**清掉状态**，这样下次再越线能立刻告警，
+        # 而不是因为"上次是 70%"被自己的去抖压掉。
+        if conn is not None:
+            with conn:
+                conn.execute("DELETE FROM job_state WHERE name IN"
+                             " ('disk_alert.kind', 'disk_alert.pct')")
+        return
+
+    # **同档位且水位没明显变化就闭嘴**：30 分钟去重只看 kind + 时间，
+    # 不看内容，于是稳态 82% 一天推 17 条一模一样的。
+    if conn is not None:
+        last_kind, last_pct = _disk_state(conn)
+        if last_kind == kind and last_pct is not None \
+                and abs(used - last_pct) < DISK_RENOTIFY_PCT:
+            log.debug("磁盘仍处 %s 档（%.1f%%，上次 %.1f%%），不重复告警",
+                      kind, used, last_pct)
+            return
+        _save_disk_state(conn, kind, used)
+
+    dispatcher.alert(kind, text, level)
 
 
 def check_disk(conn, dispatcher=None, path: str | None = None) -> float | None:
@@ -172,7 +232,7 @@ def check_disk(conn, dispatcher=None, path: str | None = None) -> float | None:
             path = "."
     used = disk_used_pct(path)
     if dispatcher is not None:
-        _alert_disk(dispatcher, used)
+        _alert_disk(dispatcher, used, conn)
     return used
 
 

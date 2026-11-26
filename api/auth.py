@@ -116,6 +116,14 @@ BLOCK_S = 900                # 触发后锁多久
 # 「打开首页就把自己锁 15 分钟」——而这正是免密功能要解决的问题本身。
 # 匿名请求猜不出口令（它们不带口令），所以放宽它不会削弱防护。
 ANON_MAX = 200                # 窗口内允许的匿名 401 次数
+#: `/api/hook/*` 自带 HMAC 验签，**不走口令**；但它完全绕过鉴权中间件也绕过了
+#: 上面两档限流，成了公网上的**公开放大器**：匿名者可以无限打，
+#: 每条都新建一个 SQLite 连接 + 查询 + `ensure_secret` 读取。
+#: 在 `mem_limit: 512m` + 单核的容器里，配合 Starlette 默认 40 的线程池，
+#: 足以把正常页面请求饿死。这里给一个独立的桶，阈值比匿名口令失败更宽
+#: （ntfy 按钮连点、重试都是正常流量），但必须有。
+HOOK_MAX = 120                # 窗口内允许的 /api/hook/ 请求数
+HOOK_BLOCK_S = 60             # 超限后封锁秒数
 ANON_BLOCK_S = 120            # 触发后锁多久（短：误判的代价要小）
 
 # 跟踪的 IP 上限。**必须有上限**：`CF-Connecting-IP` 是客户端可设置的头，
@@ -132,6 +140,7 @@ MAX_TRACKED = 10_000
 # 时用户只是刷新了一次页面，就直接被锁死。
 _fails: dict[str, tuple[float, int, float]] = {}    # 带口令的失败（在猜）
 _anon: dict[str, tuple[float, int, float]] = {}     # 匿名 401（只是要不到凭据）
+_hook_hits: dict[str, tuple[float, int, float]] = {}   # /api/hook/ 请求（自带验签）
 #: 累计取不到签名密钥的次数（DB 故障时票据全失效，靠它被发现）
 _secret_failures = 0
 # 上次清扫时刻：批量清理不能每个请求都全表扫一遍（那是另一种拒绝服务）
@@ -278,10 +287,13 @@ def _sweep(now: float) -> None:
     仍在窗口内（或仍在封锁中）的条目必须保留——否则清扫等于帮攻击者重置计数。
     """
     global _last_sweep
-    if now - _last_sweep < SWEEP_EVERY_S and len(_fails) <= MAX_TRACKED:
+    if (now - _last_sweep < SWEEP_EVERY_S and len(_fails) <= MAX_TRACKED
+            and len(_hook_hits) <= MAX_TRACKED):
         return
     _last_sweep = now
-    for bucket in (_fails, _anon):
+    # **`_hook_hits` 必须一起扫**：它同样是"只出现一次的 key"模式
+    # （公网上每个来源 IP 一条），不扫就会无界增长成内存泄漏。
+    for bucket in (_fails, _anon, _hook_hits):
         for k, (window_start, _count, blocked) in list(bucket.items()):
             if blocked <= now and now - window_start > FAIL_WINDOW_S:
                 bucket.pop(k, None)
@@ -375,6 +387,23 @@ def make_middleware(conn_factory=None):
             if any(path == p or path.startswith(p + "/") for p in OPEN_PATHS):
                 return await call_next(request)
             if any(path.startswith(prefix) for prefix in SELF_SIGNED_PREFIXES):
+                # **自带验签 ≠ 可以不限流**：这两条路由完全绕过口令与上面两档桶，
+                # 匿名者能无限打（每条都建 SQLite 连接 + 查询）。
+                # 超限直接 429，不进入业务逻辑。
+                hkey = _client_key(request)
+                hnow = time.time()
+                _sweep(hnow)
+                start, cnt, blocked = _hook_hits.get(hkey, (hnow, 0, 0.0))
+                if hnow - start > FAIL_WINDOW_S:
+                    start, cnt = hnow, 0
+                cnt += 1
+                if cnt >= HOOK_MAX:
+                    blocked = hnow + HOOK_BLOCK_S
+                _hook_hits[hkey] = (start, cnt, blocked)
+                if blocked > hnow:
+                    return JSONResponse(
+                        {"detail": "请求过于频繁"}, status_code=429,
+                        headers={"Retry-After": str(int(blocked - hnow))})
                 return await call_next(request)
 
         creds = _credentials()

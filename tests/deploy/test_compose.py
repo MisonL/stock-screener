@@ -133,3 +133,63 @@ def test_dockerignore_covers_all_env_variants():
     """`.env.local` / `.env.production` 这类名字也要挡住。"""
     text = open(".dockerignore", encoding="utf-8").read()
     assert ".env.*" in text, ".dockerignore 只挡了 *.env，漏掉 .env.local 等变体"
+
+
+def _compose():
+    import yaml
+
+    return yaml.safe_load(open("deploy/docker-compose.yml"))
+
+
+def test_every_service_caps_cpu():
+    """**每个服务都必须有 `cpus` 上限。**
+
+    这台机器是共享的（4 核，还跑着 WeKnora/selfhost/langbot，别人也在编译）。
+    不加限制时一次 `compose build`（pip 装 pandas/numpy/TA-Lib + 两次 npm ci +
+    vite build）就能跑满全部核心，ssh 卡到 banner 交换超时、healthz 直接 530
+    ——2026-11-24 实测过。
+
+    `mem_limit` 只管内存，完全不管 CPU，两者不能互相替代。
+    """
+    bad = []
+    for name, svc in _compose()["services"].items():
+        cpus = svc.get("cpus") or svc.get("cpu_quota") or svc.get("cpu_shares")
+        if not cpus:
+            bad.append(name)
+    assert not bad, f"这些服务没有 CPU 上限，会抢爆共享机：{bad}"
+
+
+def test_every_cpu_limit_is_a_sane_fraction():
+    """CPU 上限必须是正数且不超过机器总核数。
+
+    写成 0 或负数会被 docker 拒绝启动；写成 100 等于没限。
+    """
+    for name, svc in _compose()["services"].items():
+        cpus = svc.get("cpus")
+        if cpus is None:
+            continue
+        assert isinstance(cpus, (int, float)), f"{name}: cpus 不是数字：{cpus!r}"
+        assert 0 < float(cpus) <= 8, f"{name}: cpus={cpus} 不合理（应 0<×≤8）"
+
+
+def test_jobs_has_grace_period_longer_than_its_longest_task():
+    """**jobs 的优雅停机必须长于它最长的任务**，否则 SIGKILL 会毁数据。
+
+    EOD 事务约 3 分钟；备份要拷 1.3GB（实测 8 分钟，含 integrity_check）。
+    compose 默认 10 秒——2026-11-24 就是这样把当晚备份弄丢的
+    （`.market-20261124.db.tmp` 残留，备份永久缺失）。
+    """
+    svc = _compose()["services"]["jobs"]
+    grace = svc.get("stop_grace_period")
+    assert grace, "jobs 没有 stop_grace_period，默认 10s 会被 SIGKILL"
+    if isinstance(grace, (int, float)):
+        secs = float(grace)
+    else:
+        t = str(grace).strip().lower()
+        if t.endswith("s"):
+            secs = float(t[:-1])
+        elif t.endswith("m"):
+            secs = float(t[:-1]) * 60
+        else:
+            secs = float(t)
+    assert secs >= 120, f"jobs 的 stop_grace_period={grace}，EOD/备份会被强杀"

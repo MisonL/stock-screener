@@ -94,3 +94,35 @@ def test_the_repository_itself_is_clean():
             if find(line):
                 bad.append(f"{name}:{i}: {line[:120]}")
     assert not bad, "仓库里检出疑似敏感信息：\n" + "\n".join(bad[:10])
+
+
+def test_catches_this_projects_own_credential_formats():
+    """**必须抓到本项目实际使用的凭据格式。**
+
+    原来的规则全是"窄前缀 + 精确长度"（`ghp_`/`sk-`/`AKIA`…），
+    对本项目自己的密钥一个都抓不到。实测（评审用本脚本跑的）四条全不命中——
+    而 RUNBOOK 里实际生成的就是 `tk_...`，`ntfy_` 那条规则根本对不上。
+    CI 的"敏感信息"门禁因此给的是假安全感。
+    """
+    from scripts.scan_secrets import find
+
+    assert find("NTFY_TOKEN=tk_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6")
+    assert find("export SS_WEB_PASS=Hunter2MySecret")
+    assert find("WESTOCK_ACCESS_TOKEN=eyJhbGciOiJIUzI1NiJ9.abcdefghij.klmnopqrst")
+    assert find('password: "s3cr3t-very-long-password"')
+
+
+def test_does_not_flag_placeholders_and_variable_references():
+    """**占位符/变量引用不能被当成泄漏**，否则门禁变成噪音没人看。"""
+    from scripts.scan_secrets import find
+
+    for line in [
+        "SS_WEB_PASS=$SS_WEB_PASS",
+        "NTFY_TOKEN=${NTFY_TOKEN}",
+        "SS_WEB_PASS=changeme",
+        "password: <your-password>",
+        "SS_WEB_PASS=xxxxxxxx",
+        'API_KEY=""',
+        "SECRET_NAME=my-secret-name-here",   # 名字里含 secret，但值是标识符
+    ]:
+        assert find(line) == [], f"误报：{line} → {find(line)}"

@@ -719,3 +719,41 @@ def test_api_disk_used_pct_matches_df_on_ext4(monkeypatch):
     # 读不到时必须是 None，不能是 0（0 会让所有告警阈值失效）
     monkeypatch.setattr(_os, "statvfs", lambda p: (_ for _ in ()).throw(OSError("boom")))
     assert _disk_used_pct("data") is None
+
+
+def test_public_deploy_without_password_refuses_to_start(monkeypatch):
+    """**公网部署 + 口令缺失 = 拒绝启动，不能 fail-open。**
+
+    `api/auth.py` 的中间件在口令为空时 `return await call_next(request)`
+    ——全站放行。表现是"一切正常、页面能用"，日志里一条 warning 没人会看。
+    届时 `/api/status`、`/api/push-log` 全量可读，`/api/chat` 能烧 LLM 预算。
+
+    路径写错、`chmod` 不对、迁移机器漏建 web.env，任何一处都会静默变成这样。
+    """
+    import importlib
+
+    import api.main as api_main
+
+    monkeypatch.delenv("SS_WEB_PASS", raising=False)
+
+    class _Cfg:
+        class notify:
+            public_host = "stock.mysite.dev"        # 真域名，不是 RFC 2606 占位值
+
+    with pytest.raises(SystemExit) as exc:
+        api_main._warn_if_placeholder_config(_Cfg())
+    assert "SS_WEB_PASS" in str(exc.value)
+    assert "拒绝启动" in str(exc.value)
+
+
+def test_local_dev_without_password_still_starts(monkeypatch, caplog):
+    """本地开发（public_host 还是占位域）不该被拦——否则跑不起来。"""
+    import api.main as api_main
+
+    monkeypatch.delenv("SS_WEB_PASS", raising=False)
+
+    class _Cfg:
+        class notify:
+            public_host = "stock.example.com"      # RFC 2606 占位域
+
+    api_main._warn_if_placeholder_config(_Cfg())   # 不抛

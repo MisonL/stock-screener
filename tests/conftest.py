@@ -615,12 +615,18 @@ def _reset_auth_failures():
     """
     from api import auth
 
-    auth._fails.clear()
+    # **三个桶都要清**：`_fails`（带口令猜错）、`_anon`（匿名 401）、
+    # `_hook_hits`（`/api/hook/*`）。只清 `_fails` 时，`/api/hook/` 的计数
+    # 会跨用例累积——限流用例打了 120+ 次之后，**后面所有** `/api/hook/`
+    # 用例都拿到 429 而不是预期的 403/404（单跑绿、整跑红）。
+    for bucket in ("_fails", "_anon", "_hook_hits"):
+        getattr(auth, bucket).clear()
     # 清扫节流也要重置：`_last_sweep` 是模块级、跨用例残留，
     # 前一个用例把它推到很后面，后一个用例的清扫就不会发生（单跑绿、整跑红）
     auth._last_sweep = 0.0
     yield
-    auth._fails.clear()
+    for bucket in ("_fails", "_anon", "_hook_hits"):
+        getattr(auth, bucket).clear()
     auth._last_sweep = 0.0
 
 

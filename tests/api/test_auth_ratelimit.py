@@ -211,3 +211,28 @@ def test_sweep_never_evicts_a_blocked_entry():
     assert victim in auth._fails, (
         "正在封锁中的条目被容量淘汰了；攻击者撑爆 dict 就能解除自己的封锁")
     assert auth._fails[victim][2] > t0, "victim 的封锁被清掉了"
+
+
+def test_hook_endpoints_are_rate_limited(api, tmp_db, passwd):
+    """**`/api/hook/*` 自带验签，但不能不限流。**
+
+    它通过 `SELF_SIGNED_PREFIXES` 完全绕过口令中间件，也就不进 `_fails`/`_anon`
+    两档桶。匿名者可以无限打：每条都新建 SQLite 连接 + 查询 `push_log` + 读密钥。
+    512m / 单核的容器里，配合 Starlette 默认 40 的线程池，足以把正常请求饿死。
+
+    这里连打 `HOOK_MAX + 5` 次，必须出现 429。
+    """
+    async def run():
+        codes = []
+        async with api() as client:
+            for _ in range(auth.HOOK_MAX + 5):
+                r = await client.post("/api/hook/signals/1/read")
+                codes.append(r.status_code)
+        return codes
+
+    auth._hook_hits.clear()
+    codes = asyncio.run(run())
+    assert 429 in codes, f"打了 {len(codes)} 次都没有限流：{set(codes)}"
+    # 超限之前的请求应该照常走到业务逻辑（403 验签失败 / 404 记录不存在），
+    # 而不是一律 429——否则正常按钮点击就被拦了
+    assert codes[0] in (403, 404), f"第一次就被拦了：{codes[0]}"

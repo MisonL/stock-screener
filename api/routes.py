@@ -292,16 +292,28 @@ def create_app(cfg, conn_factory, clock, dispatcher=None, mcp=None, chat_llm=Non
     @app.post("/api/hook/signals/{signal_id}/read")
     def hook_read(signal_id: int, t: str = Query("")):
         """验签失败一律 403 **且不改库**；成功只写 `read_at`。"""
+        # **不主动 `close()`，与全文件其它路由保持一致**：
+        # `create_app(cfg, conn_factory, ...)` 的契约允许 factory 返回
+        # **进程级共享连接**（`api/main.py` 的注释、以及测试夹具都这么用）。
+        # 在这里关掉会直接毁掉共享连接（实测：后续所有 hook 用例报
+        # `Cannot operate on a closed database`）。生产用的
+        # `make_conn_factory(migrate_each=False)` 每次新建连接，靠局部变量
+        # 出作用域 + CPython 引用计数关闭——这是全文件既有的统一做法，
+        # 单点改成 `closing()` 反而制造不一致。
         conn = conn_factory()
-        row = conn.execute("SELECT trade_date FROM signals WHERE id = ?", (signal_id,)).fetchone()
+        row = conn.execute("SELECT trade_date FROM signals WHERE id = ?",
+                           (signal_id,)).fetchone()
+        # **不区分 404/403**：404 是"这个 id 不存在"，403 是"存在但验签失败"，
+        # 两者并存等于给匿名者一个**信号 id 存在性探针**。统一报 403。
         if row is None:
-            raise HTTPException(status_code=404, detail="signal 不存在")
+            raise HTTPException(status_code=403, detail="签名或有效期不通过")
         secret = ensure_secret(conn)
         from notify.hmac_sign import day_end_ts
 
         exp = day_end_ts(int(row[0]))
         # 过期判断必须用注入的 `clock`：`is_expired` 默认读系统时间，测试与回放都会判错
-        if not verify(secret, "read", signal_id, exp, t) or is_expired(exp, clock.now().timestamp()):
+        if not verify(secret, "read", signal_id, exp, t) \
+                or is_expired(exp, clock.now().timestamp()):
             raise HTTPException(status_code=403, detail="签名或有效期不通过")
         with conn:
             conn.execute("UPDATE signals SET read_at = COALESCE(read_at, ?) WHERE id = ?",
@@ -343,11 +355,14 @@ def create_app(cfg, conn_factory, clock, dispatcher=None, mcp=None, chat_llm=Non
         conn = conn_factory()
         # ① 验签 + 过期。**先查确认卡是否真的发过**：没有 `confirm-{turn_id}` 的
         # push_log 行就说明这不是我们推出的卡，签名再对也不执行。
+        #
+        # **`404 卡不存在` 与 `403 验签失败` 不能并存**：那是给匿名者一个
+        # turn_id 存在性探针。统一 403。
         card = conn.execute(
             "SELECT 1 FROM push_log WHERE seq_id = ? AND kind = 'confirm_card' LIMIT 1",
             (f"confirm-{turn_id}",)).fetchone()
         if card is None:
-            raise HTTPException(status_code=404, detail="确认卡不存在")
+            raise HTTPException(status_code=403, detail="签名或有效期不通过")
         secret = ensure_secret(conn)
         if not verify(secret, "confirm", turn_id, exp, t) or is_expired(exp, clock.now().timestamp()):
             raise HTTPException(status_code=403, detail="签名或有效期不通过")

@@ -49,6 +49,11 @@ def _patch_common(monkeypatch, verify="OK", rollback_ok=True, calls=None):
     monkeypatch.setattr(deploy, "read_schema_version",
         lambda h, d: ["001_batch1.sql"])
     monkeypatch.setattr(deploy, "config_drift_script", lambda d: "true")
+    # **部署互斥锁会真去 ssh**：默认替身成"拿到了"，再由专门的用例覆盖忙/闲。
+    monkeypatch.setattr(deploy, "_acquire_deploy_lock", lambda h, p: "tok-default")
+    monkeypatch.setattr(deploy, "_release_deploy_lock", lambda h, p, t: None)
+    # 危险窗口检查依赖当前时间：默认放行，由窗口用例单独覆盖。
+    monkeypatch.setattr(deploy, "in_blocked_window", lambda now: None)
     monkeypatch.setattr(deploy, "verify_deployment",
         lambda h, s, w, **kw: verify)
     def _rb(h, d, s):
@@ -975,3 +980,233 @@ def test_cleanup_warns_when_cache_prune_reports_an_error(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "回收失败" in out, out
     assert "构建缓存：Cannot" not in out, "把报错当成了回收量"
+
+
+def _fake_archive(path):
+    """造一个**真的** tar.gz：`main()` 里会 `tarfile.open()` 统计文件数。"""
+    import tarfile as _tf
+
+    with _tf.open(path, "w:gz") as tf:
+        data = b"x"
+        info = _tf.TarInfo("dummy.txt")
+        info.size = len(data)
+        import io as _io
+
+        tf.addfile(info, _io.BytesIO(data))
+
+
+def test_blocked_window_covers_backup_and_eod(monkeypatch):
+    """**备份/EOD 窗口内必须拒绝部署**（可 --force-window 强推）。
+
+    2026-11-24 的真实事故：23:30:14 部署、23:33:12 新容器起来，
+    正好吃掉 23:30 的备份（`.market-20261124.db.tmp` 残留），
+    **那一晚的备份永久丢失**，直到次日 08:55 才报一条 backup_stale。
+    """
+    from datetime import datetime as _dt
+
+    for hhmm in ["23:30", "23:26", "23:49", "15:05", "15:30", "08:40", "09:00"]:
+        h, m = map(int, hhmm.split(":"))
+        reason = deploy.in_blocked_window(_dt(2026, 11, 24, h, m))
+        assert reason, f"{hhmm} 应该被挡住（它会打断 EOD/备份），实际放行"
+
+
+def test_outside_windows_deploys_are_allowed():
+    """窗口之外不该拦——否则白天根本没法发版。"""
+    from datetime import datetime as _dt
+
+    for hhmm in ["10:00", "11:00", "14:00", "20:00", "23:00", "23:55", "07:00"]:
+        h, m = map(int, hhmm.split(":"))
+        assert deploy.in_blocked_window(_dt(2026, 11, 24, h, m)) is None, \
+            f"{hhmm} 不该被拦住"
+
+
+def test_dry_run_is_never_blocked(monkeypatch, capsys):
+    """`--dry-run` 不重启任何东西，不该受窗口限制。"""
+    from datetime import datetime as _dt
+
+    monkeypatch.setattr(deploy, "in_blocked_window",
+                        lambda now: "每日备份")
+    monkeypatch.setattr(deploy, "build_archive", _fake_archive)
+    # 工作区可能真的有改动（本仓库日常状态），用 --allow-dirty 隔离掉
+    assert deploy.main(["--host", "h", "--dir", "/srv/app", "--dry-run",
+                        "--allow-dirty"]) == 0
+
+
+def test_force_window_bypasses_the_check(monkeypatch, capsys):
+    """`--force-window` 明确越过窗口检查，但必须打警告。"""
+    _patch_common(monkeypatch, verify="OK")
+    monkeypatch.setattr(deploy, "in_blocked_window", lambda now: "每日备份")
+    rc = deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0",
+                      "--force-window"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "强推部署" in out, out
+
+
+def test_capture_swallows_ssh_timeout_instead_of_raising(monkeypatch):
+    """**`_capture` 必须自己吞掉 subprocess 异常。**
+
+    `subprocess.run(..., timeout=900)`：ssh 卡住抛 `TimeoutExpired`、
+    ssh 不存在抛 `FileNotFoundError`。不捕获的话 `main()` 以 traceback +
+    退出码 1 结束——而 1 的语义是「确认坏、已回滚」，
+    值班会去手工回滚一个其实健康的新版本。
+    """
+    import subprocess as _sp
+
+    def boom(cmd, **kw):
+        raise _sp.TimeoutExpired(cmd, 900)
+
+    monkeypatch.setattr(deploy.subprocess, "run", boom)
+    out = deploy._capture(["ssh", "h", "true"])
+    assert deploy.CAPTURE_FAILED in out
+    assert "TimeoutExpired" in out
+
+    def no_ssh(cmd, **kw):
+        raise FileNotFoundError("ssh")
+
+    monkeypatch.setattr(deploy.subprocess, "run", no_ssh)
+    assert deploy.CAPTURE_FAILED in deploy._capture(["ssh", "h", "true"])
+
+
+def test_capture_failure_maps_to_unknown_not_fail(monkeypatch):
+    """**「没验成」必须是 UNKNOWN（退出 3、不回滚），不能是 FAIL。**
+
+    FAIL 会触发自动回滚——把一次成功的部署强行切回旧版本，代价很大。
+    """
+    monkeypatch.setattr(deploy, "_capture",
+                        lambda cmd: f"{deploy.CAPTURE_FAILED}TimeoutExpired: ssh 卡住")
+    got = deploy.verify_deployment("h", "api", 10)
+    assert got.startswith("UNKNOWN:"), got
+    # 原因要能看出来是「拿不到输出」，不是笼统的「没有结论」
+    assert "拿不到验收输出" in got, got
+
+
+def test_drift_prompt_failure_does_not_fail_a_successful_deploy(monkeypatch, capsys):
+    """配置漂移提示只是"提示"，拿不到不能翻掉已经成功的部署。"""
+    _patch_common(monkeypatch, verify="OK")
+    calls = []
+
+    def cap(cmd):
+        joined = " ".join(cmd)
+        if "config_drift" in joined or "drift" in joined:
+            calls.append("drift")
+            return f"{deploy.CAPTURE_FAILED}TimeoutExpired"
+        return ""
+
+    monkeypatch.setattr(deploy, "_capture", cap)
+    rc = deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"])
+    assert rc == 0, "漂移提示失败把成功部署变成了失败"
+
+
+def test_pre_upgrade_backup_does_not_overwrite_the_previous_one(monkeypatch):
+    """**不可逆迁移前的备份不能每次都覆盖同一个文件。**
+
+    原来写死 `data/market.db.pre-upgrade`。首次升级生成的"旧结构"备份，
+    在**下一次**不可逆迁移时会被覆盖成"已含上次新结构"的库——
+    此时想回退到更早那个点，原始备份已经没了。
+    """
+    import re
+
+    seen = []
+    monkeypatch.setattr(deploy, "_capture",
+                        lambda cmd: (seen.append(" ".join(cmd)), "SS_BACKUP=OK")[1])
+    deploy.backup_before_upgrade("h", "/srv/app")
+    script = seen[0]
+
+    # 目标文件名必须带时间戳
+    m = re.search(r"market\.db\.pre-upgrade(-(\d{8}-\d{6}))?", script)
+    assert m, f"命令里找不到备份文件名：{script[:300]}"
+    assert m.group(2), f"备份文件名没有时间戳，会覆盖上一份：{m.group(0)}"
+    # 并且要有限制份数的清理，避免 1.3GB × N 占满磁盘
+    assert "tail -n +4" in script, "没有保留份数限制，磁盘会被备份撑满"
+
+
+def test_pre_upgrade_backup_keeps_only_recent_three(monkeypatch):
+    """保留策略是"最近 3 份"，不是无限累积。"""
+    seen = []
+    monkeypatch.setattr(deploy, "_capture",
+                        lambda cmd: (seen.append(" ".join(cmd)), "SS_BACKUP=OK")[1])
+    deploy.backup_before_upgrade("h", "/srv/app")
+    assert "tail -n +4" in seen[0]
+
+
+def test_build_command_pins_tag_and_project_name():
+    """**`build`/`up` 命令必须 `env -u TAG` 并显式 `-p`。**
+
+    镜像名是 `stock-screener:${TAG:-latest}`。运维 shell 里若
+    `export TAG=v0.2.133`，`build api` 产出 `stock-screener:v0.2.133`，
+    而 `_image_id()` 查的是 `stock-screener:latest`（旧镜像）→ 验收判 FAIL →
+    回滚把 rollback tag 打到 latest 再 `up -d`，但 compose 仍按 TAG 拉**新镜像**，
+    于是"回滚"之后跑的还是新版本，状态完全错乱。
+
+    `-p` 同理：`COMPOSE_PROJECT_NAME` 被改会让容器名与 `verify_script`
+    里拼的 `stock-screener-{svc}-1` 对不上，变成假失败。
+    """
+    import ast
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "scripts" / "deploy.py"
+           ).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    # `compose` 的赋值在 `main()` 拆出来的 `_deploy_body()` 里
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "_deploy_body")
+
+    compose_assigns = [n for n in ast.walk(fn)
+                       if isinstance(n, ast.Assign)
+                       and any(getattr(t, "id", None) == "compose" for t in n.targets)]
+    assert compose_assigns, "_deploy_body() 里找不到 compose 命令的赋值"
+    expr = ast.unparse(compose_assigns[0].value)
+    assert "env -u TAG" in expr, f"没有 unset TAG：{expr}"
+    assert "-p " in expr, f"没有显式指定项目名：{expr}"
+
+
+def test_deploy_refuses_when_another_deploy_holds_the_lock(monkeypatch, capsys):
+    """**两个部署同时跑必须拦住。**
+
+    后发者记录的「上一次验收通过镜像」可能是前发者尚未验完的镜像，
+    失败回滚时就可能回到一个已知坏的版本。
+    """
+    _patch_common(monkeypatch, verify="OK")
+    monkeypatch.setattr(deploy, "_acquire_deploy_lock", lambda host, path: None)
+    rc = deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"])
+    assert rc == 1, "锁被占时应该拒绝部署"
+    out = capsys.readouterr().out
+    assert "另一个部署正在进行" in out, out
+
+
+def test_deploy_releases_the_lock_even_when_verification_fails(monkeypatch):
+    """**验收失败也必须释放锁**，否则下一次部署永远被自己挡住。"""
+    _patch_common(monkeypatch, verify="FAIL:jobs起不来")
+    released = []
+    monkeypatch.setattr(deploy, "_acquire_deploy_lock", lambda host, path: "tok-1")
+    monkeypatch.setattr(deploy, "_release_deploy_lock",
+                        lambda host, path, tok: released.append(tok))
+    deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"])
+    assert released == ["tok-1"], f"部署失败后没释放锁：{released}"
+
+
+def test_lock_release_only_removes_its_own_lock(monkeypatch):
+    """释放时**必须只删自己那把**。
+
+    不看内容就删的话，一次慢部署结束时会把**后来者**的锁删掉，
+    于是两个部署又能同时跑——锁等于失效。
+    """
+    seen = []
+    monkeypatch.setattr(deploy, "_capture",
+                        lambda cmd: (seen.append(" ".join(cmd)), "")[1])
+    deploy._release_deploy_lock("h", "/srv/app/.deploy.lock", "tok-42")
+    script = seen[0]
+    # 必须做内容比对，而不是无条件 os.remove
+    assert "open(p).read()==t" in script, f"没比对内容，会删掉别人的锁：{script}"
+
+
+def test_lock_is_not_leaked_when_acquire_returns_empty(monkeypatch, capsys):
+    """拿不到锁（目标机缺 python3）时放行，但不该在结束时去删别人的锁。"""
+    _patch_common(monkeypatch, verify="OK")
+    released = []
+    monkeypatch.setattr(deploy, "_acquire_deploy_lock", lambda host, path: "")
+    monkeypatch.setattr(deploy, "_release_deploy_lock",
+                        lambda host, path, tok: released.append(tok))
+    assert deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"]) == 0
+    assert released == [], f"空 token 不该触发释放：{released}"

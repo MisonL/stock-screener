@@ -31,9 +31,15 @@ services:
     env_file:
       - ${HOME}/.config/stock-screener/llm.env
       - ${HOME}/.config/stock-screener/notify.env
-      # **网页口令**：只在 api 上生效（agent/jobs 不对外）。文件缺失也不影响启动。
+      # **网页口令**：只在 api 上生效（agent/jobs 不对外）。
+      #
+      # **不能写 `required: false`**：那样文件缺失也能启动，而
+      # `api/auth.py` 在口令为空时是**全站放行**的 fail-open——公网上
+      # `/api/status`、`/api/push-log` 全量可读，`/api/chat` 能烧预算。
+      # `compose` 缺这个文件时直接报错，比"静默开放"好得多。
+      # （`api/main.py` 另有启动断言：public_host 是真域名时直接拒启。）
       - path: ${HOME}/.config/stock-screener/web.env
-        required: false
+        required: true
     environment:
       # 全仓库的时间口径都是 Asia/Shanghai（交易日、EOD、预算自然日）；
       # 容器默认 UTC 会让「今天」比人多 8 小时
@@ -48,6 +54,11 @@ services:
       - ./config:/app/config:ro
       - ${HOME}/.config/stock-screener/state:/state:rw
     mem_limit: 512m
+    # **必须限制 CPU**：这台机器是共享的（还跑着 WeKnora/selfhost/langbot，
+    # 别人也在编译）。不加限制时一次构建就能把 4 核跑满，ssh 会卡到
+    # banner 交换超时、healthz 直接 530——2026-11-24 实测过。
+    # 0.8 核对「uvicorn + 只读查询」绰绰有余，也让别人有得用。
+    cpus: 0.8
     restart: unless-stopped
     init: true
     healthcheck:
@@ -98,8 +109,14 @@ services:
       - ${HOME}/.config/stock-screener/wb_client.json:/host-config/wb_client.json:rw
       - ${HOME}/.config/stock-screener/wb_session.json:/host-config/wb_session.json:rw
     mem_limit: 1g
+    # jobs 是唯一跑调度+抓取的常驻服务，给多一点 CPU；但仍要封顶。
+    cpus: 1.2
     restart: unless-stopped
     init: true
+    # **优雅停机必须长于最长任务**：EOD 事务约 3 分钟、备份要拷 1.3GB
+    # （实测 8 分钟，含 integrity_check）。默认 10 秒会被 SIGKILL，
+    # 2026-11-24 就是这么把当晚备份弄丢的。
+    stop_grace_period: 180s
     healthcheck:
       # 判「最近 2 分钟刷新过」而不是「文件存在」：文件一旦 touch 就永远在，
       # 主循环卡死时照样绿。心跳线程无条件每 30 秒 touch，非交易时段也刷。
@@ -134,6 +151,8 @@ services:
       - ./config:/app/config:ro
       - ${HOME}/.config/stock-screener/state:/state:rw
     mem_limit: 512m
+    # agent 只在交易时段唤醒跑 LLM 回合，CPU 需求低。
+    cpus: 0.5
     restart: unless-stopped
     init: true
 
@@ -159,6 +178,8 @@ services:
     expose:
       - "2586"
     mem_limit: 64m
+    # ntfy 只做推送转发。
+    cpus: 0.1
     restart: unless-stopped
     init: true
 
@@ -188,6 +209,9 @@ services:
       # 只挂 state/ 子目录：同目录还有 llm.env / notify.env，整目录可写等于让所有容器都能改写密钥。
       - ${HOME}/.config/stock-screener/state:/state:rw
     mem_limit: 1g
+    # backfill 是一次性全量回填（不常驻），但跑起来要打上游 + 写库，
+    # 同样封顶，避免它把机器占满。
+    cpus: 2.0
     init: true
     profiles:
       - tools
@@ -209,6 +233,8 @@ services:
     volumes:
       - ./cf:/etc/cloudflared:ro
     mem_limit: 64m
+    # cloudflared 只做隧道转发，CPU 需求极低但要有上限。
+    cpus: 0.2
     restart: unless-stopped
     init: true
     depends_on:

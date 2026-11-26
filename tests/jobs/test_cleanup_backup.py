@@ -543,3 +543,65 @@ def test_catch_up_fires_when_the_directory_is_empty(tmp_path):
     """一份备份都没有：必须立刻备（否则 stale 检查会一直报警却没人管）。"""
     made, _root, _ = _setup(tmp_path, "2026-11-25 10:00")
     assert made is not None, "没有任何备份时启动，应该立刻补一份"
+
+
+def test_disk_alert_is_not_repeated_at_a_steady_waterline(conn):
+    """**水位不变就不许反复推**。
+
+    生产实测 2026-11-25：磁盘一整天稳在 80~82%，`disk_p2` 推了 **17 条**，
+    每条都是同一句"磁盘水位 82%（75% 以上，建议清理）"。
+    `Dispatcher.alert` 的 30 分钟去重只按 `kind + 时间`、不看内容，
+    而巡检每 10 分钟一次，于是稳态下不停地推。
+
+    这种推送比不推送更糟——它训练用户忽略告警，真正该升档的那条被划掉。
+    """
+    from jobs import cleanup as cl
+
+    calls = []
+
+    class D:
+        def alert(self, kind, text, level="P1"):
+            calls.append((kind, level))
+
+    # 同一个水位连续巡检 6 次（模拟一小时）
+    for _ in range(6):
+        cl._alert_disk(D(), 82.0, conn)
+    assert len(calls) == 1, f"稳态 82% 推了 {len(calls)} 条：{calls}"
+
+    # 涨到 86% 跨档：必须再喊（P1）
+    cl._alert_disk(D(), 86.0, conn)
+    assert calls[-1] == ("disk_p1", "P1"), calls
+
+    # 同档位小幅波动：闭嘴
+    before = len(calls)
+    for pct in (86.5, 87.0, 87.9):
+        cl._alert_disk(D(), pct, conn)
+    assert len(calls) == before, f"同档位小幅波动又推了：{calls[before:]}"
+
+    # 同档位但明显恶化（≥3 个百分点）：再喊一次
+    cl._alert_disk(D(), 91.0, conn)
+    assert calls[-1] == ("disk_p1", "P1"), calls
+    assert len(calls) == before + 1
+
+
+def test_disk_alert_resets_after_falling_below_the_warning_line(conn):
+    """**回到安全线以下要清状态**，否则下次越线会被自己的去抖压掉。"""
+    from jobs import cleanup as cl
+
+    calls = []
+
+    class D:
+        def alert(self, kind, text, level="P1"):
+            calls.append((kind, level))
+
+    cl._alert_disk(D(), 82.0, conn)
+    assert len(calls) == 1
+
+    # 清理后回落到 60%：不告警，但状态要清
+    cl._alert_disk(D(), 60.0, conn)
+    assert len(calls) == 1, "回落到安全线不该告警"
+    assert cl._disk_state(conn) == (None, None), "回落之后状态没清"
+
+    # 再次越线：必须能立刻喊（不被上次的 82% 压掉）
+    cl._alert_disk(D(), 82.5, conn)
+    assert len(calls) == 2, f"再次越线没告警：{calls}"

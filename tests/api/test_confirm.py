@@ -153,11 +153,16 @@ def test_tampered_ticket_403(api, tmp_db, mcp):
     assert mcp.calls == []
 
 
-def test_unknown_turn_without_confirm_card_404(api, tmp_db, mcp):
-    """没有确认卡就说明不是我们发的卡片：不执行（即使签名对）。"""
+def test_unknown_turn_without_confirm_card_is_rejected(api, tmp_db, mcp):
+    """没有确认卡就说明不是我们发的卡片：不执行（即使签名对）。
+
+    **返回 403 而不是 404**：原来 404 表示"卡不存在"、403 表示"验签失败"，
+    两者并存等于给匿名者一个 **turn_id 存在性探针**——可以先探出哪些 id
+    真的存在，再去尝试构造。现在统一 403。
+    """
     seed_turn(tmp_db, card=False)
     r = post(api, ticket(tmp_db))
-    assert r.status_code == 404
+    assert r.status_code == 403
     assert mcp.calls == []
 
 

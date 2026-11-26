@@ -27,6 +27,7 @@ import sys
 import tarfile
 import tempfile
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -358,6 +359,9 @@ def verify_deployment(host: str, services: str, wait_s: int,
     """
     out = _capture(["ssh", "-o", "BatchMode=yes", host,
         "bash -c " + _sh_quote(verify_script(services, wait_s, settle_s, image_id))])
+    # 取不到输出（ssh 超时 / ssh 不在）＝ **没验成**，不是"坏了"
+    if CAPTURE_FAILED in out:
+        return "UNKNOWN:拿不到验收输出（" + out.split(CAPTURE_FAILED, 1)[1].strip()[:120] + "）"
     for line in out.splitlines():
         if line.strip() == "SS_VERIFY=OK":
             return "OK"
@@ -368,9 +372,29 @@ def verify_deployment(host: str, services: str, wait_s: int,
     return "UNKNOWN:验收脚本没有给出结论（ssh失败或脚本异常）"
 
 
+#: `_capture` 拿不到东西时返回这个哨兵。
+#:
+#: **不能用空串**：`verify_deployment()` 靠"输出里有没有成功标记"判断，
+#: 空串会被它当成"跑了但结果为空"，而 ssh 直接卡死/命令不存在是
+#: **"根本没验成"**——两者必须分开，前者是 UNKNOWN（退出 3、不回滚），
+#: 后者若落到 FAIL 就会去回滚一个健康的新版本。
+CAPTURE_FAILED = "\x00SS_CAPTURE_FAILED\x00"
+
+
 def _capture(cmd: list[str]) -> str:
-    """跑命令并取输出（失败也返回已拿到的部分，交给调用方判定）。"""
-    proc = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=900)
+    """跑命令并取输出（失败也返回已拿到的部分，交给调用方判定）。
+
+    **必须自己吞掉 subprocess 异常**（评审抓到）：`timeout=900`，
+    ssh 卡住抛 `TimeoutExpired`、ssh 不存在抛 `FileNotFoundError`。
+    不捕获的话 `main()` 会以 traceback + 退出码 1 结束——而退出码 1 的
+    语义是「确认坏、已回滚」，值班会去手工回滚一个其实健康的新版本。
+    返回哨兵让 `verify_deployment()` 判成 UNKNOWN（退出 3、不回滚）。
+    """
+    try:
+        proc = subprocess.run(cmd, check=False, capture_output=True, text=True,
+                              timeout=900)
+    except (subprocess.SubprocessError, OSError) as exc:
+        return f"{CAPTURE_FAILED}{type(exc).__name__}: {exc}"
     return (proc.stdout or "") + (proc.stderr or "")
 
 
@@ -493,7 +517,12 @@ def backup_before_upgrade(host: str, target: str) -> str:
     返回 "OK" / "FAIL:<原因>"。
     """
     db = target.rstrip("/") + "/data/market.db"
-    dst = db + ".pre-upgrade"
+    # **文件名带时间戳**：原来写死 `.pre-upgrade`，每次不可逆迁移前都覆盖同一份。
+    # 首次升级生成的"旧结构"备份，在**下一次**不可逆迁移时会被覆盖成
+    # "已含上次新结构"的库——此时想回退到更早那个点，原始备份已经没了。
+    # 带时间戳后每份都留着（只保最近 3 份，避免占磁盘）。
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    dst = f"{db}.pre-upgrade-{stamp}"
     code = (
      "import sqlite3;"
      "s=sqlite3.connect('file:" + db + "?mode=ro',uri=True);"
@@ -501,8 +530,14 @@ def backup_before_upgrade(host: str, target: str) -> str:
      "s.backup(d);d.close();s.close();"
      "print('SS_BACKUP=OK')"
      )
+    # **只保最近 3 份**：一份 1.3GB，攒多了会把本来就紧的磁盘占满。
+    # 用 `ls -t | tail -n +4` 删更旧的，不管删除失败（不影响本次备份）。
+    prune = (
+     "ls -t '" + db + "'.pre-upgrade-* 2>/dev/null | tail -n +4 | xargs -r rm -f; true"
+    ) if os.name != "nt" else "true"
     out = _capture(["ssh", "-o", "BatchMode=yes", host,
-     "python3 -c " + _sh_quote(code) + " || true"])
+     "bash -c " + _sh_quote("python3 -c " + _sh_quote(code) + " && (" + prune + ")")
+     + " || true"])
     if "SS_BACKUP=OK" not in out:
         return "FAIL:" + (out.strip()[:200] or "没有输出")
     return "OK"
@@ -550,7 +585,7 @@ def schema_drift_warning(before: list[str] | None, after: list[str] | None) -> s
  " 旧代码现在面对的是新结构的库。加列/加表通常无碍，"
  "重建过表的（如 004）可能读不了。\n"
  " 处理：先确认 /healthz 与日志；必要时按 RUNBOOK §9.2 用"
- " data/market.db.pre-upgrade 恢复数据库（会丢这次部署后的新数据）。"
+ " 最新的 data/market.db.pre-upgrade-<时间戳> 恢复数据库（会丢这次部署后的新数据）。"
  )
 
 
@@ -603,6 +638,113 @@ def prune_old_images(host: str) -> str | None:
 #: **用 CPU 换磁盘是换错方向**。所以阈值定在 95——真正逼近写满、
 #: 不回收就要出事时才动，而不是每次发版都付重建代价。
 DISK_RECLAIM_PCT = 95.0
+
+
+#: **不能部署的时间窗口（本地时间）**。`up -d --force-recreate` 会同时重启
+#: api/jobs/agent，而 `jobs` 里跑着几个**长时间、不可中断**的任务。
+#:
+#: 2026-11-24 的真实事故：23:30:14 部署、23:33:12 新容器起来，
+#: 正好吃掉 23:30 的每日备份——`.market-20261124.db.tmp` 残留，
+#: **那一晚的备份永久丢失**（直到次日 08:55 才报一条 backup_stale）。
+#:
+#: 现在 jobs 有了 `stop_grace_period: 180s`（能等 EOD/备份做完），
+#: 但备份本身要 8 分钟，超过 180s 仍会被杀。所以在源头挡住：
+#: 真要在这个窗口部署，显式加 `--force-window`。
+DEPLOY_BLOCK_WINDOWS = (
+    # (起, 止, 原因)
+    ((15, 0), (15, 40), "EOD 写库（约 3 分钟）+ archive 归档（15:30）"),
+    ((23, 25), (23, 50), "每日备份（23:30 起，约 8 分钟，含 integrity_check）"),
+    ((8, 35), (9, 10), "开盘前补跑 EOD / 除权刷新 / 自检（08:40~09:00）"),
+)
+
+
+#: 部署锁超过这么久没更新就视为**陈旧**（上次部署崩了没来得及释放）。
+#: 留 40 分钟：一次部署含构建（首次可能十几分钟）+ 验收 90 秒 + settle。
+DEPLOY_LOCK_STALE_S = 2400
+
+
+def _acquire_deploy_lock(host: str, lock_path: str) -> str | None:
+    """在目标机上拿一个排他部署锁；拿到返回持有者 token，已被占返回 `None`。
+
+    **为什么需要**：两个部署同时在跑会互相污染回滚点——后发者记录的
+    「上一次验收通过镜像」可能是前发者尚未验完的镜像，失败回滚时就可能
+    回到一个已知坏的版本。
+
+    **为什么不用 `flock`**：`flock` 的锁属于**持有它的那个进程/文件描述符**。
+    部署是由**几十条独立 ssh 命令**组成的，`ssh 'flock -n 9'` 一退出锁就释放，
+    等于没锁。所以改用「锁文件 + 时间戳 + 陈旧判定」：
+
+      · 用 `O_CREAT|O_EXCL` 原子创建，同时写入 pid 与时间戳；
+      · 已存在且**未超过 `DEPLOY_LOCK_STALE_S`** → 视为别人在部署，返回 `None`；
+      · 已存在但**已过期** → 上次部署崩了没释放，直接抢占（并打日志）。
+
+    远程没有 python3 时**不阻塞部署**（返回空 token）：让部署因为缺个工具
+    彻底跑不了，比偶尔撞车更糟。
+    """
+    stamp = f"{os.getpid()}-{int(datetime.now().timestamp())}"
+    code = (
+        "import os,sys,time;"
+        "p=sys.argv[1];"
+        "stale=float(sys.argv[2]);"
+        "now=time.time();"
+        "try:"
+        " fd=os.open(p,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o644);"
+        " os.write(fd,sys.argv[3].encode());os.close(fd);print('SS_LOCK=GOT')"
+        "except FileExistsError:"
+        " age=now-os.path.getmtime(p);"
+        " (print('SS_LOCK=STALE') or os.remove(p) or "
+        "  (lambda f:(os.write(f,sys.argv[3].encode()),os.close(f),print('SS_LOCK=GOT'))"
+        "   (os.open(p,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o644))))"
+        " if age>stale else print('SS_LOCK=BUSY')"
+    )
+    out = _capture(["ssh", "-o", "BatchMode=yes", host,
+                    "python3 -c " + _sh_quote(code) + " " + _sh_quote(lock_path) + " "
+                    + _sh_quote(str(DEPLOY_LOCK_STALE_S)) + " " + _sh_quote(stamp)
+                    + " || true"])
+    if "SS_LOCK=BUSY" in out:
+        return None
+    if "SS_LOCK=GOT" in out:
+        if "SS_LOCK=STALE" in out:
+            print("提示：清掉了一个陈旧的部署锁（上次部署可能异常退出）")
+        return stamp
+    print("提示：拿不到部署互斥锁（目标机缺 python3？），继续部署但并发需自行避免")
+    return ""
+
+
+def _release_deploy_lock(host: str, lock_path: str, token: str) -> None:
+    """释放部署锁。**只删自己那把**（内容等于自己的 token 才删）。
+
+    不看内容就删的话，一次慢部署结束时会把**后来者**的锁删掉。
+    释放失败不抛：部署已经结束了，为一句清理报错翻掉退出码不值得。
+    """
+    if not token:
+        return
+    # **单行、无 try/except**：`python3 -c '...'` 里塞换行要靠多层 shell 转义，
+    # 之前就踩过（`\n` 被当字面量）。用 `os.path.exists` 先判，避开 `FileNotFoundError`。
+    code = (
+        "import os,sys;"
+        "p,t=sys.argv[1],sys.argv[2];"
+        "(os.remove(p) if (os.path.exists(p) and open(p).read()==t) else None)"
+    )
+    try:
+        _capture(["ssh", "-o", "BatchMode=yes", host,
+                  "python3 -c " + _sh_quote(code) + " " + _sh_quote(lock_path) + " "
+                  + _sh_quote(token) + " || true"])
+    except Exception:                      # noqa: BLE001 —— 清理失败不影响结论
+        pass
+
+
+def in_blocked_window(now: datetime) -> str | None:
+    """当前是否落在"不该部署"的窗口里；返回原因，不在窗口返回 `None`。"""
+    hm = (now.hour, now.minute)
+    for start, end, reason in DEPLOY_BLOCK_WINDOWS:
+        # 支持跨零点（这里暂时没有，但写对边界更安全）
+        if start <= end:
+            if start <= hm < end:
+                return reason
+        elif hm >= start or hm < end:
+            return reason
+    return None
 
 
 def host_disk_pct(host: str) -> float | None:
@@ -708,11 +850,41 @@ def main(argv: list[str] | None = None) -> int:
         help="跳过部署后验收（仅排障用）")
     ap.add_argument("--public-url", default=os.environ.get("SS_PUBLIC_HEALTHZ", ""),
         help="部署后从外部探一次 /healthz（留空则跳过）")
+    ap.add_argument("--force-window", action="store_true",
+        help="忽略「危险部署窗口」检查（EOD/备份/盘前补跑期间强制部署）")
     args = ap.parse_args(argv)
 
     # **`--dir ~/x`必须展开**：`_sh_quote`会把路径包进单引号，
     #`~`不会被远端展开，marker写不进去且静默失败。
     args.dir = os.path.expanduser(args.dir)
+
+    # **危险窗口一律拒绝**（除非显式 --force-window）：`--force-recreate`
+    # 会重启 jobs，而 EOD（约 3 分钟）、每日备份（约 8 分钟）正在写库/拷文件时
+    # 被杀，代价是数据缺失。2026-11-24 就是这么丢了当晚备份。
+    if not args.dry_run:
+        reason = in_blocked_window(datetime.now())
+        if reason is not None:
+            if not args.force_window:
+                print(f"**拒绝部署**：现在是「{reason}」窗口，重启 jobs 会打断它。")
+                print("  等窗口过去，或确认无任务在跑时加 --force-window。")
+                return 1
+            print(f"警告：正在「{reason}」窗口内强推部署（--force-window）")
+
+    # **部署互斥锁**：两个部署同时在跑会互相污染回滚点。
+    # 后发者的「上一次验收通过镜像」可能是前发者尚未验完的镜像，
+    # 失败时回滚到已知坏版本的概率随之上升。
+    # `jobs/backup.py` 已有 flock 先例，这里用同一手法。
+    # `flock -n` 拿不到就立刻失败，不排队——排队会让"我以为在部署 A、
+    # 实际部署的是 B"更难排查。
+    lock_path = args.dir.rstrip("/") + "/.deploy.lock"
+    lock_holder = None
+    if not args.dry_run:
+        lock_holder = _acquire_deploy_lock(args.host, lock_path)
+        if lock_holder is None:
+            print("**拒绝部署**：另一个部署正在进行（远端锁 " + lock_path + " 被占）。")
+            print("  确认没有别的部署在跑后再试；卡死的锁会被下一个部署自动清掉。")
+            return 1
+
     check_clean(allow_dirty=args.allow_dirty)
     sha = _sha()
     tag = _git("describe", "--tags", "--exact-match", "HEAD").strip() \
@@ -721,6 +893,17 @@ def main(argv: list[str] | None = None) -> int:
     #从 tag推出期望版本（v0.2.124 →0.2.124）；没打 tag时为空（跳过版本比对）
     expected_version = tag[1:] if tag.startswith("v") and tag[1:2].isdigit() else ""
 
+    try:
+        return _deploy_body(args, expected_version, sha)
+    finally:
+        if lock_holder:
+            _release_deploy_lock(args.host, lock_path, lock_holder)
+
+
+def _deploy_body(args, expected_version: str = "", sha: str = "") -> int:
+    """`main()` 的后半段（拿锁之后）。单独成函数是为了用 `try/finally` 保证释放锁。"""
+    if not sha:
+        sha = _sha()
     with tempfile.TemporaryDirectory() as tmp:
         tarball = Path(tmp) / "src.tar.gz"
         build_archive(tarball)
@@ -756,7 +939,16 @@ def main(argv: list[str] | None = None) -> int:
             print(f"**上传或解压失败，部署中止（容器未动，无需回滚）**：{exc}")
             return 1
 
-    compose = ("docker compose -f deploy/docker-compose.yml --project-directory . ")
+    # **必须先 `unset TAG`**（评审抓到）：`docker-compose.yml` 里镜像名是
+    # `stock-screener:${TAG:-latest}`。运维 shell 里若 `export TAG=v0.2.133`，
+    # `build api` 产出的就是 `stock-screener:v0.2.133`，而 `_image_id()` 查的是
+    # `stock-screener:latest`（旧镜像）→ 验收判 FAIL → `rollback()` 把 rollback
+    # tag 打到 latest 再 `up -d`，但 compose 仍按 TAG 拉**新镜像**起容器，
+    # 于是"回滚"之后跑的还是新版本，状态完全错乱。
+    # `--project-name` 同理固定：`COMPOSE_PROJECT_NAME` 被改会让容器名与
+    # `verify_script` 里拼的 `stock-screener-{svc}-1` 对不上，变成假失败。
+    compose = ("env -u TAG docker compose -p " + PROJECT
+               + " -f deploy/docker-compose.yml --project-directory . ")
     # **不能 `build ... | tail -1`**：管道取的是 `tail` 的退出码，构建失败也会
     # 被当成成功，然后拿**旧镜像**重建容器并报告"已重启"——故障被完全掩盖。
     # 用 `bash -c 'set -o pipefail; …'`：SSH 的登录 shell 可能是 dash，
@@ -770,10 +962,10 @@ def main(argv: list[str] | None = None) -> int:
     risky = pending_risky_migrations(schema_before, SCHEMA_DIR)
     if risky:
         print("**本次部署包含不可逆迁移**：" + "、".join(risky))
-        print("先做一份 data/market.db.pre-upgrade（sqlite backup API，不是 cp）")
+        print("先做一份 data/market.db.pre-upgrade-<时间戳>（sqlite backup API，不是 cp）")
         bk = backup_before_upgrade(args.host, args.dir)
         if bk == "OK":
-            print("备份完成：data/market.db.pre-upgrade")
+            print("备份完成：data/market.db.pre-upgrade-<时间戳>（只保最近 3 份）")
         else:
             print("**备份失败**：" + bk)
             if not args.skip_backup:
@@ -809,8 +1001,16 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     # **提示保留配置与仓库默认值的差异**：不提示的话，仓库改了默认值而站点
     # 仍用旧值，运维会以为新值已经生效（v0.2.71→v0.2.72 的真实事故）。
-    _run(["ssh", "-o", "BatchMode=yes", args.host,
-          "bash -c " + _sh_quote(config_drift_script(args.dir))])
+    # **失败只警告，不能翻掉这次部署**：新版本此时已经上线、且已记入
+    # `.last_good_image`。这里抛 SystemExit 就成了「部署成功却以非零码结束」，
+    # 而退出码 1 的语义是「确认坏、已回滚」——值班会去回滚一个健康的版本。
+    drift = _capture(["ssh", "-o", "BatchMode=yes", args.host,
+                      "bash -c " + _sh_quote(config_drift_script(args.dir))])
+    if drift and CAPTURE_FAILED not in drift:
+        print(drift.rstrip())
+    elif CAPTURE_FAILED in drift:
+        print(f"（配置漂移提示取不到：{drift.split(CAPTURE_FAILED, 1)[1].strip()[:120]}，"
+              "不影响本次部署）")
        # **机器判定部署成功**：v0.2.114那次 jobs容器重启循环，deploy.py
     #打印一句「请自行核对 /healthz」就退出0，故障全靠人盯 docker ps才发现。
     # **取这次构建出来的镜像 ID**：验收时要比对容器跑的是不是它。

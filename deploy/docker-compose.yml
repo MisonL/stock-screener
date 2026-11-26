@@ -237,6 +237,25 @@ services:
     cpus: 0.2
     restart: unless-stopped
     init: true
+    # **隧道连接会卡死，而且自己恢复不了** —— 2026-11-26 实测：
+    # 容器 Up 41 小时后 4 条 QUIC 连接全部 `timeout: no recent network activity`，
+    # 之后一直「Retrying connection in up to 4-8s」但**再也没连上**，
+    # 公网整站 1033（Cloudflare 找不到源站）。重启容器后 precheck 立刻全绿。
+    # 容器一直挂着，`restart: unless-stopped` 不会触发（它没退出）。
+    #
+    # 所以必须有**外部可见的健康状态**：开 metrics 端点，
+    # `/ready` 只在「已连上 edge」时返回 200。`jobs` 的心跳会读它并告警。
+    command: >-
+      tunnel --no-autoupdate --config /etc/cloudflared/config.yml
+      --metrics 0.0.0.0:2000 run
+    healthcheck:
+      # **不能用 `cloudflared tunnel info`**：那要额外的 API 凭据。
+      # `/ready` 是它自带的就绪端点，连不上 edge 时返回非 200。
+      test: ["CMD", "cloudflared", "tunnel", "--metrics", "0.0.0.0:2000", "ready"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     depends_on:
       - api
       - ntfy

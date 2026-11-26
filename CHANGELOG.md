@@ -1,5 +1,49 @@
 ## [Unreleased]
 
+###修复（生产事故：整站 1033，隧道卡死后自己恢复不了）
+
+2026-11-26 16:07 部署后外部探活报 `HTTP 530 / error code 1033`。
+排查结果：`api`/`jobs` 都 healthy、主机出网正常（`curl cloudflare.com` → 200），
+但 `cloudflared` 容器 **Up 41 小时**后 4 条 QUIC 连接全部
+`timeout: no recent network activity`，之后一直「Retrying in 4-8s」
+**再也没连上**：
+
+```
+ERR Failed to dial a quic connection ... connIndex=3
+ERR Connection terminated ... accept stream listener error ... connIndex=0
+```
+
+`restart cloudflared` 之后 precheck 立刻全绿、站点恢复。
+
+- **根因是"看起来正常"**：进程没崩，容器状态一直是 `Up`，
+  `restart: unless-stopped` 只对"进程退出"生效，Docker 不会动它。
+  也就是说这 40 多分钟里 `docker ps` 一切正常，唯一的信号是"用户发现打不开"。
+- 给 `cloudflared` 加 `--metrics` 端点与 healthcheck（问 `/ready`，
+  隧道没连上就返回非 200），隧道死掉时状态会显示 `(unhealthy)`。
+- RUNBOOK 新增 §9.3.1 记录这个故障形态与恢复命令。
+
+**⚠️ 一个必须知道的结构性弱点**：`ntfy` 推送走的是**同一条隧道**，
+隧道断的时候 `jobs` 发的告警**也发不出去**——告警通道和故障源一起死。
+所以这类故障只能靠人看公网或看 `docker ps`，不能指望告警。
+要根治得给自愈加 `docker.sock`（autoheal 那类），但那等于把 root 交给一个
+容器，与最小暴露面的取舍冲突，**暂不做**（同机 `langbot_box` 挂着
+`docker.sock`，本项目不挂）。这条已写进 RUNBOOK。
+
+###修复（部署窗口判断用了本机时区）
+
+`in_blocked_window()` 传的是 `datetime.now()`——**跑脚本那台机器的本地时区**。
+在 UTC 环境（CI、跳板机、容器）里，北京时间 16:40 会被算成 08:40，
+正好落进「盘前 08:35–09:10」窗口，于是**所有部署都被莫名拦住**；
+而生产（在上海的笔记本上跑）一切正常。这类环境相关差异极难排查
+（本轮就是先被它绊了一下：一个回滚用例莫名失败）。
+
+改为 `_sh_now()`，显式用 `Asia/Shanghai`，不依赖进程时区。
+用例断言：把进程时区改成 UTC 后仍拿到上海时间。
+
+###测试
+
+81.4 全量 **1478 passed, 3 skipped**。
+
 ## [0.2.140] - 2026-11-26
 
 第三轮自查（Codex 那轮超时没出结论，这几条是我按它提的怀疑方向自己验出来的）。

@@ -769,8 +769,24 @@ def _release_deploy_lock(host: str, lock_path: str, token: str) -> None:
         pass
 
 
+#: 交易所/运维口径的时区。**不能依赖"跑脚本那台机器的本地时区"**：
+#: 这个脚本可能在 UTC 机器（CI、跳板机、容器）上跑，那样 16:40 会被算成
+#: 08:40，正好落进盘前窗口——实测在 UTC 的测试容器里就是这么误拦的。
+SH_TZ = "Asia/Shanghai"
+
+
+def _sh_now() -> datetime:
+    """上海时区的当前时间（naive，便于和窗口元组比较）。"""
+    from zoneinfo import ZoneInfo
+
+    return datetime.now(ZoneInfo(SH_TZ)).replace(tzinfo=None)
+
+
 def in_blocked_window(now: datetime) -> str | None:
-    """当前是否落在"不该部署"的窗口里；返回原因，不在窗口返回 `None`。"""
+    """`now`（**上海时间**）是否落在"不该部署"的窗口里；返回原因，否则 `None`。
+
+    调用方请用 `_sh_now()`，不要用 `datetime.now()`。
+    """
     hm = (now.hour, now.minute)
     for start, end, reason in DEPLOY_BLOCK_WINDOWS:
         # 支持跨零点（这里暂时没有，但写对边界更安全）
@@ -897,7 +913,7 @@ def main(argv: list[str] | None = None) -> int:
     # 会重启 jobs，而 EOD（约 3 分钟）、每日备份（约 8 分钟）正在写库/拷文件时
     # 被杀，代价是数据缺失。2026-11-24 就是这么丢了当晚备份。
     if not args.dry_run:
-        reason = in_blocked_window(datetime.now())
+        reason = in_blocked_window(_sh_now())
         if reason is not None:
             if not args.force_window:
                 print(f"**拒绝部署**：现在是「{reason}」窗口，重启 jobs 会打断它。")
@@ -953,7 +969,7 @@ def _assert_not_in_window(args, when: str) -> bool:
     """
     if args.dry_run or getattr(args, "force_window", False):
         return False
-    reason = in_blocked_window(datetime.now())
+    reason = in_blocked_window(_sh_now())
     if reason is None:
         return False
     print(f"**中止部署（{when}）**：现在进入「{reason}」窗口，"

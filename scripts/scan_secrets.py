@@ -155,6 +155,10 @@ def find(line: str) -> list[str]:
         if rx.search(line):
             hits.append(f"令牌 {rx.pattern[:24]}…")
     for m in _URL_CRED.finditer(line):
+        # **同样要放过文档里的行内代码**：CHANGELOG 写 `` `scheme://user:password@host` ``
+        # 是在说明规则，不是真的连接串（第一次提交就踩了）。
+        if _inside_backticks(line, m.start()):
+            continue
         if not _NOT_A_SECRET.search(m.group(1)):
             hits.append(f"连接串里带口令 {m.group(0)[:32]}")
     if not _looks_like_code_line(line):

@@ -1335,3 +1335,40 @@ def test_window_abort_does_not_trigger_rollback(monkeypatch):
                         lambda h, d, s: (ro.append(1), (True, "OK"))[1])
     deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"])
     assert ro == [], "窗口中止后不该回滚"
+
+
+def test_window_check_uses_shanghai_time_not_the_local_machine():
+    """**窗口判断必须用上海时间，不能依赖跑脚本那台机器的时区。**
+
+    真实踩坑：测试容器是 UTC，`datetime.now()` 在北京时间 16:40 返回 08:40，
+    正好落进「盘前 08:35–09:10」窗口 —— 于是所有部署用例都被莫名拦下，
+    而生产（在上海的笔记本上跑）一切正常。这种环境相关的差异极难排查。
+    """
+    from zoneinfo import ZoneInfo
+
+    import datetime as _dt
+
+    now_sh = _dt.datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
+    got = deploy._sh_now()
+    # 微秒会流逝，比较容差即可（重点是**不是 UTC**：差 8 小时会立刻暴露）
+    assert abs((got - now_sh).total_seconds()) < 5, \
+        f"_sh_now() 返回的不是上海时间：{got} vs {now_sh}"
+
+
+def test_sh_now_is_timezone_independent(monkeypatch):
+    """把进程时区改成 UTC 后，`_sh_now()` 仍然给上海时间。"""
+    import os
+    import time as _time
+    from zoneinfo import ZoneInfo
+
+    monkeypatch.setenv("TZ", "UTC")
+    _time.tzset()
+    try:
+        import datetime as _dt
+
+        expect = _dt.datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
+        got = deploy._sh_now()
+        assert abs((got - expect).total_seconds()) < 5, f"UTC 下拿到了 {got}"
+    finally:
+        monkeypatch.delenv("TZ", raising=False)
+        _time.tzset()

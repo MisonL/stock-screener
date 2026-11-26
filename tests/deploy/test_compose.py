@@ -193,3 +193,24 @@ def test_jobs_has_grace_period_longer_than_its_longest_task():
         else:
             secs = float(t)
     assert secs >= 120, f"jobs 的 stop_grace_period={grace}，EOD/备份会被强杀"
+
+
+def test_cloudflared_has_a_healthcheck_that_detects_a_dead_tunnel():
+    """**隧道卡死必须能被看见。**
+
+    2026-11-26 真实故障：`cloudflared` Up 41 小时后 4 条 QUIC 连接全断，
+    之后一直重试但再也没连上，公网整站 1033；而 `docker ps` 显示 `Up`，
+    因为进程没退出、`restart: unless-stopped` 不会触发。
+    没有健康检查时，唯一的信号是"用户发现网站打不开"。
+    """
+    svc = _compose()["services"]["cloudflared"]
+    hc = svc.get("healthcheck")
+    assert hc, "cloudflared 没有 healthcheck，隧道卡死时状态仍然是 Up"
+    test = hc["test"]
+    joined = " ".join(test) if isinstance(test, list) else str(test)
+    # 必须真的问"隧道连上了吗"，而不是只判进程活着
+    assert "ready" in joined, f"健康检查没判隧道就绪状态：{joined}"
+    # metrics 端点得开，否则 ready 探针无处可问
+    cmd = svc.get("command") or ""
+    cmd = " ".join(cmd) if isinstance(cmd, list) else cmd
+    assert "--metrics" in cmd, f"没开 metrics 端点，/ready 探不到：{cmd}"

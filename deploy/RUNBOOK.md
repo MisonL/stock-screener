@@ -560,6 +560,52 @@ git checkout main
    基座在本地有缓存后，`build` 不再需要联网。
 3. 因此部署后一律用 `/healthz` 的 `version` 复验，别信命令的退出码。
 
+### 9.3.1 整站 1033（Cloudflare 找不到源站）
+
+**症状**：公网 URL 返回 Cloudflare 错误页 `Error 1033`（Tunnel error），
+但 `docker ps` 里所有容器都是 `Up`。
+
+**真实案例（2026-11-26）**：`cloudflared` 容器 **Up 41 小时**后，4 条 QUIC
+连接全部 `timeout: no recent network activity`，之后一直
+`Retrying connection in up to 4-8s`，**再也没连上**：
+
+```
+ERR Failed to dial a quic connection error="failed to dial to edge with quic:
+    timeout: no recent network activity" connIndex=3
+ERR Connection terminated error="accept stream listener error: failed to accept
+    QUIC stream: timeout: no recent network activity" connIndex=0
+```
+
+同时主机出网正常（`curl https://www.cloudflare.com` → 200），
+`api`/`jobs` 都 healthy。**重启 cloudflared 后 precheck 立刻全绿、站点恢复。**
+
+**处理**：
+
+```bash
+cd ~/stock-screener
+env -u TAG docker compose -p stock-screener -f deploy/docker-compose.yml restart cloudflared
+curl -s https://stock.431695.xyz/healthz      # 应返回 {"ok":true,...}
+```
+
+**为什么必须手工**：`restart: unless-stopped` 只在**进程退出**时生效，
+而这个故障里容器一直活着（进程没崩），Docker 不会动它。
+`cloudflared` 镜像基于 distroless（没有 `sh`/`wget`），也放不了自愈脚本。
+
+**现在能看见它了**：`cloudflared` 加了 healthcheck（读 metrics 的 `/ready`），
+隧道断了会显示 `(unhealthy)`，而不是像以前一样显示 `Up`：
+
+```bash
+docker ps --format '{{.Names}} {{.Status}}' | grep cloudflared
+```
+
+**⚠️ 一个必须知道的结构性弱点**：`ntfy` 推送走的是**同一条隧道**。
+隧道断的时候，`jobs` 发的告警**也发不出去**——告警通道和故障源一起死。
+所以这类故障只能靠"人看公网"或"人看 `docker ps`"，不能指望告警。
+
+要根治得给自愈加 `docker.sock`（例如 autoheal 容器），但那等于把
+root 权限交给一个容器，与"最小暴露面"的取舍冲突，目前**不做**：
+同机上 `langbot_box` 挂着 `docker.sock`，本项目不挂。
+
 ### 9.3.2 不能部署的时间窗口
 
 `scripts/deploy.py` 会拒绝在下列窗口部署，除非显式加 `--force-window`：

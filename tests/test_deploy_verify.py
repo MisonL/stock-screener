@@ -264,6 +264,13 @@ def test_build_failure_also_rolls_back(monkeypatch, capsys):
     monkeypatch.setattr(deploy, "_sha", lambda: "deadbeef")
     monkeypatch.setattr(deploy, "_has_tag", lambda: False)
     monkeypatch.setattr(deploy, "build_archive", _noop_archive)
+    # ⚠️⚠️ 危险窗口必须桩掉（2026-11-26）：本用例断言的是"build 失败也要
+    # 回滚"，与**跑测试的时刻**无关。原来漏了这一条，于是 CI 在
+    # `(8,35)~(9,10)` 那 35 分钟里必红 —— `[实测]` 08:35:47Z 那轮正是
+    # 撞上窗口起点，部署被拒、`_run` 一次都没调用，报的却是
+    # 「构建失败但没有回滚」。一天红 35 分钟的用例，等于没有这条门禁。
+    # 走 `_patch_common` 的用例都带着这条桩，这条手写的漏了。
+    monkeypatch.setattr(deploy, "in_blocked_window", lambda now: None)
     monkeypatch.setattr(deploy, "snapshot_image", lambda h, d: "MARKER")
     monkeypatch.setattr(deploy, "_run", boom)
     monkeypatch.setattr(deploy, "config_drift_script", lambda d: "true")
@@ -1028,6 +1035,12 @@ def test_dry_run_is_never_blocked(monkeypatch, capsys):
                         lambda now: "每日备份")
     monkeypatch.setattr(deploy, "build_archive", _fake_archive)
     # 工作区可能真的有改动（本仓库日常状态），用 --allow-dirty 隔离掉
+    #
+    # ⚠️ 取 HEAD 也要桩掉（2026-11-26）：本用例断言的是"窗口校验不影响
+    # --dry-run"，与仓库状态无关。原来真去跑 `git rev-parse`，CI 的容器里
+    # 有 git 却没有 `.git`，于是退出 128 —— 一条**窗口**用例被**仓库**环境
+    # 拖红（main 上长期如此）。与被测行为无关的依赖一律桩掉。
+    monkeypatch.setattr(deploy, "_sha", lambda: "deadbeef")
     assert deploy.main(["--host", "h", "--dir", "/srv/app", "--dry-run",
                         "--allow-dirty"]) == 0
 
@@ -1372,3 +1385,34 @@ def test_sh_now_is_timezone_independent(monkeypatch):
     finally:
         monkeypatch.delenv("TZ", raising=False)
         _time.tzset()
+def test_every_main_call_stubs_the_block_window():
+    """**凡调用 `deploy.main()` 的用例，都必须桩掉危险窗口。**
+
+    2026-11-26：`test_build_failure_also_rolls_back` 漏了这条桩，而 CI 恰好
+    在 `(8,35)~(9,10)` 窗口里跑（容器是 UTC），部署被拒、`_run` 一次都没调用，
+    于是报「构建失败但没有回滚」。**一天必红 35 分钟**的用例，等于这条门禁
+    根本不存在——而且红的时候指向的是"回滚逻辑坏了"，带人去查错的地方。
+
+    判据落在机制上：不是记住"下次别忘了"，而是每次都机械核对一遍。
+    走 `_patch_common()` 的自动带上这条桩，手写的必须自己写。
+    """
+    import ast
+    import inspect
+
+    src = inspect.getsource(sys.modules[__name__])
+    tree = ast.parse(src)
+    offenders = []
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef) or not node.name.startswith("test_"):
+            continue
+        body_src = ast.get_source_segment(src, node) or ""
+        if "deploy.main([" not in body_src:
+            continue
+        if ("in_blocked_window" in body_src
+                or "_patch_common(" in body_src
+                or "make_args" in body_src):
+            continue
+        offenders.append(node.name)
+    assert not offenders, (
+        f"这些用例调了 deploy.main() 却没桩危险窗口，"
+        f"在 (8,35)~(9,10) 那 35 分钟里必红：{offenders}")

@@ -316,7 +316,8 @@ def test_watch_hist_returns_most_recent_60_in_ascending_order(env):
             (20250101 + i, float(i), float(i), float(i), float(i), 1000, float(i)))
     env.conn.commit()
 
-    hist, _ma20 = env.tick._watch_hist("sh600001")
+    # `today` 传 20250171 → 造出的 70 根全部 < today，都会参与
+    hist, _ma20 = env.tick._watch_hist("sh600001", 20250171)
 
     assert len(hist) == 60, f"应该只取最近 60 根，实际 {len(hist)}"
     dates = [b.date for b in hist]
@@ -325,3 +326,38 @@ def test_watch_hist_returns_most_recent_60_in_ascending_order(env):
     assert hist[-1].date == 20250170, f"最后一根应是 20250170，实际 {hist[-1].date}"
     # 最近 60 根 = 第 11..70 根；第一根不是 20250101（那是"最早 60 根"的错误）
     assert hist[0].date == 20250111, f"第一根应是 20250111，实际 {hist[0].date}"
+
+
+def test_watch_hist_excludes_today_bar(env):
+    """**当天的 bar 不能进 `hist`**（2026-11-26 第二次修复）。
+
+    修好「升序」之后还有第二个静默通道：盘中/收盘后 `daily_bars` 里**已经有
+    今天这一根**（EOD 15:05 落库、或盘中实时写库）。于是 `hist[-1]` 变成今天
+    的收盘，而除权判据比的是 `abs(prev_close - hist[-1].close)`——那正好等于
+    **今天自己的涨跌**，几乎必然 > price_eps(0.011) → 自选股又整只静音。
+
+    `[实测]` 生产 20:11 取到 hist[-1]=1469.0（今天），prev_close=1474.84，
+    差 5.84 → `eval_watch` 返回 `[]`；13:55（今天这根还没落库）取到 1474.84，
+    差 0 → 正常。**同一个 bug 在一天里只在收盘后出现**，最难抓。
+
+    语义上也必须排除：`hist` 是"截至上一交易日"，今天的价格由实时的
+    `q.price` 提供；混进来等于把今天算两遍（MA20 与 recent 都被污染）。
+    """
+    for i in range(30):
+        env.conn.execute(
+            "INSERT INTO daily_bars (code, date, open, high, low, close, volume, amount, source)"
+            " VALUES ('sh600001', ?, ?, ?, ?, ?, ?, ?, 'test')",
+            (20250101 + i, float(i), float(i), float(i), float(i), 1000, float(i)))
+    # 今天这根：收盘价故意拉得很高，如果被算进来一定露馅
+    env.conn.execute(
+        "INSERT INTO daily_bars (code, date, open, high, low, close, volume, amount, source)"
+        " VALUES ('sh600001', 20250131, 999, 999, 999, 999, 1000, 999, 'test')")
+    env.conn.commit()
+
+    hist, ma20 = env.tick._watch_hist("sh600001", 20250131)
+
+    assert all(b.date < 20250131 for b in hist), \
+        f"今天的 bar 混进了 hist：{[b.date for b in hist][-3:]}"
+    assert hist[-1].date == 20250130, f"最后一根应是上一交易日，实际 {hist[-1].date}"
+    # MA20 也不能把今天的 999 算进去（否则会明显偏高）
+    assert ma20 < 100, f"MA20 把今天的 bar 算进去了：{ma20}"

@@ -257,13 +257,13 @@ class IntradayTick:
         for code, q in quotes.items():
             if code not in watch:
                 continue
-            hist, ma20 = self._watch_hist(code)
+            hist, ma20 = self._watch_hist(code, int(now.strftime("%Y%m%d")))
             out += eval_watch(q, hist, ma20, self.cfg.strategy.intraday, hm,
                               pct_threshold=watch[code],
                               price_eps=self.cfg.strategy.universe.price_eps)
         return out
 
-    def _watch_hist(self, code: str):
+    def _watch_hist(self, code: str, today: int):
         # **必须 ASC**：`core/intraday/watch_rules.py` 按「`hist[-1]` 是最近一根」
         # 来用（除权对齐的 `prev` 对照、`_crossed` 的 MA20 穿越基准、
         # `recent = hist[-extreme_days:]` 取最近 N 天）。
@@ -279,17 +279,31 @@ class IntradayTick:
         # **先取「最近 60 根」再按 ASC 排**：直接 `ORDER BY date ASC LIMIT 60`
         # 拿到的是**最早**的 60 根（2019 年那批），正好是要修的 bug 换了个方向。
         # 子查询 DESC 限 60 → 外层 ASC，才是「最近 60 根、最后一个是昨天」。
+        # **必须排除「当天」这根 bar**（2026-11-26 二次修复）。
+        #
+        # 修好 ASC 之后还有第二个静默通道：盘中/收盘后 `daily_bars` 里**已经有今天
+        # 这一根**（EOD 15:05 写入，或盘中实时落库）。于是 `hist[-1]` 变成今天的
+        # 收盘，而除权判据比的是 `abs(prev_close - hist[-1].close)` ——
+        # 那正好等于**今天自己的涨跌**，几乎必然 > 0.011 → 又整只静音。
+        # 实测：20:11 取到 hist[-1]=1469.0（今天），prev_close=1474.84，差 5.84
+        # → `eval_watch` 返回 []；而 13:55（今天这根还没落库）取到的是
+        # 1474.84，差 0 → 正常。
+        #
+        # 语义上也必须排除：`hist` 是"截至上一交易日"的历史，
+        # 今天的价格由实时的 `q.price` 提供，混进来等于把今天算两遍
+        # （MA20 与 `recent[-extreme_days:]` 都会被污染）。
         rows = self.conn.execute(
             "SELECT date, high, low, close FROM ("
             "  SELECT date, high, low, close FROM daily_bars"
-            "  WHERE code = ? ORDER BY date DESC LIMIT 60"
+            "  WHERE code = ? AND date < ? ORDER BY date DESC LIMIT 60"
             ") ORDER BY date ASC",
-            (code,)).fetchall()
+            (code, today)).fetchall()
         if not rows:
             return [], 0.0
         hist = [SimpleBar(r[0], r[1], r[2], r[3]) for r in rows]
         closes = [r[0] for r in self.conn.execute(
-            "SELECT close FROM daily_bars WHERE code=? ORDER BY date DESC LIMIT 20", (code,))]
+            "SELECT close FROM daily_bars WHERE code=? AND date < ?"
+            " ORDER BY date DESC LIMIT 20", (code, today))]
         ma20 = sum(closes) / len(closes)
         return hist, ma20
 

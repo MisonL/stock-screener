@@ -671,43 +671,49 @@ def _acquire_deploy_lock(host: str, lock_path: str) -> str | None:
     回到一个已知坏的版本。
 
     **为什么不用 `flock`**：`flock` 的锁属于**持有它的那个进程/文件描述符**。
-    部署是由**几十条独立 ssh 命令**组成的，`ssh 'flock -n 9'` 一退出锁就释放，
+    部署是由几十条独立 ssh 命令组成的，`ssh 'flock -n 9'` 一退出锁就释放，
     等于没锁。所以改用「锁文件 + 时间戳 + 陈旧判定」：
+      · `O_CREAT|O_EXCL` 原子创建，写入 pid 与时间戳；
+      · 已存在且未超过 `DEPLOY_LOCK_STALE_S` → 别人在部署，返回 `None`；
+      · 已存在但已过期 → 上次部署崩了没释放，抢占。
 
-      · 用 `O_CREAT|O_EXCL` 原子创建，同时写入 pid 与时间戳；
-      · 已存在且**未超过 `DEPLOY_LOCK_STALE_S`** → 视为别人在部署，返回 `None`；
-      · 已存在但**已过期** → 上次部署崩了没释放，直接抢占（并打日志）。
-
-    远程没有 python3 时**不阻塞部署**（返回空 token）：让部署因为缺个工具
-    彻底跑不了，比偶尔撞车更糟。
+    **判据必须是「整行精确等于」**：一度用一行式 `try:`（语法错误）拼脚本，
+    结果 traceback 把源码行回显出来，而源码里含 `SS_LOCK=BUSY` 这个字面量，
+    子串匹配就把它当成"锁被占"——**部署被一个不存在的锁拦住了**。
+    现在脚本是多行（真 newline，`_sh_quote` 的单引号会保留），
+    且只认 `out.splitlines()` 里完全相等的那一行。
     """
     stamp = f"{os.getpid()}-{int(datetime.now().timestamp())}"
-    code = (
-        "import os,sys,time;"
-        "p=sys.argv[1];"
-        "stale=float(sys.argv[2]);"
-        "now=time.time();"
-        "try:"
-        " fd=os.open(p,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o644);"
-        " os.write(fd,sys.argv[3].encode());os.close(fd);print('SS_LOCK=GOT')"
-        "except FileExistsError:"
-        " age=now-os.path.getmtime(p);"
-        " (print('SS_LOCK=STALE') or os.remove(p) or "
-        "  (lambda f:(os.write(f,sys.argv[3].encode()),os.close(f),print('SS_LOCK=GOT'))"
-        "   (os.open(p,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o644))))"
-        " if age>stale else print('SS_LOCK=BUSY')"
-    )
+    code = "\n".join([
+        "import os, sys, time",
+        "p, stale, tok = sys.argv[1], float(sys.argv[2]), sys.argv[3]",
+        "try:",
+        "    fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)",
+        "    os.write(fd, tok.encode()); os.close(fd)",
+        "    print('SS_LOCK=GOT')",
+        "except FileExistsError:",
+        "    age = time.time() - os.path.getmtime(p)",
+        "    if age > stale:",
+        "        os.remove(p)",
+        "        fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)",
+        "        os.write(fd, tok.encode()); os.close(fd)",
+        "        print('SS_LOCK=STALE')",
+        "        print('SS_LOCK=GOT')",
+        "    else:",
+        "        print('SS_LOCK=BUSY')",
+    ])
     out = _capture(["ssh", "-o", "BatchMode=yes", host,
                     "python3 -c " + _sh_quote(code) + " " + _sh_quote(lock_path) + " "
                     + _sh_quote(str(DEPLOY_LOCK_STALE_S)) + " " + _sh_quote(stamp)
                     + " || true"])
-    if "SS_LOCK=BUSY" in out:
+    lines = {ln.strip() for ln in out.splitlines()}
+    if "SS_LOCK=BUSY" in lines:
         return None
-    if "SS_LOCK=GOT" in out:
-        if "SS_LOCK=STALE" in out:
+    if "SS_LOCK=GOT" in lines:
+        if "SS_LOCK=STALE" in lines:
             print("提示：清掉了一个陈旧的部署锁（上次部署可能异常退出）")
         return stamp
-    print("提示：拿不到部署互斥锁（目标机缺 python3？），继续部署但并发需自行避免")
+    print("提示：拿不到部署互斥锁（目标机缺 python3 或脚本报错），继续部署但并发需自行避免")
     return ""
 
 

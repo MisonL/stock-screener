@@ -1210,3 +1210,36 @@ def test_lock_is_not_leaked_when_acquire_returns_empty(monkeypatch, capsys):
                         lambda host, path, tok: released.append(tok))
     assert deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"]) == 0
     assert released == [], f"空 token 不该触发释放：{released}"
+
+
+def test_lock_acquisition_uses_multiline_script(monkeypatch):
+    """**锁脚本必须是多行、且只认整行精确匹配。**
+
+    发生过一次真实故障：锁脚本用一行式 `try:` 拼出来（Python 语法错误），
+    traceback 把源码行回显到 stderr，而源码里含 `SS_LOCK=BUSY` 这个字面量——
+    子串匹配就把它当成"锁被占"，**部署被一个根本不存在的锁拦住了**。
+    """
+    seen = []
+    monkeypatch.setattr(deploy, "_capture",
+                        lambda cmd: (seen.append(cmd), "SS_LOCK=GOT")[1])
+    deploy._acquire_deploy_lock("h", "/srv/app/.deploy.lock")
+    cmd = seen[0][-1]
+    # 必须真的有换行（而不是一行式 try:）
+    assert "\n" in cmd, f"锁脚本是单行式，会语法错误：{cmd[:200]}"
+    assert "try:" in cmd
+
+
+def test_lock_traceback_containing_busy_literal_is_not_treated_as_busy(monkeypatch):
+    """**traceback 回显里的 `SS_LOCK=BUSY` 不能当成真的 BUSY。**
+
+    只做子串匹配时，任何把脚本原文打出来的报错都会被误判成"锁被占"。
+    必须按整行精确比较。
+    """
+    traceback_like = (
+        '  File "<string>", line 15\n'
+        "    print('SS_LOCK=BUSY')\n"
+        "SyntaxError: invalid syntax\n"
+    )
+    monkeypatch.setattr(deploy, "_capture", lambda cmd: traceback_like)
+    got = deploy._acquire_deploy_lock("h", "/srv/app/.deploy.lock")
+    assert got == "", f"把 traceback 回显当成了锁被占：{got!r}"

@@ -23,10 +23,12 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import select
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -688,86 +690,172 @@ DEPLOY_BLOCK_WINDOWS = (
 )
 
 
-#: 部署锁超过这么久没更新就视为**陈旧**（上次部署崩了没来得及释放）。
-#: 留 40 分钟：一次部署含构建（首次可能十几分钟）+ 验收 90 秒 + settle。
-DEPLOY_LOCK_STALE_S = 2400
+#: 等远端回一个"锁结果"的上限。超时就当拿不到——**不能无限等**：
+#: 远端脚本可能在 `flock` 成功之后、`echo` 之前卡住（hung mount、
+#: `~/.ssh/rc` 里挂住），此时控制台一行提示都没有，人只会以为"在构建"，
+#: 而远端可能**已经持着锁**，把别人也一起挡住。
+LOCK_RESULT_TIMEOUT_S = 30
+
+#: 远端噪声音符（ANSI 转义）。`~/.ssh/rc`、包装脚本的欢迎语都是写进会话
+#: **stdout** 的，会出现在我们的判定行之前。
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 
 
-def _acquire_deploy_lock(host: str, lock_path: str) -> str | None:
-    """在目标机上拿一个排他部署锁；拿到返回持有者 token，已被占返回 `None`。
+def _clean_remote_line(raw: str) -> str:
+    """剥掉 ANSI 转义并去空白——远端杂行不能污染"锁结果"的判定。"""
+    return _ANSI.sub("", raw).strip()
 
-    **为什么需要**：两个部署同时在跑会互相污染回滚点——后发者记录的
-    「上一次验收通过镜像」可能是前发者尚未验完的镜像，失败回滚时就可能
-    回到一个已知坏的版本。
 
-    **为什么不用 `flock`**：`flock` 的锁属于**持有它的那个进程/文件描述符**。
-    部署是由几十条独立 ssh 命令组成的，`ssh 'flock -n 9'` 一退出锁就释放，
-    等于没锁。所以改用「锁文件 + 时间戳 + 陈旧判定」：
-      · `O_CREAT|O_EXCL` 原子创建，写入 pid 与时间戳；
-      · 已存在且未超过 `DEPLOY_LOCK_STALE_S` → 别人在部署，返回 `None`；
-      · 已存在但已过期 → 上次部署崩了没释放，抢占。
+def _acquire_deploy_lock(host: str, lock_path: str):
+    """在目标机上拿**真正的排他锁**；拿到返回持有它的 ssh 子进程，被占返回 `None`。
 
-    **判据必须是「整行精确等于」**：一度用一行式 `try:`（语法错误）拼脚本，
-    结果 traceback 把源码行回显出来，而源码里含 `SS_LOCK=BUSY` 这个字面量，
-    子串匹配就把它当成"锁被占"——**部署被一个不存在的锁拦住了**。
-    现在脚本是多行（真 newline，`_sh_quote` 的单引号会保留），
-    且只认 `out.splitlines()` 里完全相等的那一行。
+    ## 为什么不再用「锁文件 + mtime 陈旧判定」
+
+    那个做法有 **TOCTOU**：抢占是「读 mtime → 删 → 重建」三步，两个进程可以
+    都判陈旧、都删除、都重建成功，各自以为自己拿到了锁。释放端
+    「读内容 → 比 token → 删」同理，慢部署结束时可能删掉**后来者**的锁。
+
+    ## 现在：`flock` 由一条常驻 ssh 会话持有
+
+    部署由几十条独立 ssh 命令组成，所以 `ssh 'flock -n 9'` 一退出锁就没了。
+    办法是让**一个** ssh 进程专门持锁：拿到 fd 9 上的 `flock` 之后，远端脚本
+    阻塞在 `read` 上不退出；本地一关 stdin，远端读到 EOF、脚本结束、fd 关闭、
+    **内核**释放锁。
+
+    ## 这条连接必须被当成"有生命的东西"对待
+
+    锁的正确性现在挂在一条**几乎不发数据**的 TCP 连接上，所以三件事缺一不可：
+
+    1. **保活**（`ServerAliveInterval`）：OpenSSH 默认的 `TCPKeepAlive` 走
+       `SO_KEEPALIVE`，Linux 首次探测在**两小时**空闲之后；而 NAT/防火墙的
+       空闲超时普遍是 5–30 分钟。首次构建十几分钟 + 验收 90 秒，这条最闲的
+       连接最可能被中间设备悄悄丢掉——锁随之释放，而部署**还在继续**，
+       于是又变成两个部署并行。保活让它保持活跃，断了也能被及时发现。
+    2. **读超时**：见 `LOCK_RESULT_TIMEOUT_S`。
+    3. **锁存活校验**：`_deploy_body` 在每个关键边界调 `_lock_lost()`，
+       断了就中止，绝不"锁没了还继续往下部署"。
+
+    ## 其它几个刻意的选择
+
+    · `-T`：不分配 pty。我们的 stdin 是数据通道，不是终端。
+    · `mkdir -p $(dirname $1)`：**全新目标机上第一次部署**时目录还不存在，
+      不建目录 `exec 9>` 会失败（实测 `NOFILE`），而新逻辑是 fail-closed，
+      会把首次部署硬挡住。
+    · 锁路径走**位置参数**（`bash -c <脚本> bash <锁路径>`），不拼进脚本正文：
+      路径里有 `"`/`$`/反引号时，拼进去会被远程 shell 解析。
+    · 判定只认**整行等于** `SS_LOCK=GOT`（先剥掉 ANSI 噪声，并跳过之前的杂行）。
+      一度用一行式 `try:` 拼脚本（Python 语法错误），traceback 把源码行回显
+      出来，而源码里含 `SS_LOCK=BUSY` 字面量，子串匹配就把它当"锁被占"——
+      **部署被一个根本不存在的锁拦住了**。
     """
-    stamp = f"{os.getpid()}-{int(datetime.now().timestamp())}"
-    code = "\n".join([
-        "import os, sys, time",
-        "p, stale, tok = sys.argv[1], float(sys.argv[2]), sys.argv[3]",
-        "try:",
-        "    fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)",
-        "    os.write(fd, tok.encode()); os.close(fd)",
-        "    print('SS_LOCK=GOT')",
-        "except FileExistsError:",
-        "    age = time.time() - os.path.getmtime(p)",
-        "    if age > stale:",
-        "        os.remove(p)",
-        "        fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)",
-        "        os.write(fd, tok.encode()); os.close(fd)",
-        "        print('SS_LOCK=STALE')",
-        "        print('SS_LOCK=GOT')",
-        "    else:",
-        "        print('SS_LOCK=BUSY')",
+    script = "\n".join([
+        "set -u",
+        # 目录可能还不存在（首次部署）；失败不致命，交给下面的 exec 报 NOFILE
+        'mkdir -p "$(dirname "$1")" 2>/dev/null || true',
+        'exec 9>"$1" || { echo SS_LOCK=NOFILE; exit 0; }',
+        "flock -n 9 || { echo SS_LOCK=BUSY; exit 0; }",
+        "echo SS_LOCK=GOT",
+        # **持锁**：阻塞读 stdin，直到本地关闭（或在 finally 里 kill）。
+        "while IFS= read -r _line; do :; done",
     ])
-    out = _capture(["ssh", "-o", "BatchMode=yes", host,
-                    "python3 -c " + _sh_quote(code) + " " + _sh_quote(lock_path) + " "
-                    + _sh_quote(str(DEPLOY_LOCK_STALE_S)) + " " + _sh_quote(stamp)
-                    + " || true"])
-    lines = {ln.strip() for ln in out.splitlines()}
-    if "SS_LOCK=BUSY" in lines:
-        return None
-    if "SS_LOCK=GOT" in lines:
-        if "SS_LOCK=STALE" in lines:
-            print("提示：清掉了一个陈旧的部署锁（上次部署可能异常退出）")
-        return stamp
-    print("提示：拿不到部署互斥锁（目标机缺 python3 或脚本报错），继续部署但并发需自行避免")
-    return ""
-
-
-def _release_deploy_lock(host: str, lock_path: str, token: str) -> None:
-    """释放部署锁。**只删自己那把**（内容等于自己的 token 才删）。
-
-    不看内容就删的话，一次慢部署结束时会把**后来者**的锁删掉。
-    释放失败不抛：部署已经结束了，为一句清理报错翻掉退出码不值得。
-    """
-    if not token:
-        return
-    # **单行、无 try/except**：`python3 -c '...'` 里塞换行要靠多层 shell 转义，
-    # 之前就踩过（`\n` 被当字面量）。用 `os.path.exists` 先判，避开 `FileNotFoundError`。
-    code = (
-        "import os,sys;"
-        "p,t=sys.argv[1],sys.argv[2];"
-        "(os.remove(p) if (os.path.exists(p) and open(p).read()==t) else None)"
-    )
+    argv = [
+        "ssh", "-T",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+        # 保活：20 秒探一次，连续 3 次没回应（≈60 秒）就判定连接已死
+        "-o", "ServerAliveInterval=20",
+        "-o", "ServerAliveCountMax=3",
+        host,
+        "bash -c " + _sh_quote(script) + " bash " + _sh_quote(lock_path),
+    ]
     try:
-        _capture(["ssh", "-o", "BatchMode=yes", host,
-                  "python3 -c " + _sh_quote(code) + " " + _sh_quote(lock_path) + " "
-                  + _sh_quote(token) + " || true"])
-    except Exception:                      # noqa: BLE001 —— 清理失败不影响结论
+        proc = subprocess.Popen(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, bufsize=1,
+            encoding="utf-8", errors="replace")
+    except OSError as exc:
+        print(f"**拒绝部署**：拿不到部署锁（无法启动 ssh：{exc}）。")
+        return None
+
+    deadline = time.monotonic() + LOCK_RESULT_TIMEOUT_S
+    noise = []
+    reason = ""
+    while time.monotonic() < deadline:
+        try:
+            ready, _, _ = select.select([proc.stdout], [], [], 1.0)
+        except (OSError, ValueError):
+            break
+        if not ready:
+            if proc.poll() is not None:      # 进程已退出，不会有更多输出
+                break
+            continue
+        raw = proc.stdout.readline()
+        if not raw:                          # EOF
+            break
+        line = _clean_remote_line(raw)
+        if line == "SS_LOCK=GOT":
+            if noise:
+                print("提示：远端在锁结果之前输出了杂行（已忽略）："
+                      + repr(noise[:3]))
+            return proc
+        if line == "SS_LOCK=BUSY":
+            reason = "另一个部署正在进行"
+            break
+        if line == "SS_LOCK=NOFILE":
+            reason = f"锁文件所在目录不可创建/不可写：{lock_path}"
+            break
+        if line:
+            noise.append(line[:120])
+
+    _shutdown_lock_proc(proc)
+    if not reason:
+        reason = (f"{LOCK_RESULT_TIMEOUT_S} 秒内没有拿到锁结果"
+                  if not noise else f"远端输出无法识别：{noise[:3]}")
+    print(f"**拒绝部署**：{reason}。")
+    print("  锁由内核持有、**不会残留**；确认没有别的部署在跑后再试。")
+    return None
+
+
+def _shutdown_lock_proc(proc) -> None:
+    """关掉持锁的 ssh：远端读到 EOF 就退出，锁随之释放。"""
+    if proc is None:
+        return
+    try:
+        if proc.stdin is not None and not proc.stdin.closed:
+            proc.stdin.close()
+    except (OSError, ValueError):
         pass
+    try:
+        proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _lock_lost(holder) -> bool:
+    """持锁的那条 ssh 还活着吗？**死了就等于锁没了。**
+
+    保活能发现死连接，但"发现"要几十秒；在它被发现之前，本地可能已经
+    `up -d --force-recreate` 完了。所以每个关键边界都要主动查一次。
+    """
+    return holder is not None and holder.poll() is not None
+
+
+def _release_deploy_lock(holder) -> None:
+    """释放部署锁。
+
+    **不用判断"是不是自己的锁"**：`flock` 挂在这条 ssh 的文件描述符上，
+    它只可能释放自己持有的那把，不存在删掉后来者的可能
+    （旧实现靠"内容等于自己的 token 才删"，那一步本身就是竞态）。
+
+    ⚠️ **不要 `rm` 锁文件**：`flock` 锁的是 inode，删掉文件后内核锁还挂在
+    那个已 unlink 的 inode 上，下一个部署新建同名文件会立刻拿到锁 → 两个
+    部署并行。锁只在持有进程退出时释放，"删文件解锁"等于绕过锁。
+    """
+    _shutdown_lock_proc(holder)
 
 
 #: 交易所/运维口径的时区。**不能依赖"跑脚本那台机器的本地时区"**：
@@ -924,8 +1012,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # **本地预检必须在拿锁之前**（Codex 评审）：`check_clean()` 在脏工作区时
     # 抛 `SystemExit`，如果那时已经拿到远端锁，`try/finally` 还没建立，
-    # 锁就留下来了——后面 40 分钟内谁都不能部署，而真正的错误还只是
-    # "工作区脏"这种小事。
+    # 锁就一直被那条 ssh 占着——别人谁都不能部署，而真正的错误还只是
+    # "工作区脏"这种小事。（换成 `flock` 之后不会"残留 40 分钟"了，
+    # 但预检失败还占着锁同样没道理。）
     check_clean(allow_dirty=args.allow_dirty)
     sha = _sha()
     tag = _git("describe", "--tags", "--exact-match", "HEAD").strip() \
@@ -945,15 +1034,13 @@ def main(argv: list[str] | None = None) -> int:
     if not args.dry_run:
         lock_holder = _acquire_deploy_lock(args.host, lock_path)
         if lock_holder is None:
-            print("**拒绝部署**：另一个部署正在进行（远端锁 " + lock_path + " 被占）。")
-            print("  确认没有别的部署在跑后再试；卡死的锁会被下一个部署自动清掉。")
-            return 1
+            return 1                       # 原因已在 _acquire_deploy_lock 里打印
 
     try:
-        return _deploy_body(args, expected_version, sha)
+        return _deploy_body(args, expected_version, sha, lock_holder)
     finally:
         if lock_holder:
-            _release_deploy_lock(args.host, lock_path, lock_holder)
+            _release_deploy_lock(lock_holder)
 
 
 def _assert_not_in_window(args, when: str) -> bool:
@@ -1010,7 +1097,8 @@ def composed_services_not_recreated(services: str) -> list[str]:
     return [svc for svc in declared if svc not in wanted]
 
 
-def _deploy_body(args, expected_version: str = "", sha: str = "") -> int:
+def _deploy_body(args, expected_version: str = "", sha: str = "",
+                 lock_holder=None) -> int:
     """`main()` 的后半段（拿锁之后）。单独成函数是为了用 `try/finally` 保证释放锁。"""
     if not sha:
         sha = _sha()
@@ -1085,6 +1173,10 @@ def _deploy_body(args, expected_version: str = "", sha: str = "") -> int:
     # **构建前再查一次窗口**（Codex 两轮都点这条）：入口那次检查可能是在
     # 23:24 通过的，而构建要几分钟——真正 `up -d --force-recreate` 时已在
     # 备份窗口内，jobs 被重启，正在拷的 1.3GB 备份被杀（2026-11-24 事故重演）。
+    if _lock_lost(lock_holder):
+        print("**中止部署（构建前）**：部署锁已丢失（持锁的 ssh 连接断了）。"
+              "可能有另一个部署介入，继续下去会污染回滚点。容器未动。")
+        return 1
     if _assert_not_in_window(args, "重建前"):
         return 1
     body = (f"set -o pipefail; cd {args.dir} && "
@@ -1132,6 +1224,10 @@ def _deploy_body(args, expected_version: str = "", sha: str = "") -> int:
     if args.no_verify:
         print("**已跳过验收**（--no-verify）：部署是否成功未经验证")
         return 0
+    if _lock_lost(lock_holder):
+        print("**验收跳过并中止**：部署锁在重启之后丢失了（持锁的 ssh 断开了）。"
+              "容器可能已经是新版本，请人工确认状态后再决定是否重跑。")
+        return 1
     image_id = _image_id(args.host)
     reason = verify_deployment(args.host, args.services, args.verify_wait,
         image_id=image_id, settle_s=args.settle)

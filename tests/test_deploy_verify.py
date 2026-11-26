@@ -50,8 +50,8 @@ def _patch_common(monkeypatch, verify="OK", rollback_ok=True, calls=None):
         lambda h, d: ["001_batch1.sql"])
     monkeypatch.setattr(deploy, "config_drift_script", lambda d: "true")
     # **部署互斥锁会真去 ssh**：默认替身成"拿到了"，再由专门的用例覆盖忙/闲。
-    monkeypatch.setattr(deploy, "_acquire_deploy_lock", lambda h, p: "tok-default")
-    monkeypatch.setattr(deploy, "_release_deploy_lock", lambda h, p, t: None)
+    monkeypatch.setattr(deploy, "_acquire_deploy_lock", lambda h, p: FakeLockProc())
+    monkeypatch.setattr(deploy, "_release_deploy_lock", lambda holder: None)
     # 危险窗口检查依赖当前时间：默认放行，由窗口用例单独覆盖。
     monkeypatch.setattr(deploy, "in_blocked_window", lambda now: None)
     monkeypatch.setattr(deploy, "verify_deployment",
@@ -271,6 +271,10 @@ def test_build_failure_also_rolls_back(monkeypatch, capsys):
     # 「构建失败但没有回滚」。一天红 35 分钟的用例，等于没有这条门禁。
     # 走 `_patch_common` 的用例都带着这条桩，这条手写的漏了。
     monkeypatch.setattr(deploy, "in_blocked_window", lambda now: None)
+    # **部署锁也必须是 fail-closed 的**：换成 flock 之后拿不到锁就返回 None，
+    # `main()` 会直接拒绝部署（不再"空 token 继续跑"）。本机跑测试时 ssh 不存在
+    # 或连不上，所以这里必须桩掉，否则用例验的是"锁拒绝了部署"而不是"回滚"。
+    monkeypatch.setattr(deploy, "_acquire_deploy_lock", lambda h, p: FakeLockProc())
     monkeypatch.setattr(deploy, "snapshot_image", lambda h, d: "MARKER")
     monkeypatch.setattr(deploy, "_run", boom)
     monkeypatch.setattr(deploy, "config_drift_script", lambda d: "true")
@@ -1191,78 +1195,193 @@ def test_deploy_refuses_when_another_deploy_holds_the_lock(monkeypatch, capsys):
     monkeypatch.setattr(deploy, "_acquire_deploy_lock", lambda host, path: None)
     rc = deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"])
     assert rc == 1, "锁被占时应该拒绝部署"
-    out = capsys.readouterr().out
-    assert "另一个部署正在进行" in out, out
+    # 提示文本由 `_acquire_deploy_lock()` 自己打印（见
+    # `test_lock_refuses_when_flock_reports_busy`），这里只断言"拒绝"这个行为，
+    # 否则把提示文案绑死在调用方，改文案就会连带弄红两条用例。
+
+
+def _stdout_pipe(lines):
+    """造一个**真管道**冒充 ssh 的 stdout。
+
+    `_acquire_deploy_lock` 用 `select.select([proc.stdout], ...)` 加读超时，
+    而 `StringIO` 没有 `fileno()`，`select` 会直接抛 → 被当成"拿不到锁"。
+    所以桩必须用真的 fd（写完就关写端，读端读完后自然 EOF）。
+    """
+    import os
+
+    r, w = os.pipe()
+    try:
+        os.write(w, "".join(lines).encode())
+    finally:
+        os.close(w)
+    return os.fdopen(r, "r", encoding="utf-8", errors="replace")
+
+
+class FakeLockProc:
+    """假装是那条持有 `flock` 的 ssh 子进程。"""
+
+    def __init__(self, first_line: str = "SS_LOCK=GOT"):
+        import io
+
+        self.stdin = io.StringIO()
+        self._line = first_line
+        self.waited = False
+        self.killed = False
+        self.stdout = self
+
+    def readline(self):
+        return self._line + "\n"
+
+    def wait(self, timeout=None):
+        self.waited = True
+        return 0
+
+    def poll(self):
+        """还活着 → 返回 None（`_lock_lost` 靠它判断）。"""
+        return None
+
+    def kill(self):
+        self.killed = True
 
 
 def test_deploy_releases_the_lock_even_when_verification_fails(monkeypatch):
     """**验收失败也必须释放锁**，否则下一次部署永远被自己挡住。"""
     _patch_common(monkeypatch, verify="FAIL:jobs起不来")
     released = []
-    monkeypatch.setattr(deploy, "_acquire_deploy_lock", lambda host, path: "tok-1")
+    monkeypatch.setattr(deploy, "_acquire_deploy_lock", lambda host, path: FakeLockProc())
     monkeypatch.setattr(deploy, "_release_deploy_lock",
-                        lambda host, path, tok: released.append(tok))
+                        lambda holder: released.append(holder))
     deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"])
-    assert released == ["tok-1"], f"部署失败后没释放锁：{released}"
+    assert len(released) == 1, f"部署失败后没释放锁：{released}"
 
 
-def test_lock_release_only_removes_its_own_lock(monkeypatch):
-    """释放时**必须只删自己那把**。
+def test_lock_uses_flock_on_a_long_lived_session(monkeypatch):
+    """**锁必须是内核 `flock`，不是"锁文件 + mtime 陈旧判定"。**
 
-    不看内容就删的话，一次慢部署结束时会把**后来者**的锁删掉，
-    于是两个部署又能同时跑——锁等于失效。
+    旧做法是 `O_CREAT|O_EXCL` + 40 分钟 mtime 判定，抢占要「读 mtime → 删 →
+    重建」三步，两个进程可以都判陈旧、都重建成功，各自以为自己拿到了锁
+    （**TOCTOU**）；释放端「读内容 → 比 → 删」同理，慢部署结束时会删掉
+    后来者的锁。
+
+    新做法：一条 ssh 常驻持有 fd 9 上的 `flock`，远端脚本阻塞在 `read` 上
+    不退出；本地关 stdin → 远端 EOF → 进程退出 → 内核释放。
+    没有 TOCTOU，也没有"陈旧锁"。
     """
-    seen = []
-    monkeypatch.setattr(deploy, "_capture",
-                        lambda cmd: (seen.append(" ".join(cmd)), "")[1])
-    deploy._release_deploy_lock("h", "/srv/app/.deploy.lock", "tok-42")
-    script = seen[0]
-    # 必须做内容比对，而不是无条件 os.remove
-    assert "open(p).read()==t" in script, f"没比对内容，会删掉别人的锁：{script}"
+    captured = {}
+
+    class Fake:
+        def __init__(self, *a, **kw):
+            captured["argv"] = a[0] if a else kw.get("args")
+            captured["kwargs"] = kw
+            import io
+            self.stdin = io.StringIO()
+            self.stdout = _stdout_pipe(["SS_LOCK=GOT\n"])
+            self.stderr = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(deploy.subprocess, "Popen", Fake)
+    got = deploy._acquire_deploy_lock("h", "/srv/app/.deploy.lock")
+    assert got is not None, "拿到锁却返回了 None"
+    argv = captured["argv"]
+    script = argv[-1]
+    assert "flock -n 9" in script, f"没用 flock：{script}"
+    # 必须持锁：阻塞读，不能拿完就退出
+    assert "read -r" in script, f"拿完就退出，锁等于没有：{script}"
+
+    # ⚠️ **`stdin=PIPE` 才是"持锁"的关键不变量**。改成 DEVNULL 时远端 `read`
+    # 立刻 EOF、脚本在 `echo SS_LOCK=GOT` 之后就退出，锁在拿到的一瞬间就释放，
+    # 互斥等于没有——而只断言脚本文本的话，这个变异**测不出来**。
+    import subprocess as _sp
+
+    assert captured["kwargs"].get("stdin") is _sp.PIPE, \
+        f"锁连接没有 stdin=PIPE，远端会立刻 EOF 释放锁：{captured['kwargs']}"
+
+    # 空闲连接必须保活：NAT/防火墙的空闲超时 5–30 分钟，
+    # 而首次构建十几分钟 + 验收 90 秒，这条最闲的连接最容易被悄悄丢掉。
+    joined = " ".join(argv)
+    assert "ServerAliveInterval" in joined, \
+        f"持锁连接没有保活，会被中间设备悄悄断掉：{joined}"
+
+    # 锁路径必须走**位置参数**，不能拼进脚本正文：
+    # 路径含 `"`/`$`/反引号时，拼进去会被远端 shell 解析（也会直接语法错）。
+    # 判据：路径在整条远端命令里只出现**一次**（就是那个位置参数），
+    # 脚本正文里用的是 `"$1"`。
+    assert joined.count("/srv/app/.deploy.lock") == 1, (
+        f"锁路径被拼进脚本正文了（应只作为位置参数出现一次）：{joined}")
+    assert '"$1"' in joined, f"脚本没有用位置参数取锁路径：{joined}"
 
 
-def test_lock_is_not_leaked_when_acquire_returns_empty(monkeypatch, capsys):
-    """拿不到锁（目标机缺 python3）时放行，但不该在结束时去删别人的锁。"""
-    _patch_common(monkeypatch, verify="OK")
-    released = []
-    monkeypatch.setattr(deploy, "_acquire_deploy_lock", lambda host, path: "")
-    monkeypatch.setattr(deploy, "_release_deploy_lock",
-                        lambda host, path, tok: released.append(tok))
-    assert deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"]) == 0
-    assert released == [], f"空 token 不该触发释放：{released}"
+def test_lock_refuses_when_flock_reports_busy(monkeypatch):
+    """`flock -n` 失败即 BUSY —— 必须当成"别人在部署"并中止。"""
+    class Fake:
+        def __init__(self, *a, **kw):
+            import io
+            self.stdin = io.StringIO()
+            self.stdout = _stdout_pipe(["SS_LOCK=BUSY\n"])
+            self.stderr = None
+        def wait(self, timeout=None):
+            return 0
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(deploy.subprocess, "Popen", Fake)
+    assert deploy._acquire_deploy_lock("h", "/l") is None
 
 
-def test_lock_acquisition_uses_multiline_script(monkeypatch):
-    """**锁脚本必须是多行、且只认整行精确匹配。**
+def test_lock_failure_never_falls_back_to_unlocked_deploy(monkeypatch, capsys):
+    """**拿不到锁一律中止**，不能"继续部署、并发自行避免"。
 
-    发生过一次真实故障：锁脚本用一行式 `try:` 拼出来（Python 语法错误），
-    traceback 把源码行回显到 stderr，而源码里含 `SS_LOCK=BUSY` 这个字面量——
-    子串匹配就把它当成"锁被占"，**部署被一个根本不存在的锁拦住了**。
+    旧实现在拿不到锁（如目标机缺 python3）时会把 token 置空并**继续部署**，
+    打印一句"并发需自行避免"——那句话等于没有锁。
     """
-    seen = []
-    monkeypatch.setattr(deploy, "_capture",
-                        lambda cmd: (seen.append(cmd), "SS_LOCK=GOT")[1])
-    deploy._acquire_deploy_lock("h", "/srv/app/.deploy.lock")
-    cmd = seen[0][-1]
-    # 必须真的有换行（而不是一行式 try:）
-    assert "\n" in cmd, f"锁脚本是单行式，会语法错误：{cmd[:200]}"
-    assert "try:" in cmd
+    class Fake:
+        def __init__(self, *a, **kw):
+            import io
+            self.stdin = io.StringIO()
+            self.stdout = _stdout_pipe([])          # 没有任何输出
+            self.stderr = None
+        def wait(self, timeout=None):
+            return 0
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(deploy.subprocess, "Popen", Fake)
+    assert deploy._acquire_deploy_lock("h", "/l") is None
+    out = capsys.readouterr().out
+    assert "拒绝部署" in out, out
 
 
-def test_lock_traceback_containing_busy_literal_is_not_treated_as_busy(monkeypatch):
+def test_lock_output_is_matched_as_a_whole_line_not_substring(monkeypatch):
     """**traceback 回显里的 `SS_LOCK=BUSY` 不能当成真的 BUSY。**
 
-    只做子串匹配时，任何把脚本原文打出来的报错都会被误判成"锁被占"。
-    必须按整行精确比较。
+    真实故障：锁脚本用一行式 `try:` 拼（语法错误），traceback 把源码行回显，
+    而源码里含 `SS_LOCK=BUSY` 字面量，子串匹配就把它当"锁被占"——
+    **部署被一个根本不存在的锁拦住了**。现在只认整行等于 `SS_LOCK=GOT`。
     """
-    traceback_like = (
-        '  File "<string>", line 15\n'
-        "    print('SS_LOCK=BUSY')\n"
-        "SyntaxError: invalid syntax\n"
-    )
-    monkeypatch.setattr(deploy, "_capture", lambda cmd: traceback_like)
-    got = deploy._acquire_deploy_lock("h", "/srv/app/.deploy.lock")
-    assert got == "", f"把 traceback 回显当成了锁被占：{got!r}"
+    class Fake:
+        def __init__(self, *a, **kw):
+            import io
+            self.stdin = io.StringIO()
+            self.stdout = _stdout_pipe([
+                '  File "<string>", line 15\n',
+                "    print('SS_LOCK=BUSY')\n",
+                "SyntaxError: invalid syntax\n"])
+            self.stderr = None
+        def wait(self, timeout=None):
+            return 0
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(deploy.subprocess, "Popen", Fake)
+    assert deploy._acquire_deploy_lock("h", "/l") is None, "把 traceback 回显当成了拿到锁"
 
 
 def test_backup_failure_text_must_not_contain_command_source(monkeypatch):
@@ -1466,3 +1585,155 @@ def test_deploy_prints_the_full_manual_command_with_project_directory(monkeypatc
     assert "--project-directory ." in cmd, (
         f"命令漏了 --project-directory .，./cf 会解析成 deploy/cf → 整站 1033：{cmd}")
     assert "force-recreate" in cmd and "cloudflared" in cmd, cmd
+
+
+def test_shutdown_lock_proc_closes_stdin_so_the_remote_releases(monkeypatch):
+    """释放锁 = **关掉 stdin**，让远端 `read` 读到 EOF 后退出。
+
+    这条路径之前完全没有直接覆盖（`test_deploy_releases_the_lock...` 把
+    `_release_deploy_lock` 整个桩掉了，只证明 `finally` 被执行，不证明
+    stdin 真的被关）。stdin 没关的话远端会一直挂着——锁永远不释放。
+    """
+    class Proc:
+        def __init__(self):
+            import io
+            self.stdin = io.StringIO()
+            self.waited = False
+            self.killed = False
+        def wait(self, timeout=None):
+            self.waited = True
+            return 0
+        def kill(self):
+            self.killed = True
+
+    p = Proc()
+    deploy._shutdown_lock_proc(p)
+    assert p.stdin.closed, "没有关闭 stdin，远端会一直持锁"
+    assert p.waited and not p.killed
+
+
+def test_shutdown_lock_proc_kills_a_hung_connection():
+    """远端不响应（wait 超时）时必须 kill，不能卡在释放上。"""
+    import subprocess as _sp
+
+    class Proc:
+        def __init__(self):
+            import io
+            self.stdin = io.StringIO()
+            self.kills = 0
+        def wait(self, timeout=None):
+            if self.kills == 0:
+                raise _sp.TimeoutExpired("ssh", timeout)
+            return 0
+        def kill(self):
+            self.kills += 1
+
+    p = Proc()
+    deploy._shutdown_lock_proc(p)
+    assert p.kills == 1, "超时后没有 kill，释放会一直卡住"
+
+
+def test_shutdown_lock_proc_tolerates_none():
+    deploy._shutdown_lock_proc(None)      # 不该抛
+
+
+def test_lock_timeout_when_remote_never_answers(monkeypatch, capsys):
+    """**远端一直不回应必须超时中止**，不能无限阻塞。
+
+    远端可能在 `flock` 成功之后、`echo` 之前卡住（hung mount、
+    `~/.ssh/rc` 里挂住）。此时一行提示都没有，人只会以为"在构建"，
+    而远端**可能已经持着锁**，把别人也一起挡住。
+    """
+    class Silent:
+        def __init__(self, *a, **kw):
+            import io
+            self.stdin = io.StringIO()
+            self.stdout = _stdout_pipe([])     # 立刻 EOF，等价于"没有结果"
+            self.stderr = None
+        def poll(self):
+            return 0
+        def wait(self, timeout=None):
+            return 0
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(deploy.subprocess, "Popen", Silent)
+    monkeypatch.setattr(deploy, "LOCK_RESULT_TIMEOUT_S", 1)
+    assert deploy._acquire_deploy_lock("h", "/l") is None
+    assert "没有拿到锁结果" in capsys.readouterr().out
+
+
+def test_lock_ignores_remote_stdout_noise_before_the_result(monkeypatch):
+    """`~/.ssh/rc` 之类写进 stdout 的噪声不能让我们误判"没拿到锁"。
+
+    判据必须只认**整行等于** `SS_LOCK=GOT`，噪声行要跳过并回报，
+    而不是拿第一行去比。
+    """
+    class Noisy:
+        def __init__(self, *a, **kw):
+            import io
+            self.stdin = io.StringIO()
+            self.stdout = _stdout_pipe([
+                "Welcome to the box\n",
+                "\x1b[1;32mnotice\x1b[0m: rc script ran\n",
+                "SS_LOCK=GOT\n"])
+            self.stderr = None
+        def poll(self):
+            return None
+        def wait(self, timeout=None):
+            return 0
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(deploy.subprocess, "Popen", Noisy)
+    got = deploy._acquire_deploy_lock("h", "/l")
+    assert got is not None, "远端有噪声输出时拿不到锁"
+
+
+def test_lock_end_to_end_against_a_real_flock(monkeypatch):
+    """**真跑一次 flock**：验证"持锁期间第二个拿不到、关了 stdin 就释放"。
+
+    前面几条都是桩 Popen，验的是"我们有没有把参数传对"。这条用本地 `bash`
+    真起一次同款脚本，验的是**这套手法本身成立**——`flock` 挂在 fd 9 上、
+    子进程 `flock` 退出后锁仍由 shell 持着、stdin 关闭即释放。
+    """
+    import io
+    import os
+    import random
+    import subprocess as _sp
+
+    import pytest
+
+    if os.name != "posix":
+        pytest.skip("flock 只在 POSIX 上")
+    if _sp.run(["bash", "-c", "command -v flock"], capture_output=True).returncode:
+        pytest.skip("环境没有 flock")
+
+    lock = f"/tmp/ds-lock-{random.randint(1, 10**9)}.lock"
+    script = "\n".join([
+        "set -u",
+        'mkdir -p "$(dirname "$1")" 2>/dev/null || true',
+        'exec 9>"$1" || { echo SS_LOCK=NOFILE; exit 0; }',
+        "flock -n 9 || { echo SS_LOCK=BUSY; exit 0; }",
+        "echo SS_LOCK=GOT",
+        "while IFS= read -r _line; do :; done",
+    ])
+
+    def spawn():
+        return _sp.Popen(["bash", "-c", script, "bash", lock],
+                         stdin=_sp.PIPE, stdout=_sp.PIPE,
+                         stderr=_sp.DEVNULL, text=True)
+
+    p1 = spawn()
+    assert p1.stdout.readline().strip() == "SS_LOCK=GOT"
+    p2 = spawn()
+    assert p2.stdout.readline().strip() == "SS_LOCK=BUSY", "第二个也拿到了锁！"
+    p2.wait(timeout=10)
+
+    p1.stdin.close()                      # 释放
+    p1.wait(timeout=10)
+    p3 = spawn()
+    assert p3.stdout.readline().strip() == "SS_LOCK=GOT", "释放后拿不到锁"
+    p3.stdin.close()
+    p3.wait(timeout=10)
+    os.unlink(lock)

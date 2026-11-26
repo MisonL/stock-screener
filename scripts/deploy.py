@@ -939,6 +939,29 @@ def main(argv: list[str] | None = None) -> int:
             _release_deploy_lock(args.host, lock_path, lock_holder)
 
 
+def _assert_not_in_window(args, when: str) -> bool:
+    """在**真正重启 jobs 之前**再确认一次不在危险窗口里。
+
+    入口检查不够（Codex 两轮都点）：23:24 通过检查，构建跑到 23:31，
+    `up -d --force-recreate` 就直接把 jobs 重启了，而备份正在拷 1.3GB。
+    `stop_grace_period: 180s` 也救不了——备份要 8 分钟。
+
+    这里**直接中止**（返回 True，容器未动、不需要回滚），而不是等待：
+    等到窗口过去再继续会让部署卡十几分钟，运维会以为卡死。
+    返回 `True` 表示"应该中止"，由调用方决定退出码（**不抛异常**，
+    因为 `main()` 里抛 `SystemExit` 会绕过测试、也会绕过退出码语义）。
+    """
+    if args.dry_run or getattr(args, "force_window", False):
+        return False
+    reason = in_blocked_window(datetime.now())
+    if reason is None:
+        return False
+    print(f"**中止部署（{when}）**：现在进入「{reason}」窗口，"
+          "重启 jobs 会打断它。容器未动，代码已同步但未上线；"
+          "等窗口过去后重跑，或加 --force-window。")
+    return True
+
+
 def _deploy_body(args, expected_version: str = "", sha: str = "") -> int:
     """`main()` 的后半段（拿锁之后）。单独成函数是为了用 `try/finally` 保证释放锁。"""
     if not sha:
@@ -1011,6 +1034,11 @@ def _deploy_body(args, expected_version: str = "", sha: str = "") -> int:
                 return 1
             print("--skip-backup已指定，继续（风险自担）")
     snapshot_image(args.host, args.dir)
+    # **构建前再查一次窗口**（Codex 两轮都点这条）：入口那次检查可能是在
+    # 23:24 通过的，而构建要几分钟——真正 `up -d --force-recreate` 时已在
+    # 备份窗口内，jobs 被重启，正在拷的 1.3GB 备份被杀（2026-11-24 事故重演）。
+    if _assert_not_in_window(args, "重建前"):
+        return 1
     body = (f"set -o pipefail; cd {args.dir} && "
             f"{compose}build api 2>&1 | tail -1 && "
             f"{compose}up -d --force-recreate {args.services} 2>&1 | tail -3")

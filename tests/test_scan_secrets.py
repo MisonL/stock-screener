@@ -166,3 +166,40 @@ def test_does_not_flag_code_expressions():
         "secret = os.urandom(_SECRET_BYTES)",
     ]:
         assert find(line) == [], f"把代码当成凭据了：{line} → {find(line)}"
+
+
+def test_catches_short_alpha_and_suffixed_passwords():
+    """**Codex 第二轮指出的三类漏检**：短纯字母、带 `==`、带 `;`。
+
+    应用完全接受这些口令，而第一版的"含 `()[]{},;=` 就排除"把它们全滤掉了。
+    代码形态现在由**行级**预筛排除，不再靠值的字符去猜。
+    """
+    from scripts.scan_secrets import find
+
+    assert find("SS_WEB_PASS=abcdefghij")
+    assert find("SS_WEB_PASS=Abcdef12==")
+    assert find("SS_WEB_PASS=Abcdef12;")
+
+
+def test_backtick_quoted_doc_examples_are_not_config():
+    """**文档里解释规则不算泄漏**，否则一写 CHANGELOG 就把 CI 弄挂。
+
+    真实事故：我在 CHANGELOG 里举例说明"新规则能抓哪些口令"，把样本原样
+    抄了进去 → 全仓扫描命中 2 处 → CI 红。历史扫描还会把这些文本一起扫出来，
+    所以不能只靠"以后别这么写"。
+    """
+    from scripts.scan_secrets import find
+
+    # markdown 行内代码：在解释规则
+    assert find('漏掉了 `SS_WEB_PASS=correcthorsebatterystaple` 这种写法') == []
+    assert find('- 新增 `"NTFY_TOKEN": "tk_a1b2c3"` 的识别') == []
+    # 但**不在**反引号里的就是真配置，必须报
+    assert find('SS_WEB_PASS=correcthorsebatterystaple')
+
+
+def test_doc_placeholders_are_not_flagged():
+    """文档里的省略号/中文占位不是口令。"""
+    from scripts.scan_secrets import find
+
+    assert find("把 `tk_xxx` 填进 NTFY_TOKEN=... 里") == []
+    assert find("NTFY_TOKEN=值") == []

@@ -1295,3 +1295,43 @@ def test_backup_marker_must_be_a_standalone_line(monkeypatch):
 
     monkeypatch.setattr(deploy, "_capture", lambda cmd: "noise\nSS_BACKUP=OK\n")
     assert deploy.backup_before_upgrade("h", "/srv/app") == "OK"
+
+
+def test_window_is_rechecked_right_before_recreate(monkeypatch, capsys):
+    """**重建前必须再查一次窗口**（Codex 两轮都点这条）。
+
+    入口检查不够：23:24 通过，构建跑到 23:31，`up -d --force-recreate`
+    就直接把 jobs 重启了，而备份正在拷 1.3GB。`stop_grace_period: 180s`
+    也救不了——备份要 8 分钟。2026-11-24 就是这么丢的备份。
+    """
+    _patch_common(monkeypatch, verify="OK")
+    calls = {"n": 0}
+
+    def window(now):
+        calls["n"] += 1
+        # 第一次（入口）放行，第二次（重建前）已在窗口里
+        return None if calls["n"] == 1 else "每日备份（23:30 起，约 8 分钟）"
+
+    monkeypatch.setattr(deploy, "in_blocked_window", window)
+    rc = deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"])
+    assert rc == 1, "重建前进窗口时应该中止"
+    out = capsys.readouterr().out
+    assert "中止部署" in out and "重建前" in out, out
+    assert calls["n"] >= 2, "只查了一次窗口，重建前没复查"
+
+
+def test_window_abort_does_not_trigger_rollback(monkeypatch):
+    """窗口中止时容器**没动**，不该回滚（回滚会把健康版本换掉）。"""
+    _patch_common(monkeypatch, verify="OK")
+    calls = {"n": 0}
+
+    def window(now):
+        calls["n"] += 1
+        return None if calls["n"] == 1 else "每日备份"
+
+    monkeypatch.setattr(deploy, "in_blocked_window", window)
+    ro = []
+    monkeypatch.setattr(deploy, "rollback",
+                        lambda h, d, s: (ro.append(1), (True, "OK"))[1])
+    deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"])
+    assert ro == [], "窗口中止后不该回滚"

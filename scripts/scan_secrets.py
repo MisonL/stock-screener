@@ -57,26 +57,26 @@ def _looks_like_secret_value(val: str) -> bool:
     而应用完全接受它。现在只做三件事：
       1. 排除占位符/变量引用（`$VAR` / `${VAR}` / `changeme` / `xxx` / `<...>`）；
       2. 排除整个值就是布尔/开关词的；
-      3. 长度门槛（≥6，太短的不像口令）。
+      3. 长度门槛（≥8，太短的不像口令）。
+    代码形态不在这里判断——由 `_looks_like_code_line()` 在整行层面先筛掉。
     """
     if not val or _NOT_A_SECRET.search(val):
         return False
     if val.strip().lower() in _NOT_A_SECRET_WORDS:
         return False
-    if len(val) < 6:
+    if len(val) < 8:
         return False
-    # **代码形态一律排除**：`secret = ensure_secret(conn)`、
-    # `secret: bytes`、`api_key=self._api_key` 这些是**变量/函数调用**，
-    # 不是凭据。只看字符：出现括号/下标/逗号/分号就说明是表达式。
-    # 反斜杠也排除：`"TOKEN=abc\n"` 里的 `\n` 是**转义文本**，不是值的一部分
-    # （实测把 `tok-1` 这类短测试串误判成 6 字符凭据）。
-    if any(c in val for c in "()[]{},;=\\"):
+    # 反斜杠排除：`"TOKEN=abc\n"` 里的 `\n` 是**转义文本**，不是值的一部分。
+    if "\\" in val:
         return False
-    # 纯标识符（全字母 + 下划线/点，没有数字）几乎都是变量名，除非它足够长
-    # 到像一句 passphrase。`ensure_secret`（13）排除，
-    # `correcthorsebatterystaple`（25）保留。
-    has_digit = any(c.isdigit() for c in val)
-    return has_digit or len(val) >= 20
+    # **文档里的省略号/反引号/中文不是口令**：说明文字写 `KEY=tk_...`、
+    # `KEY=值` 会被当成赋值。省略号、反引号、非 ASCII 一律排除。
+    if "..." in val or "`" in val or not val.isascii():
+        return False
+    # **不再要求"含数字"**（Codex 第二轮）：纯字母口令同样会被应用接受，
+    # 必须能报。代码形态改由**行级预筛**排除（见 `_looks_like_code_line`），
+    # 不再靠"值里有没有括号/数字"去猜。
+    return True
 
 
 # 各家令牌的固定前缀 + 长度，命中即算泄漏（无法从上下文解释成别的东西）
@@ -102,15 +102,56 @@ PRIVATE_NETS = [ipaddress.ip_network(n) for n in (
 )]
 
 
+#: 整行出现这些就按**代码**处理，不走「密钥名赋值」规则。
+#:
+#: Codex 评审指出：靠"值里有没有数字/括号"区分代码与配置，既漏
+#: （纯字母口令）又误报。**行级**判断准确得多——一旦出现调用/定义语法，
+#: 整行就不是一条配置。
+_CODE_LINE = re.compile(
+    r"\(|\)|\bdef \b|\breturn \b|\blambda\b|\bself\.|->|"
+    r"\bimport \b|\bclass \b|\bos\.|\bconn\b|\bNone\b"
+)
+
+
+def _looks_like_code_line(line: str) -> bool:
+    """这一行是代码而不是配置吗？"""
+    return bool(_CODE_LINE.search(line))
+
+
+def _inside_backticks(line: str, pos: int) -> bool:
+    """`pos` 是否落在 markdown 的行内代码（`` `...` ``）里。
+
+    **文档示例与真实配置必须分开**：CHANGELOG / RUNBOOK 里写
+    `` `KEY=值` `` 是在**说明规则**，不是运维真的配了这个口令。
+    但 CI 的历史扫描会把旧提交里的这类文本一起扫出来，于是
+    「文档里解释一条规则」就会让门禁失败——第一次写这段说明时
+    我就是这么把 CI 弄挂了（Codex 抓到）。
+    """
+    open_at = -1
+    for i, ch in enumerate(line):
+        if ch != "`":
+            continue
+        if open_at < 0:
+            open_at = i
+        else:
+            if open_at < pos < i:
+                return True
+            open_at = -1
+    return False
+
+
 def find(line: str) -> list[str]:
     """返回这一行里命中的问题描述；空列表表示干净。"""
     hits = []
     for rx in TOKENS:
         if rx.search(line):
             hits.append(f"令牌 {rx.pattern[:24]}…")
-    for m in SECRET_NAMES.finditer(line):
-        if _looks_like_secret_value(m.group(1)):
-            hits.append(f"疑似密钥赋值 {m.group(0)[:40]}")
+    if not _looks_like_code_line(line):
+        for m in SECRET_NAMES.finditer(line):
+            if _inside_backticks(line, m.start()):
+                continue                      # 文档里在解释规则，不是真配置
+            if _looks_like_secret_value(m.group(1)):
+                hits.append(f"疑似密钥赋值 {m.group(0)[:40]}")
     for m in IPV4.finditer(line):
         try:
             ip = ipaddress.ip_address(m.group(1))

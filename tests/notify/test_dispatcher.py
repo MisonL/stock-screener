@@ -729,3 +729,25 @@ def test_repeated_alert_is_cooled_down(env):
     # 不同 kind 不受影响
     env.disp.alert("disk_full", "磁盘满了", "P0")
     assert len(env.ntfy.published) > after_first, "不同 kind 被错误地一起冷却了"
+
+
+def test_alert_returns_false_when_publish_failed(env, monkeypatch):
+    """**推送失败不能返回 True**（Codex 第二轮）。
+
+    `_push_rows()` 捕获发布异常后只把行记成 `failed`，然后照常返回（认领成功）。
+    `alert()` 原来无脑 `return True`，`_alert_disk` 于是把状态记成"已告警"，
+    之后同水位一直被去抖压住——**磁盘真涨上去也不会再有第二条**。
+    """
+    d = env.disp
+
+    class BrokenNtfy:
+        def publish(self, msg):
+            raise RuntimeError("ntfy 挂了")
+
+    d.ntfy = BrokenNtfy()
+    assert d.alert("disk_p2", "磁盘水位 82%（75% 以上，建议清理）", "P2") is False
+
+
+def test_alert_returns_true_when_delivered(env):
+    """正常送达要返回 True，否则去抖会把每轮都当成"没送到"而反复推。"""
+    assert env.disp.alert("disk_p2", "磁盘水位 82%", "P2") is True

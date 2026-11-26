@@ -216,7 +216,7 @@ class Dispatcher:
                        claim=True, enforce_cap=sig.level != "P0")
 
     def _push_log(self, row: dict, msg: Message, claim: bool = False,
-                  enforce_cap: bool = False) -> None:
+                  enforce_cap: bool = False) -> bool:
         """默认**不**受日额度约束。
 
         额度（`notify.daily_cap`）是给**行情信号**用的：防止「一只票一个异动推一条」
@@ -228,7 +228,7 @@ class Dispatcher:
         开始受额度限制——日额度打满后，P0 通道故障告警会被静默 `suppressed`。
         v0.2.68 的 `_push_rows` 里压根没有额度检查，这里恢复成那个语义。
         """
-        self._push_rows([row], msg, claim=claim, enforce_cap=enforce_cap)
+        return self._push_rows([row], msg, claim=claim, enforce_cap=enforce_cap)
 
     def _push_rows(self, rows: list[dict], msg: Message, claim: bool = False,
                    enforce_cap: bool = True) -> bool:
@@ -238,6 +238,12 @@ class Dispatcher:
         两边同时对同一个 signal 派发时，只有先提交的那一边能把行写成 `pending`；
         后到者看到 `seq_id` 已有 `pending/accepted` 行就放弃（返回 False），不再双发。
         """
+        # **上一次发布到底成没成**：`_push_rows` 的返回值语义是"这批行有没有
+        # 被我认领"，不是"有没有真的发出去"——发布失败也只记 `failed` 后
+        # 照常 `return True`。`alert()` 需要后者（Codex 第二轮指出：
+        # 推送失败仍会返回 True → 磁盘告警被记成"已告警"→ 之后一直静默）。
+        # 不改编返回值以免动到其它调用方的认领语义，用这个旁路标记。
+        self._last_pushed_ok = False
         now = self.clock.now().isoformat()
         # **必须 BEGIN IMMEDIATE**：`with conn` 是延迟事务，SELECT 不开启写事务，
         # api 与 jobs 会同时查到「没有」，然后同时插入——认领等于没做（实测双发 2 条）。
@@ -295,6 +301,7 @@ class Dispatcher:
             ntfy_id = self.ntfy.publish(msg)
             status, error = "accepted", None
             self._fail_streak = 0
+            self._last_pushed_ok = True
         except Exception as exc:                  # noqa: BLE001 —— 上游挂了也要记一行
             ntfy_id, status, error = None, "failed", str(exc)[:200]
             self._fail_streak += 1
@@ -393,12 +400,14 @@ class Dispatcher:
                               (f"{seq_id}%",)).fetchone()[0]
         if n:
             seq_id = f"{seq_id}-{n}"
-        self._push_log(row={"code": None, "kind": kind, "level": level, "seq_id": seq_id,
-                            "event_id": None, "signal_id": None, "segment": 1,
-                            "trade_date": self.clock.today()},
-                       msg=render_alert(kind, text, self.cfg, level=level,
-                                        secret=self.secret))
-        return True
+        claimed = self._push_log(
+            row={"code": None, "kind": kind, "level": level, "seq_id": seq_id,
+                 "event_id": None, "signal_id": None, "segment": 1,
+                 "trade_date": self.clock.today()},
+            msg=render_alert(kind, text, self.cfg, level=level, secret=self.secret))
+        # **只有真的发出去才返回 True**：认领成功 + 上游接受，两个条件都要满足。
+        # 额度被压掉（claimed=False）、发布失败（`_last_pushed_ok=False`）都算没送达。
+        return bool(claimed) and bool(getattr(self, "_last_pushed_ok", False))
 
     def open_brief(self, rows: list[BriefRow], n: int, overflow=None, pool_date=None,
                    baseline_days=None, auction_detections=None) -> None:

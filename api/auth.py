@@ -308,8 +308,13 @@ def _sweep(now: float) -> None:
     # "每个来源 IP 一条"，公网扫描会把它撑成无界字典；而且一旦超过
     # `MAX_TRACKED`，上面那个 `return` 条件就不成立 → **每个请求都做一次
     # O(N) 全量清扫**，反而成了放大器。这里按窗口起点丢最旧的（封锁中的保留）。
+    # **必须一次削到低水位**（Codex 第二轮）：只削到 `MAX_TRACKED` 的话，
+    # 容量会稳定卡在 MAX_TRACKED+1（本次扫前是 N+1，削掉 1 个又插入 1 个），
+    # 于是**每一次新来源都重新触发一次全表遍历 + 排序**——正好是我们要避免的
+    # O(N) 每请求开销。削到 80%，再涨回来要 2000 个新 key，摊销掉。
     if len(_hook_hits) > MAX_TRACKED:
-        overflow = len(_hook_hits) - MAX_TRACKED
+        target = int(MAX_TRACKED * 0.8)
+        overflow = len(_hook_hits) - target
         victims = sorted(
             ((k, v) for k, v in _hook_hits.items() if v[2] <= now),
             key=lambda kv: kv[1][0])[:overflow]

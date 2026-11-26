@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -978,6 +979,37 @@ def _assert_not_in_window(args, when: str) -> bool:
     return True
 
 
+#: 部署只重建这几个服务（`--services` 的默认值要与此一致）。
+DEFAULT_SERVICES = ("api", "jobs", "agent")
+
+
+def composed_services_not_recreated(services: str) -> list[str]:
+    """`docker-compose.yml` 里有、但本次**不会被重建**的服务。
+
+    **这是 2026-11-26 踩到的真坑**：给 `cloudflared` 改了 compose
+    （加 metrics / 加 protocol），跑 `deploy.py` 显示「验收通过」，
+    但 `cloudflared` **根本没被重建**——`--services` 默认只含
+    api/jobs/agent。于是 git 里的 compose 与实际运行的容器长期不一致，
+    而部署日志里一个字都没提。
+
+    更糟的是手工补重建时我自己漏了 `--project-directory .`，
+    `./cf` 解析成了 `deploy/cf`（空目录），容器一下子读不到 `config.yml`
+    **整站 1033**。所以提示里必须带完整命令，不能只说"记得重建一下"。
+    """
+    try:
+        text = (Path(__file__).parent.parent / "deploy" / "docker-compose.yml") \
+            .read_text(encoding="utf-8")
+    except OSError:
+        return []
+    # 只取 `services:` 段下的**两空格缩进键**。直接全文扫 `^  xxx:$` 会把
+    # `logging.options:` 之类的子键也算进来（实测列出过 `options`）。
+    m = re.search(r"(?ms)^services:\s*$\n(.*?)(?=^[a-z\w$]|\Z)", text)
+    block = m.group(1) if m else ""
+    declared = re.findall(r"(?m)^  ([a-z][a-z0-9_-]*):\s*$", block)
+    wanted = {x.strip() for x in services.split() if x.strip()}
+    return [svc for svc in declared if svc not in wanted]
+
+
 def _deploy_body(args, expected_version: str = "", sha: str = "") -> int:
     """`main()` 的后半段（拿锁之后）。单独成函数是为了用 `try/finally` 保证释放锁。"""
     if not sha:
@@ -1167,6 +1199,18 @@ def _deploy_body(args, expected_version: str = "", sha: str = "") -> int:
             print("**回退失败**： " + code)
             print("→立即手工处理，见 RUNBOOK §9")
         return 1
+    skipped = composed_services_not_recreated(args.services)
+    if skipped:
+        print("注意：本次只重建了 " + args.services + "，下面这些服务"
+              "的 compose 改动**没有生效**：" + "、".join(skipped))
+        print("  它们是常驻基础设施，重建会短暂中断（cloudflared 断隧道、"
+              "ntfy 断推送），所以没有放进默认流程。")
+        print("  如果这次确实改了它们的配置，部署完手动重建（**必须带 "
+              "--project-directory .**，否则 ./cf 会解析成 deploy/cf）：")
+        print("    cd " + args.dir + " && env -u TAG docker compose -p " + PROJECT
+              + " --project-directory . -f deploy/docker-compose.yml"
+              " up -d --force-recreate " + " ".join(skipped))
+
     print(f"提示：{len(PRESERVE_ON_TARGET)}个站点配置保留在目标机未被覆盖；"
         "改了仓库默认值时请按上面的提示手工同步，或用 --show-config对比")
     return 0

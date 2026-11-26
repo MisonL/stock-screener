@@ -1416,3 +1416,53 @@ def test_every_main_call_stubs_the_block_window():
     assert not offenders, (
         f"这些用例调了 deploy.main() 却没桩危险窗口，"
         f"在 (8,35)~(9,10) 那 35 分钟里必红：{offenders}")
+
+
+def test_warns_about_services_that_the_deploy_will_not_recreate():
+    """**部署没重建的服务必须说出来。**
+
+    2026-11-26 真坑：给 `cloudflared` 改了 compose（加 metrics / 加 protocol），
+    跑 `deploy.py` 显示「验收通过」，但 `cloudflared` **根本没被重建**——
+    `--services` 默认只含 api/jobs/agent。git 里的 compose 与实际运行的容器
+    长期不一致，而部署日志一个字都没提。
+
+    更糟的是手工补重建时漏了 `--project-directory .`，`./cf` 被解析成
+    `deploy/cf`（空目录），容器读不到 `config.yml`，**整站 1033**。
+    所以提示必须带**完整命令**，不能只说"记得重建一下"。
+    """
+    skipped = deploy.composed_services_not_recreated("api jobs agent")
+    assert "cloudflared" in skipped, f"没提示 cloudflared 没被重建：{skipped}"
+    assert "ntfy" in skipped, f"没提示 ntfy 没被重建：{skipped}"
+    assert "api" not in skipped, "把已经重建的服务也算进未重建了"
+    # 不能把 compose 里 logging 之类的子键当成服务
+    assert "options" not in skipped, f"把子键当成服务了：{skipped}"
+
+    # 全量重建时不该有任何"未重建"
+    assert deploy.composed_services_not_recreated(
+        "api jobs agent ntfy backfill cloudflared") == []
+
+
+def test_deploy_prints_the_full_manual_command_with_project_directory(monkeypatch, capsys):
+    """提示里的命令必须带 `--project-directory .`。
+
+    漏了它，`./cf` 会解析成 `deploy/cf`（空目录）→ cloudflared 读不到配置
+    → 整站 1033。这是当天真实发生的第二次故障。
+    """
+    _patch_common(monkeypatch, verify="OK")
+    monkeypatch.setattr(deploy, "in_blocked_window", lambda now: None)
+    rc = deploy.main(["--host", "h", "--dir", "/srv/app", "--settle", "0"])
+    assert rc == 0, f"部署应成功，实际 {rc}"
+    out = capsys.readouterr().out
+    assert "没有生效" in out, out
+    assert "cloudflared" in out, out
+
+    # **必须断言「命令那一行」**，不能只看整个输出。
+    # 提示语的散文部分本身就写着 `--project-directory .**`（在解释为什么需要它），
+    # 于是 `"--project-directory ." in out` 在命令-line 丢了参数时**照样通过**
+    # —— 实测把命令里的参数删掉后，弱断言仍然绿。要精确到以 `cd ` 开头那行。
+    cmd_lines = [ln for ln in out.splitlines() if ln.strip().startswith("cd ")]
+    assert cmd_lines, f"没有打印手工重建命令：{out}"
+    cmd = cmd_lines[0]
+    assert "--project-directory ." in cmd, (
+        f"命令漏了 --project-directory .，./cf 会解析成 deploy/cf → 整站 1033：{cmd}")
+    assert "force-recreate" in cmd and "cloudflared" in cmd, cmd

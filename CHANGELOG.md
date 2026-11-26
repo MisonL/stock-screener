@@ -1,5 +1,29 @@
 ## [Unreleased]
 
+###修复（部署从没重建过 cloudflared / ntfy，而且一个字都没提）
+
+`deploy.py` 的 `--services` 默认只有 `api jobs agent`，所以
+**`cloudflared` / `ntfy` / `backfill` 的 compose 改动永远不会随部署生效**，
+而部署日志只说"验收通过"。
+
+2026-11-26 就是这么踩的：给 `cloudflared` 加了 metrics 与 `protocol: http2`，
+`deploy.py` 报验收通过，但 `cloudflared` **还是旧容器**（`Up About an hour`），
+git 里的 compose 与实际运行的状态长期不一致。
+
+- 新增 `composed_services_not_recreated()`：部署成功后列出"compose 里有、
+  但本次没重建"的服务，并打印**完整可复制**的手工命令。
+- 提示里的命令**必须带 `--project-directory .`**：我手工补重建时漏了它，
+  `./cf` 被解析成 `deploy/cf`（空目录）→ 容器读不到 `config.yml`
+  → **整站 1033**。这是当天第二次故障，起因是"补做一次本该自动的事"。
+- 用例外加了一条**精确到命令行**的断言。第一版写成
+  `"--project-directory ." in out` 是**假绿**：提示语的散文部分本身就写着
+  这个参数（在解释为什么需要它），命令里删掉它断言照样通过。
+  变异验证后改成只检查以 `cd ` 开头那一行。
+
+###测试
+
+81.4 全量 **1491 passed, 3 skipped**。
+
 ## [0.2.145] - 2026-11-26
 
 ###修复（自选股静默的**第二个**通道：当天的 bar 混进了历史）

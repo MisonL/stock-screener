@@ -304,6 +304,18 @@ def _sweep(now: float) -> None:
     # `window_start` 最早），再用海量其它 IP 撑爆 dict，自己那条就会作为
     # 「最旧」被丢掉，封锁立即解除——等于给他一个解锁按钮。
     # 封锁最多持续 BLOCK_S 秒，所以它们最终都会被窗口清理掉，不会累积。
+    # **`_hook_hits` 也要有硬容量**（Codex 评审）：它和 `_fails` 一样是
+    # "每个来源 IP 一条"，公网扫描会把它撑成无界字典；而且一旦超过
+    # `MAX_TRACKED`，上面那个 `return` 条件就不成立 → **每个请求都做一次
+    # O(N) 全量清扫**，反而成了放大器。这里按窗口起点丢最旧的（封锁中的保留）。
+    if len(_hook_hits) > MAX_TRACKED:
+        overflow = len(_hook_hits) - MAX_TRACKED
+        victims = sorted(
+            ((k, v) for k, v in _hook_hits.items() if v[2] <= now),
+            key=lambda kv: kv[1][0])[:overflow]
+        for k, _v in victims:
+            _hook_hits.pop(k, None)
+
     if len(_fails) > MAX_TRACKED:
         over = len(_fails) - MAX_TRACKED
         evictable = sorted(

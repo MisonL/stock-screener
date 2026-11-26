@@ -605,3 +605,83 @@ def test_disk_alert_resets_after_falling_below_the_warning_line(conn):
     # 再次越线：必须能立刻喊（不被上次的 82% 压掉）
     cl._alert_disk(D(), 82.5, conn)
     assert len(calls) == 2, f"再次越线没告警：{calls}"
+
+
+def test_disk_state_not_recorded_when_alert_was_not_delivered(conn):
+    """**没送达就不能记「已告警」**（Codex 评审）。
+
+    `Dispatcher.alert()` 在维护模式或 30 分钟去重时直接返回 False，推送失败
+    也只记 `failed`。原来先写状态再发，于是"记成已告警、其实一条都没送达"，
+    之后同水位一直被去抖压着——磁盘真涨上去也不会再有第二条。
+    """
+    from jobs import cleanup as cl
+
+    sent = []
+
+    class NotDelivered:
+        """模拟维护模式/去重：一条都没发出去。"""
+
+        def alert(self, kind, text, level="P1"):
+            sent.append(kind)
+            return False
+
+    for _ in range(3):
+        cl._alert_disk(NotDelivered(), 82.0, conn)
+    # 三次都尝试了（说明去抖没有压掉重试）
+    assert len(sent) == 3, f"未送达后应该每轮都重试，实际只试了 {len(sent)} 次"
+    # 但状态没有被记成"已告警"
+    assert cl._disk_state(conn) == (None, None), "未送达却记了已告警状态"
+
+    # 送达之后才记
+    class Delivered:
+        def alert(self, kind, text, level="P1"):
+            return True
+
+    cl._alert_disk(Delivered(), 82.0, conn)
+    assert cl._disk_state(conn)[0] == "disk_p2"
+
+
+def test_catch_up_backup_after_midnight_when_last_night_was_missed(tmp_path):
+    """**午夜后启动也要补**（Codex 评审）。
+
+    11-24 23:30 备过 → 11-25 晚漏备 → 11-26 00:10 才重启。
+    此时"今天"是 11-26、还没到 23:30（条件①不成立），最新备份只陈旧约
+    25 小时（条件②的 29 小时也不成立）→ 两个条件都不触发，
+    一直等到 11-26 23:30，间隔接近 **48 小时**。
+
+    条件③「上一个已过去的 23:30 之后没有新备份」才能兜住这个形态。
+    """
+    made, _root, _ = _setup(tmp_path, "2026-11-26 00:10",
+                            existing=[("20261124", "2026-11-24 23:30")])
+    assert made is not None, "昨天漏备、今天凌晨启动，却没有补备份"
+
+
+def test_catch_up_backup_is_not_repeated_right_after_tonight_backup(tmp_path):
+    """当晚 23:31 刚备完，重启不该再备一次（条件③不能太激进）。"""
+    made, _root, _ = _setup(tmp_path, "2026-11-25 23:40",
+                            existing=[("20261125", "2026-11-25 23:31")])
+    assert made is None, "刚备完又补了一次"
+
+
+def test_catch_up_backup_runs_when_backup_dir_is_missing(tmp_path):
+    """**备份目录不存在也要补**：那正是最需要备份的状态。
+
+    原来 `if not root.is_dir(): return None`，于是"backups 目录被误删"
+    或首次部署时永远不补。
+    """
+    from datetime import datetime as _dt
+
+    from core.clock import FixedClock
+    from core.db import connect, migrate
+    from jobs.backup import catch_up_missed_backup
+
+    conn = connect(tmp_path / "c.db")
+    migrate(conn)
+    conn.execute(
+        "INSERT INTO pool(trade_date, market, code, rank, score, factors, box_days,"
+        " box_high_adj, box_low_adj, box_high_raw, box_low_raw, close_raw, box_vol_mean, pos_in_box)"
+        " VALUES (20261119,'cn_main','sh600519',1,82.9,'{}',40,10.14,9.86,10.14,9.86,10.04,6e6,0.5)")
+    conn.commit()
+    assert not (tmp_path / "backups").exists()
+    made = catch_up_missed_backup(conn, tmp_path, FixedClock(_dt(2026, 11, 25, 23, 40)))
+    assert made is not None, "备份目录不存在时没有补备"

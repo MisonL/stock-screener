@@ -126,3 +126,43 @@ def test_does_not_flag_placeholders_and_variable_references():
         "SECRET_NAME=my-secret-name-here",   # 名字里含 secret，但值是标识符
     ]:
         assert find(line) == [], f"误报：{line} → {find(line)}"
+
+
+def test_catches_passphrases_and_pure_numeric_passwords():
+    """**纯字母口令和纯数字口令都要抓到**（Codex 评审抓到的漏检）。
+
+    原来要求"必须同时有数字和字母"，于是 `correcthorsebatterystaple`
+    （很典型的 passphrase）和 `12345678` 全部漏检——而应用完全接受它们。
+    """
+    from scripts.scan_secrets import find
+
+    assert find("SS_WEB_PASS=correcthorsebatterystaple")
+    assert find("SS_WEB_PASS=12345678")
+
+
+def test_catches_quoted_json_style_keys():
+    """**带引号的键名也要抓到**：`"SS_WEB_PASS": "..."` 是 JSON/YAML 常见写法。"""
+    from scripts.scan_secrets import find
+
+    assert find('"SS_WEB_PASS": "Abcdef12"')
+    assert find("'NTFY_TOKEN': 'tk_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6'")
+
+
+def test_does_not_flag_code_expressions():
+    """**代码形态一律不能误报**（放宽规则后实测误报 39 处）。
+
+    `secret = ensure_secret(conn)`、`secret: bytes`、`api_key=self._api_key`
+    是变量/函数调用，不是凭据。只看字符就能区分：出现括号/下标/逗号/分号
+    就说明是表达式。
+    """
+    from scripts.scan_secrets import find
+
+    for line in [
+        "secret = ensure_secret(conn)",
+        "def issue_session(secret: bytes, exp_ts: int) -> str:",
+        "api_key = api_key",
+        "self._api_key = api_key",
+        "secret=SECRET, cfg=CFG, exp_ts=exp)",
+        "secret = os.urandom(_SECRET_BYTES)",
+    ]:
+        assert find(line) == [], f"把代码当成凭据了：{line} → {find(line)}"

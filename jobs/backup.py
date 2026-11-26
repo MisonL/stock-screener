@@ -10,7 +10,7 @@ import fcntl # POSIX-only；本项目只跑 Linux容器
 import logging
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -229,14 +229,15 @@ def catch_up_missed_backup(conn, data_dir, clock, *, keep: int =7,
     from datetime import time as _time
 
     root = Path(data_dir) / "backups"
-    if not root.is_dir():
-        return None
+    # **目录不存在也要补**（Codex 评审）：原来直接返回 None，于是
+    # "backups 目录被误删/首次部署"这种最需要备份的场景反而永远不补。
+    # `backup_db` 自己会建目录（它本来就写 `out_dir / ...`）。
     now = clock.now()
     today_file = root / f"market-{now.strftime('%Y%m%d')}.db"
 
     conflict = False
     if not today_file.exists() and now.time() >= _time(BACKUP_HOUR, BACKUP_MINUTE):
-        conflict = True                              # 条件①：当晚过点还没备
+        conflict = True                              # 条件①：今晚过点还没备
 
     if not conflict:
         newest = sorted(root.glob("market-*.db"),
@@ -244,8 +245,27 @@ def catch_up_missed_backup(conn, data_dir, clock, *, keep: int =7,
         if newest:
             age_h = (now.timestamp() - newest[0].stat().st_mtime) / 3600
             conflict = age_h > stale_h               # 条件②：已经断档
-        elif root.is_dir():
+        else:
             conflict = True                          # 一份都没有：必须立刻备
+
+    if not conflict:
+        # **条件③：按「最近一次该执行的 23:30」判断**（Codex 评审）。
+        #
+        # 前两个条件都在"今天"这条轴上想问题，漏掉了这个形态：
+        # 11-24 23:30 备过 → 11-25 晚漏备 → 11-26 00:10 才重启。
+        # 此时"今天"是 11-26、还没到 23:30（条件①不成立），而最新备份只陈旧
+        # 约 25 小时（条件②的 29 小时也不成立）→ 两个条件都不触发，
+        # 一直要等到 11-26 23:30，间隔接近 48 小时。
+        #
+        # 正确判据：把 `now` 回退到"上一个已经过去的 23:30"，如果
+        # **最新备份早于那个时刻**，就说明那一轮漏了。
+        due = now.replace(hour=BACKUP_HOUR, minute=BACKUP_MINUTE,
+                          second=0, microsecond=0)
+        if due > now:
+            due -= timedelta(days=1)
+        newest_ts = max((p.stat().st_mtime for p in root.glob("market-*.db")),
+                        default=0.0)
+        conflict = newest_ts < due.timestamp()
 
     if not conflict:
         return None

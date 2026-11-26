@@ -361,7 +361,7 @@ class Dispatcher:
     #: 同一 `kind` 的告警多久内不重复发（秒）。`api/watchdog.py` 的 `REPEAT_S` 是同一量级。
     ALERT_REPEAT_S = 1800
 
-    def alert(self, kind: str, text: str, level: str = "P1") -> None:
+    def alert(self, kind: str, text: str, level: str = "P1") -> bool:
         """运维告警。**同 kind 30 分钟内只发一次**。
 
         起因：`agent/main.py` 的主循环 `except Exception` 里会调 `alert`，
@@ -369,12 +369,16 @@ class Dispatcher:
         几分钟就能把 `notify.daily_cap` 烧穿；额度一满，**真正的告警也被压掉**。
         watchdog 自己早就有 30 分钟冷却（`api/watchdog.py::_alert`），
         这条路径没有，属于同一个问题只修了一半。
+
+        **返回值**：`True` = 真的发了一条；`False` = 被维护模式/30 分钟去重
+        跳过，**这次没有送达**。调用方若要记录"已经告警过"，必须看返回值——
+        否则会出现"记成已告警、但其实一条都没发出去"，之后一直静默。
         """
         # 维护模式（备份/回填/演练）期间不告警：那段时间的失败是预期的
         flag = self.conn.execute(
             "SELECT value FROM job_state WHERE name = 'maintenance.flag'").fetchone()
         if flag is not None and str(flag[0]) == "1":
-            return
+            return False
         now = self.clock.now()
         # 冷却判据用 **`status='accepted'` 或 `suppressed`**：发成功要冷却，
         # 被额度压掉的也算"已经尝试过"——否则额度满时反而每 2 秒重试一次。
@@ -383,7 +387,7 @@ class Dispatcher:
             "SELECT 1 FROM push_log WHERE kind = ? AND status IN ('accepted','suppressed')"
             " AND ts > ? LIMIT 1", (kind, cutoff)).fetchone()
         if recent is not None:
-            return
+            return False
         seq_id = f"alert-{kind}-{int(now.timestamp())}"
         n = self.conn.execute("SELECT count(*) FROM push_log WHERE seq_id LIKE ?",
                               (f"{seq_id}%",)).fetchone()[0]
@@ -394,6 +398,7 @@ class Dispatcher:
                             "trade_date": self.clock.today()},
                        msg=render_alert(kind, text, self.cfg, level=level,
                                         secret=self.secret))
+        return True
 
     def open_brief(self, rows: list[BriefRow], n: int, overflow=None, pool_date=None,
                    baseline_days=None, auction_detections=None) -> None:

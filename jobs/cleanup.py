@@ -115,7 +115,9 @@ def cleanup(conn, clock, dispatcher=None, data_dir: str = "/app/data") -> dict[s
     used = disk_used_pct(data_dir)
     out["disk_used_pct"] = None if used is None else int(used)
     if dispatcher is not None:
-        _alert_disk(dispatcher, used)
+        # **必须传 `conn`**（Codex 评审）：不传就绕过了去抖，每日 cleanup 会在
+        # 稳态水位下**再推一条**，把 10 分钟巡检的去抖白做。
+        _alert_disk(dispatcher, used, conn)
     return out
 
 
@@ -209,9 +211,15 @@ def _alert_disk(dispatcher, used: float | None, conn=None) -> None:
             log.debug("磁盘仍处 %s 档（%.1f%%，上次 %.1f%%），不重复告警",
                       kind, used, last_pct)
             return
-        _save_disk_state(conn, kind, used)
 
-    dispatcher.alert(kind, text, level)
+    # **先发再记状态**（Codex 评审）：`Dispatcher.alert()` 会在维护模式、
+    # 30 分钟去重时直接返回、也可能推送失败。原来先写状态再发，
+    # 于是"记成已告警、其实一条都没送达"，之后同水位一直被去抖压着——
+    # 磁盘真涨上去也不会有第二条。
+    # 返回 `False` 表示这次没送到：不记状态，下一轮（10 分钟后）还会再试。
+    delivered = dispatcher.alert(kind, text, level)
+    if conn is not None and delivered is not False:
+        _save_disk_state(conn, kind, used)
 
 
 def check_disk(conn, dispatcher=None, path: str | None = None) -> float | None:

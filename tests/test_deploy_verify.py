@@ -1148,17 +1148,24 @@ def test_build_command_pins_tag_and_project_name():
     src = (Path(__file__).resolve().parents[1] / "scripts" / "deploy.py"
            ).read_text(encoding="utf-8")
     tree = ast.parse(src)
-    # `compose` 的赋值在 `main()` 拆出来的 `_deploy_body()` 里
+    # 现在 compose 命令统一由 `compose_cmd()` 构造（正向部署与回滚共用），
+    # 两处都去调用它——这里查那个唯一构造点。
     fn = next(n for n in ast.walk(tree)
-              if isinstance(n, ast.FunctionDef) and n.name == "_deploy_body")
+              if isinstance(n, ast.FunctionDef) and n.name == "compose_cmd")
 
-    compose_assigns = [n for n in ast.walk(fn)
-                       if isinstance(n, ast.Assign)
-                       and any(getattr(t, "id", None) == "compose" for t in n.targets)]
-    assert compose_assigns, "_deploy_body() 里找不到 compose 命令的赋值"
-    expr = ast.unparse(compose_assigns[0].value)
+    # 返回值表达式
+    rets = [n for n in ast.walk(fn) if isinstance(n, ast.Return) and n.value]
+    assert rets, "compose_cmd() 没有返回值"
+    expr = ast.unparse(rets[0].value)
     assert "env -u TAG" in expr, f"没有 unset TAG：{expr}"
     assert "-p " in expr, f"没有显式指定项目名：{expr}"
+
+    # **回滚必须用同一个构造点**（Codex 评审：只固定正向等于留了半边口子）
+    rb = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "rollback")
+    rb_src = ast.unparse(rb)
+    assert "compose_cmd()" in rb_src, f"回滚没用 compose_cmd()，仍受 TAG 污染：{rb_src[:200]}"
+    assert "env -u TAG" not in rb_src, "回滚自己拼了 compose 命令，会与正向分叉"
 
 
 def test_deploy_refuses_when_another_deploy_holds_the_lock(monkeypatch, capsys):
@@ -1243,3 +1250,48 @@ def test_lock_traceback_containing_busy_literal_is_not_treated_as_busy(monkeypat
     monkeypatch.setattr(deploy, "_capture", lambda cmd: traceback_like)
     got = deploy._acquire_deploy_lock("h", "/srv/app/.deploy.lock")
     assert got == "", f"把 traceback 回显当成了锁被占：{got!r}"
+
+
+def test_backup_failure_text_must_not_contain_command_source(monkeypatch):
+    """**Codex 抓到的阻断**：异常文本里带命令原文 → 备份被误判成功。
+
+    `TimeoutExpired.__str__` 是 `Command '[...]' timed out`，而 `cmd`
+    **包含 bash 脚本全文**，脚本里就有 `SS_BACKUP=OK` 这个字面量。
+    于是 `"SS_BACKUP=OK" not in out` 为 False → 返回 "OK" →
+    **放行一次没有备份的不可逆迁移**。
+    """
+    import subprocess as _sp
+
+    def boom(cmd, **kw):
+        raise _sp.TimeoutExpired(cmd, 900)
+
+    monkeypatch.setattr(deploy.subprocess, "run", boom)
+    got = deploy.backup_before_upgrade("h", "/srv/app")
+    assert got.startswith("FAIL:"), f"备份超时被当成成功了：{got}"
+
+
+def test_capture_failure_text_never_includes_the_command(monkeypatch):
+    """哨兵后面**只跟异常类型名**，不带 `str(exc)`（那会带出整条命令）。"""
+    import subprocess as _sp
+
+    secret_marker = "SS_BACKUP=OK"
+
+    def boom(cmd, **kw):
+        # 模拟真实情况：cmd 里含成功标记字面量
+        raise _sp.TimeoutExpired(cmd, 900)
+
+    monkeypatch.setattr(deploy.subprocess, "run", boom)
+    out = deploy._capture(["ssh", "h", "bash -c \"echo SS_BACKUP=OK\""])
+    assert deploy.CAPTURE_FAILED in out
+    assert "SS_BACKUP=OK" not in out, f"异常文本把命令原文带出来了：{out}"
+
+
+def test_backup_marker_must_be_a_standalone_line(monkeypatch):
+    """成功标记必须**整行相等**，不能被"回显出来的命令原文"蒙过。"""
+    monkeypatch.setattr(deploy, "_capture",
+                        lambda cmd: "bash: echo SS_BACKUP=OK: command not found\n")
+    got = deploy.backup_before_upgrade("h", "/srv/app")
+    assert got.startswith("FAIL:"), f"非独立行也被当成成功：{got}"
+
+    monkeypatch.setattr(deploy, "_capture", lambda cmd: "noise\nSS_BACKUP=OK\n")
+    assert deploy.backup_before_upgrade("h", "/srv/app") == "OK"

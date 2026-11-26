@@ -328,9 +328,25 @@ done
 echo SS_VERIFY=OK'''
 
 
+def compose_cmd() -> str:
+    """`docker compose` 的唯一构造点。**正向部署与回滚共用**。
+
+    `env -u TAG` + 固定 `-p` 两个都不能少：
+      · 镜像名是 `stock-screener:${TAG:-latest}`。运维 shell 里若
+        `export TAG=v0.2.133`，构建产物与 `_image_id()` 查的不是一个东西 →
+        验收假失败 → "回滚"之后 compose 仍按 TAG 拉起**新**镜像，
+        等于没回滚；
+      · `COMPOSE_PROJECT_NAME` 被改会让容器名与 `verify_script` 里拼的
+        `stock-screener-{svc}-1` 对不上，变成假失败。
+    Codex 评审指出：只固定正向、回滚仍用原始命令，等于留了半边口子。
+    """
+    return ("env -u TAG docker compose -p " + PROJECT
+            + " -f deploy/docker-compose.yml --project-directory . ")
+
+
 def rollback(host: str, target: str, services: str) -> tuple[bool, str]:
     """回退到 `stock-screener:rollback`；返回 (是否成功,原因码)。"""
-    compose = "docker compose -f deploy/docker-compose.yml --project-directory . "
+    compose = compose_cmd()
     body = (
      "set -u; cd " + target + " || { echo SS_ROLLBACK=BAD_TARGET; exit 0; }; "
      "docker image inspect stock-screener:rollback >/dev/null 2>&1 || "
@@ -384,17 +400,23 @@ CAPTURE_FAILED = "\x00SS_CAPTURE_FAILED\x00"
 def _capture(cmd: list[str]) -> str:
     """跑命令并取输出（失败也返回已拿到的部分，交给调用方判定）。
 
-    **必须自己吞掉 subprocess 异常**（评审抓到）：`timeout=900`，
-    ssh 卡住抛 `TimeoutExpired`、ssh 不存在抛 `FileNotFoundError`。
-    不捕获的话 `main()` 会以 traceback + 退出码 1 结束——而退出码 1 的
-    语义是「确认坏、已回滚」，值班会去手工回滚一个其实健康的新版本。
-    返回哨兵让 `verify_deployment()` 判成 UNKNOWN（退出 3、不回滚）。
+    **必须自己吞掉 subprocess 异常**：`timeout=900`，ssh 卡住抛
+    `TimeoutExpired`、ssh 不存在抛 `FileNotFoundError`。不捕获的话
+    `main()` 会以 traceback + 退出码 1 结束——而 1 的语义是
+    「确认坏、已回滚」，值班会去手工回滚一个其实健康的新版本。
+
+    **异常文本里绝不能带命令原文**（Codex 评审抓到的阻断）：
+    `TimeoutExpired.__str__` 是 `Command '[...]' timed out`，而 `cmd`
+    **包含 bash 脚本全文**。于是 `SS_BACKUP=OK` 这种"成功标记"会以字面量
+    出现在异常文本里，备份函数用 `"SS_BACKUP=OK" not in out` 判断时
+    **误判成功 → 放行一次不可逆迁移**。只保留异常类型名，不带 `str(exc)`。
     """
     try:
         proc = subprocess.run(cmd, check=False, capture_output=True, text=True,
                               timeout=900)
     except (subprocess.SubprocessError, OSError) as exc:
-        return f"{CAPTURE_FAILED}{type(exc).__name__}: {exc}"
+        # **只留类型名**，绝不拼 str(exc)（它会带出整条命令）
+        return f"{CAPTURE_FAILED}{type(exc).__name__}"
     return (proc.stdout or "") + (proc.stderr or "")
 
 
@@ -538,7 +560,12 @@ def backup_before_upgrade(host: str, target: str) -> str:
     out = _capture(["ssh", "-o", "BatchMode=yes", host,
      "bash -c " + _sh_quote("python3 -c " + _sh_quote(code) + " && (" + prune + ")")
      + " || true"])
-    if "SS_BACKUP=OK" not in out:
+    # **哨兵优先判定**：拿不到输出（ssh 超时/不存在）绝不能被当成备份成功——
+    # 那会放行一次没有备份的不可逆迁移。
+    if CAPTURE_FAILED in out:
+        return "FAIL:拿不到备份命令的输出（" + out.split(CAPTURE_FAILED, 1)[1].strip()[:80] + "）"
+    # 只认**整行相等**的标记：子串匹配会被"回显了命令原文"的输出骗过
+    if "SS_BACKUP=OK" not in {ln.strip() for ln in out.splitlines()}:
         return "FAIL:" + (out.strip()[:200] or "没有输出")
     return "OK"
 
@@ -619,6 +646,8 @@ def prune_old_images(host: str) -> str | None:
     # **必须区分「删了 0 个」和「根本没跑成」**：ssh 连不上、docker 挂了
     # 时 `SS_PRUNED=` 一行也没有，只看计数会把两者混成"0"，
     # 于是清理失败也静默。用结尾哨兵判断是否真的跑完。
+    if CAPTURE_FAILED in out:
+        return None
     if "SS_DONE" not in out:
         return None
     n = sum(1 for line in out.splitlines() if line.startswith("SS_PRUNED="))
@@ -876,6 +905,18 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             print(f"警告：正在「{reason}」窗口内强推部署（--force-window）")
 
+    # **本地预检必须在拿锁之前**（Codex 评审）：`check_clean()` 在脏工作区时
+    # 抛 `SystemExit`，如果那时已经拿到远端锁，`try/finally` 还没建立，
+    # 锁就留下来了——后面 40 分钟内谁都不能部署，而真正的错误还只是
+    # "工作区脏"这种小事。
+    check_clean(allow_dirty=args.allow_dirty)
+    sha = _sha()
+    tag = _git("describe", "--tags", "--exact-match", "HEAD").strip() \
+        if _has_tag() else "(未打 tag)"
+    print(f"部署 HEAD={sha} {tag}")
+    #从 tag推出期望版本（v0.2.124 →0.2.124）；没打 tag时为空（跳过版本比对）
+    expected_version = tag[1:] if tag.startswith("v") and tag[1:2].isdigit() else ""
+
     # **部署互斥锁**：两个部署同时在跑会互相污染回滚点。
     # 后发者的「上一次验收通过镜像」可能是前发者尚未验完的镜像，
     # 失败时回滚到已知坏版本的概率随之上升。
@@ -890,14 +931,6 @@ def main(argv: list[str] | None = None) -> int:
             print("**拒绝部署**：另一个部署正在进行（远端锁 " + lock_path + " 被占）。")
             print("  确认没有别的部署在跑后再试；卡死的锁会被下一个部署自动清掉。")
             return 1
-
-    check_clean(allow_dirty=args.allow_dirty)
-    sha = _sha()
-    tag = _git("describe", "--tags", "--exact-match", "HEAD").strip() \
-        if _has_tag() else "(未打 tag)"
-    print(f"部署 HEAD={sha} {tag}")
-    #从 tag推出期望版本（v0.2.124 →0.2.124）；没打 tag时为空（跳过版本比对）
-    expected_version = tag[1:] if tag.startswith("v") and tag[1:2].isdigit() else ""
 
     try:
         return _deploy_body(args, expected_version, sha)
@@ -953,8 +986,7 @@ def _deploy_body(args, expected_version: str = "", sha: str = "") -> int:
     # 于是"回滚"之后跑的还是新版本，状态完全错乱。
     # `--project-name` 同理固定：`COMPOSE_PROJECT_NAME` 被改会让容器名与
     # `verify_script` 里拼的 `stock-screener-{svc}-1` 对不上，变成假失败。
-    compose = ("env -u TAG docker compose -p " + PROJECT
-               + " -f deploy/docker-compose.yml --project-directory . ")
+    compose = compose_cmd()
     # **不能 `build ... | tail -1`**：管道取的是 `tail` 的退出码，构建失败也会
     # 被当成成功，然后拿**旧镜像**重建容器并报告"已重启"——故障被完全掩盖。
     # 用 `bash -c 'set -o pipefail; …'`：SSH 的登录 shell 可能是 dash，

@@ -25,9 +25,11 @@ IPV4 = re.compile(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b")
 #: 而 RUNBOOK 里实际生成的就是 `tk_...`，`ntfy_` 那条规则**根本对不上**。
 #: CI 的"敏感信息"门禁因此给的是假安全感。
 SECRET_NAMES = re.compile(
-    r"(?:SS_WEB_PASS|SS_WEB_USER|NTFY_TOKEN|WESTOCK_ACCESS_TOKEN|"
+    # **键名可以带引号**（`"SS_WEB_PASS": "..."` 是 JSON/YAML 常见写法，
+    # Codex 评审指出原来的正则漏了这一整类）。
+    r"[\"\']?(?:SS_WEB_PASS|SS_WEB_USER|NTFY_TOKEN|WESTOCK_ACCESS_TOKEN|"
     r"DEEPSEEK_API_KEY|OPENAI_API_KEY|LLM_API_KEY|API_KEY|SECRET|PASSWORD|PASSWD)"
-    r"\s*[:=]\s*['\"]?([^\s'\"#]{6,})",
+    r"[\"\']?\s*[:=]\s*['\"]?([^\s'\"#]{6,})",
     re.IGNORECASE,
 )
 
@@ -39,19 +41,42 @@ _NOT_A_SECRET = re.compile(
 )
 
 
+#: 这些是**值**而不是密钥：布尔/开关/常见标记。只按"整个值"匹配，
+#: 不看子串——`on`/`true` 出现在长口令里是正常的。
+_NOT_A_SECRET_WORDS = frozenset({
+    "true", "false", "yes", "no", "on", "off", "none", "null", "nil",
+    "enabled", "disabled", "required", "optional", "read", "write",
+})
+
+
 def _looks_like_secret_value(val: str) -> bool:
     """右侧这一串是不是真的像密钥。
 
-    要求**至少含一个数字和一个字母**（排除 `true`/`on`/`none` 这类布尔值）
-    或长度足够长；同时排除 `$VAR` / `${VAR}` / `changeme` / `xxx` 这类占位。
+    **不再要求"必须同时有数字和字母"**（Codex 评审抓到的漏检）：
+    `correcthorsebatterystaple` 是很典型的口令写法，纯字母一样是凭据，
+    而应用完全接受它。现在只做三件事：
+      1. 排除占位符/变量引用（`$VAR` / `${VAR}` / `changeme` / `xxx` / `<...>`）；
+      2. 排除整个值就是布尔/开关词的；
+      3. 长度门槛（≥6，太短的不像口令）。
     """
     if not val or _NOT_A_SECRET.search(val):
         return False
-    if len(val) < 8:
+    if val.strip().lower() in _NOT_A_SECRET_WORDS:
         return False
+    if len(val) < 6:
+        return False
+    # **代码形态一律排除**：`secret = ensure_secret(conn)`、
+    # `secret: bytes`、`api_key=self._api_key` 这些是**变量/函数调用**，
+    # 不是凭据。只看字符：出现括号/下标/逗号/分号就说明是表达式。
+    # 反斜杠也排除：`"TOKEN=abc\n"` 里的 `\n` 是**转义文本**，不是值的一部分
+    # （实测把 `tok-1` 这类短测试串误判成 6 字符凭据）。
+    if any(c in val for c in "()[]{},;=\\"):
+        return False
+    # 纯标识符（全字母 + 下划线/点，没有数字）几乎都是变量名，除非它足够长
+    # 到像一句 passphrase。`ensure_secret`（13）排除，
+    # `correcthorsebatterystaple`（25）保留。
     has_digit = any(c.isdigit() for c in val)
-    has_alpha = any(c.isalpha() for c in val)
-    return has_digit and has_alpha
+    return has_digit or len(val) >= 20
 
 
 # 各家令牌的固定前缀 + 长度，命中即算泄漏（无法从上下文解释成别的东西）

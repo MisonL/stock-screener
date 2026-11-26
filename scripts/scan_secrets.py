@@ -79,6 +79,11 @@ def _looks_like_secret_value(val: str) -> bool:
     return True
 
 
+#: **带口令的连接串**：`scheme://user:password@host`。
+#: 这类泄漏不会被"按密钥名赋值"的规则抓到（键名可能叫 `DB_CONN`/`DSN`/`URL`），
+#: 但形式极其固定，直接按 URL 认。
+_URL_CRED = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s:/@]+:([^\s@/]{3,})@")
+
 # 各家令牌的固定前缀 + 长度，命中即算泄漏（无法从上下文解释成别的东西）
 TOKENS = [
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
@@ -107,9 +112,12 @@ PRIVATE_NETS = [ipaddress.ip_network(n) for n in (
 #: Codex 评审指出：靠"值里有没有数字/括号"区分代码与配置，既漏
 #: （纯字母口令）又误报。**行级**判断准确得多——一旦出现调用/定义语法，
 #: 整行就不是一条配置。
+#: **不要放 `conn` / `None` 这种泛词**：`DB_CONN=postgres://...`、
+#: `SS_NONE=...` 是**真配置**，会被整行误判成代码而漏检。
+#: 真正需要的信号是"这行有调用/定义语法"——括号、`def `、`self.`、`->` 足够。
 _CODE_LINE = re.compile(
     r"\(|\)|\bdef \b|\breturn \b|\blambda\b|\bself\.|->|"
-    r"\bimport \b|\bclass \b|\bos\.|\bconn\b|\bNone\b"
+    r"\bimport \b|\bclass \b|\bos\."
 )
 
 
@@ -146,6 +154,9 @@ def find(line: str) -> list[str]:
     for rx in TOKENS:
         if rx.search(line):
             hits.append(f"令牌 {rx.pattern[:24]}…")
+    for m in _URL_CRED.finditer(line):
+        if not _NOT_A_SECRET.search(m.group(1)):
+            hits.append(f"连接串里带口令 {m.group(0)[:32]}")
     if not _looks_like_code_line(line):
         for m in SECRET_NAMES.finditer(line):
             if _inside_backticks(line, m.start()):

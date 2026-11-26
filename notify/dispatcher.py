@@ -236,14 +236,17 @@ class Dispatcher:
 
         认领键是 `seq_id`：api 与 jobs 各自持一个 `Dispatcher`、共用一个 SQLite 库，
         两边同时对同一个 signal 派发时，只有先提交的那一边能把行写成 `pending`；
-        后到者看到 `seq_id` 已有 `pending/accepted` 行就放弃（返回 False），不再双发。
+        后到者看到 `seq_id` 已有 `pending/accepted` 行就放弃，不再双发。
+
+        **返回值：`True` 只表示"上游真的接受了"**（`status="accepted"`）。
+        以下都返回 `False`：被别的进程认领、日额度压掉、演练跳过、发布失败。
+        Codex 两轮都指出这一点：原来发布失败也只记 `failed` 后照常 `return True`，
+        于是 `alert()` 把运维告警记成"已发出"，后续同水位被去抖压住——
+        **磁盘真涨上去也不会再有第二条**。调用方要看这个返回值就必须是"送达"。
+
+        （历史上这里返回的是"有没有被我认领"，`alert()` 之外的调用方都忽略
+        返回值，所以改语义不影响它们。）
         """
-        # **上一次发布到底成没成**：`_push_rows` 的返回值语义是"这批行有没有
-        # 被我认领"，不是"有没有真的发出去"——发布失败也只记 `failed` 后
-        # 照常 `return True`。`alert()` 需要后者（Codex 第二轮指出：
-        # 推送失败仍会返回 True → 磁盘告警被记成"已告警"→ 之后一直静默）。
-        # 不改编返回值以免动到其它调用方的认领语义，用这个旁路标记。
-        self._last_pushed_ok = False
         now = self.clock.now().isoformat()
         # **必须 BEGIN IMMEDIATE**：`with conn` 是延迟事务，SELECT 不开启写事务，
         # api 与 jobs 会同时查到「没有」，然后同时插入——认领等于没做（实测双发 2 条）。
@@ -274,7 +277,7 @@ class Dispatcher:
                     " LIMIT 1", (rows[0]["seq_id"],)).fetchone()
                 if claimed is not None:
                     self.conn.rollback()
-                    return False
+                    return False                     # 额度压掉：没送达
             ids = []
             for row in rows:
                 cur = self.conn.execute(
@@ -296,12 +299,11 @@ class Dispatcher:
                 self.conn.executemany(
                     "UPDATE push_log SET status = 'suppressed', error = 'drill' WHERE id = ?",
                     [(i,) for i in ids])
-            return []
+            return False                             # 演练：没送达
         try:
             ntfy_id = self.ntfy.publish(msg)
             status, error = "accepted", None
             self._fail_streak = 0
-            self._last_pushed_ok = True
         except Exception as exc:                  # noqa: BLE001 —— 上游挂了也要记一行
             ntfy_id, status, error = None, "failed", str(exc)[:200]
             self._fail_streak += 1
@@ -312,7 +314,8 @@ class Dispatcher:
             )
         if self._fail_streak >= 3:
             self._channel_down()
-        return True
+        # **只有真的被接受才算送达**：`status` 在发布异常时是 `failed`。
+        return status == "accepted"
 
     def _channel_down(self) -> None:
         """D20：推送通道连续失败 3 次 → 写一条本地失败留痕，api 侧据此报 `notify_ok=false`。"""
@@ -400,14 +403,11 @@ class Dispatcher:
                               (f"{seq_id}%",)).fetchone()[0]
         if n:
             seq_id = f"{seq_id}-{n}"
-        claimed = self._push_log(
+        return self._push_log(
             row={"code": None, "kind": kind, "level": level, "seq_id": seq_id,
                  "event_id": None, "signal_id": None, "segment": 1,
                  "trade_date": self.clock.today()},
             msg=render_alert(kind, text, self.cfg, level=level, secret=self.secret))
-        # **只有真的发出去才返回 True**：认领成功 + 上游接受，两个条件都要满足。
-        # 额度被压掉（claimed=False）、发布失败（`_last_pushed_ok=False`）都算没送达。
-        return bool(claimed) and bool(getattr(self, "_last_pushed_ok", False))
 
     def open_brief(self, rows: list[BriefRow], n: int, overflow=None, pool_date=None,
                    baseline_days=None, auction_detections=None) -> None:

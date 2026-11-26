@@ -203,3 +203,30 @@ def test_doc_placeholders_are_not_flagged():
 
     assert find("把 `tk_xxx` 填进 NTFY_TOKEN=... 里") == []
     assert find("NTFY_TOKEN=值") == []
+
+
+def test_catches_connection_strings_with_inline_passwords():
+    """**带口令的连接串**：键名可能是 `DB_CONN`/`DSN`/`URL`，不在密钥名列表里。
+
+    这类泄漏只能用 URL 形式认：`scheme://user:password@host`。
+    """
+    from scripts.scan_secrets import find
+
+    assert find("DB_CONN=postgres://app:Sup3rS3cret@db.internal:5432/stock")
+    assert find("DSN=mysql://root:hunter2@127.0.0.1/x")
+
+
+def test_code_line_regex_does_not_swallow_real_config_keys():
+    """**`_CODE_LINE` 不能放 `conn`/`None` 这类泛词。**
+
+    `DB_CONN=...`、`SS_NONE=...` 是真配置，放进去会让整行被当成代码而漏检。
+    第一版就是这么写的，实测漏掉了 `DB_CONN=postgres://用户:口令@主机`。
+    """
+    from scripts import scan_secrets as ss
+
+    assert not ss._looks_like_code_line("DB_CONN=postgres://a:bcd12345@h/db")
+    assert not ss._looks_like_code_line("SS_NONE=abcdefghijk")
+    assert not ss._looks_like_code_line("SS_WEB_PASS=abcdefghij")
+    # 真正的代码形态仍要识别
+    assert ss._looks_like_code_line("secret = ensure_secret(conn)")
+    assert ss._looks_like_code_line("def issue_session(secret: bytes, exp_ts: int) -> str:")

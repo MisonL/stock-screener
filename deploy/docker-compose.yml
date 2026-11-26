@@ -222,7 +222,6 @@ services:
     # 具体版本号按你的上游兼容性自行调整。
     image: cloudflare/cloudflared:2026.10.3
     user: "${UID:-1000}:${GID:-1000}"
-    command: tunnel --no-autoupdate --config /etc/cloudflared/config.yml run
     environment:
       # 全仓库的时间口径都是 Asia/Shanghai（交易日、EOD、预算自然日）；
       # 容器默认 UTC 会让「今天」比人多 8 小时

@@ -135,6 +135,46 @@ def test_dockerignore_covers_all_env_variants():
     assert ".env.*" in text, ".dockerignore 只挡了 *.env，漏掉 .env.local 等变体"
 
 
+def _compose_strict():
+    """**和 docker compose 一样拒绝重复键**的解析器。
+
+    真实事故（v0.2.141）：给 `cloudflared` 加 `command:` 时原文件里已经有一条
+    `command:`，于是同一个映射里出现两个 `command`。`yaml.safe_load` **静默**
+    取后者，所有 compose 用例照绿；而 `docker compose` 直接报
+    `mapping key "command" already defined` → **构建与重启全失败**。
+
+    更糟的是**回滚也失败**：`rollback()` 用的是同一份坏文件，
+    于是 `up -d` 起不来、回滚也起不来（实测 `回滚失败：UP_FAILED`）。
+    当时容器还活着纯属侥幸（compose 在解析阶段就退出，没动容器）。
+
+    所以必须在测试里用严格解析器，把"只有 docker 才报"的错误提前到 CI。
+    """
+    import yaml
+
+    class Strict(yaml.SafeLoader):
+        pass
+
+    def _no_duplicate(loader, node, deep=False):
+        mapping = {}
+        for key_node, value_node in node.value:
+            key = loader.construct_object(key_node, deep=deep)
+            if key in mapping:
+                raise ValueError(
+                    f"deploy/docker-compose.yml 第 {key_node.start_mark.line + 1} 行："
+                    f"重复键 {key!r}（docker compose 会拒绝解析）")
+            mapping[key] = loader.construct_object(value_node, deep=deep)
+        return mapping
+
+    Strict.add_constructor(
+        yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _no_duplicate)
+    return yaml.load(open("deploy/docker-compose.yml"), Loader=Strict)
+
+
+def test_compose_file_has_no_duplicate_keys():
+    """**compose 文件不能有重复键** —— 否则构建与回滚会一起失效。"""
+    _compose_strict()          # 有重复键会直接抛
+
+
 def _compose():
     import yaml
 

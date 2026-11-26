@@ -1,5 +1,37 @@
 ## [Unreleased]
 
+###修复（我自己引入的：compose 重复键让构建与回滚同时失效）
+
+给 `cloudflared` 加 `command:` 加 metrics 时，**那个服务本来就有 `command:`**，
+于是同一个映射里出现了两个 `command`。`yaml.safe_load` 静默取后者，
+`tests/deploy/test_compose.py` 全绿；而 `docker compose` 直接拒绝解析：
+
+```
+failed to parse deploy/docker-compose.yml:
+  mapping key "command" already defined at line 225
+```
+
+后果比"部署失败"更糟：**回滚用的是同一份坏文件**，所以回滚也起不来
+（实测 `**回退失败**：UP_FAILED`）。当时站点没挂纯属侥幸——compose 在
+解析阶段就退出，根本没碰容器（`0.2.140` 继续健康运行）。
+
+- 删掉重复的 `command:`，保留带 `--metrics` 的那条。
+- **测试加严格解析器** `_compose_strict()`：与 `docker compose` 一样拒绝
+  ​重复键。这是真漏洞——`yaml.safe_load` 的宽容恰好把"只有 docker 才报"
+  的错误挡在了 CI 之外。变异验证：重新插入重复键后用例立刻报
+  「第 250 行：重复键 'command'」。
+
+###教训
+
+这一轮我引入的**两个**问题都属于同一类：**"只有真跑起来才会暴露的错误，
+被宽松的工具静默接受了"**——
+上一轮是 `yaml.safe_load` 放过重复键，更早是 `str(TimeoutExpired)` 把命令
+原文带成功标记。两次都是我改了代码、测试全绿、却在真实环境里炸。
+
+###测试
+
+81.4 全量 **1479 passed, 3 skipped**。
+
 ## [0.2.141] - 2026-11-26
 
 ###修复（生产事故：整站 1033，隧道卡死后自己恢复不了）

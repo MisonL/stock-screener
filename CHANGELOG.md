@@ -1,5 +1,50 @@
 ## [Unreleased]
 
+###修复（整站 1033 的真正根因：QUIC/UDP 在这台机器上会卡死）
+
+前面只做到"故障能被发现"，这次找到了根因。
+
+2026-11-26 一天之内整站 1033 出现了 **三次**，每次都是同样的形态：
+`cloudflared` 的 4 条 **QUIC（UDP）** 连接全部
+`timeout: no recent network activity`，之后无限重试但再也连不上。
+每次 `restart` 都能好，但过一阵又断。
+
+- 改成 `protocol: http2`（走 TCP）后立即稳定。
+- `deploy/cf/config.yml.example` 里写死这条并加了说明，
+  新环境不会踩；用例断言示例配置必须含 `protocol: http2`。
+- **`cloudflared` 自己的 precheck 会骗人**：每次都报
+  `UDP Connectivity: QUIC connection successful status=pass`，
+  因为那是**刚建连时**测的，问题出在长时间运行后。
+  光看 precheck 会以为 UDP 没问题。
+
+###修复（我加的 healthcheck 是恒真的，已删掉）
+
+上一版给 `cloudflared` 加了
+`test: ["CMD","cloudflared","tunnel","--metrics","0.0.0.0:2000","ready"]`，
+以为能发现隧道死掉。**实测它恒为 exit 0**：18:14 隧道已全断、公网 1033，
+`docker inspect` 里却是 `ExitCode: 0` / `Status: healthy` / `FailingStreak: 0`。
+
+一个**"出事时说没事"的探针比没有更糟**——运维会因此不去看。
+镜像基于 distroless（无 `sh`/`curl`/`wget`），也写不出别的探针，所以**删掉**，
+并在 RUNBOOK 里写明"不要再加"。`--metrics` 端点保留（排查时有用）。
+
+用例从"必须有 healthcheck"改成"**不能有** healthcheck"，
+并说明要先验证探针真的会失败。
+
+###教训
+
+这一轮同一个坑踩了三次，形态都是**"检查手段本身在说谎"**：
+1. `str(TimeoutExpired)` 把命令原文（含 `SS_BACKUP=OK`）带进异常文本；
+2. `yaml.safe_load` 静默接受重复键，而 `docker compose` 会拒绝；
+3. `cloudflared ... ready` 探针恒真，隧道死了也报 healthy。
+
+共同点：**工具给的绿灯不等于真的没问题**。每次都要问一句
+"如果它坏了，这个检查真的会变红吗？"——答不上来就等于没检查。
+
+###测试
+
+81.4 全量 **1481 passed, 3 skipped**。
+
 ## [0.2.142] - 2026-11-26
 
 ###修复（我自己引入的：compose 重复键让构建与回滚同时失效）

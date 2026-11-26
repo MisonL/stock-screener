@@ -4,6 +4,15 @@
 tunnel: <TUNNEL-UUID>
 credentials-file: /etc/cloudflared/<TUNNEL-UUID>.json
 
+# **必须用 http2（TCP），不要用默认的 quic（UDP）。**
+# 2026-11-26 这台机器两次整站 1033：4 条 QUIC 连接全部
+# `timeout: no recent network activity`，cloudflared 一直重试但
+# **再也连不上**（容器还活着、`docker ps` 显示 Up）。
+# 换 `protocol: http2` 走 TCP 后立刻稳定。
+# 注意：`cloudflared` 的 precheck 会报 "QUIC connection successful"，
+# 也就是说**建连时能通**，是长时间运行后才会卡死——别被 precheck 骗了。
+protocol: http2
+
 ingress:
   - hostname: stock.example.com
     service: http://api:5000

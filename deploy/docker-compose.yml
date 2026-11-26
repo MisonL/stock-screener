@@ -247,14 +247,12 @@ services:
     command: >-
       tunnel --no-autoupdate --config /etc/cloudflared/config.yml
       --metrics 0.0.0.0:2000 run
-    healthcheck:
-      # **不能用 `cloudflared tunnel info`**：那要额外的 API 凭据。
-      # `/ready` 是它自带的就绪端点，连不上 edge 时返回非 200。
-      test: ["CMD", "cloudflared", "tunnel", "--metrics", "0.0.0.0:2000", "ready"]
-      interval: 60s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
+    # **刻意不加 healthcheck。** 试过 `cloudflared tunnel --metrics ... ready`，
+    # 实测是**恒真**的：2026-11-26 18:14 隧道已经全断、公网 1033，
+    # `docker inspect` 里 `ExitCode: 0`、`Status: healthy`，`FailingStreak: 0`。
+    # 一个"出事时说没事"的探针比没有更糟——运维会因此不去看。
+    # 镜像基于 distroless（无 sh/curl/wget），也写不出别的探针。
+    # 真正的修法是让隧道别断：`cf/config.yml` 里 `protocol: http2`（见上方注释）。
     depends_on:
       - api
       - ntfy

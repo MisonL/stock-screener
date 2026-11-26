@@ -235,22 +235,41 @@ def test_jobs_has_grace_period_longer_than_its_longest_task():
     assert secs >= 120, f"jobs 的 stop_grace_period={grace}，EOD/备份会被强杀"
 
 
-def test_cloudflared_has_a_healthcheck_that_detects_a_dead_tunnel():
-    """**隧道卡死必须能被看见。**
+def test_cloudflared_does_not_carry_a_false_green_healthcheck():
+    """**cloudflared 不能带恒真的 healthcheck。**
 
-    2026-11-26 真实故障：`cloudflared` Up 41 小时后 4 条 QUIC 连接全断，
-    之后一直重试但再也没连上，公网整站 1033；而 `docker ps` 显示 `Up`，
-    因为进程没退出、`restart: unless-stopped` 不会触发。
-    没有健康检查时，唯一的信号是"用户发现网站打不开"。
+    试过 `cloudflared tunnel --metrics ... ready`，实测**恒为 exit 0**：
+    2026-11-26 18:14 隧道已全断、公网返回 1033，而 `docker inspect` 里
+    `ExitCode: 0` / `Status: healthy` / `FailingStreak: 0`。
+    一个"出事时说没事"的探针比没有更糟——运维会因此不去看。
+    镜像基于 distroless（无 sh/curl/wget），写不出别的探针。
+    真正的修法是让隧道别断：`protocol: http2`（见下一个用例）。
     """
     svc = _compose()["services"]["cloudflared"]
-    hc = svc.get("healthcheck")
-    assert hc, "cloudflared 没有 healthcheck，隧道卡死时状态仍然是 Up"
-    test = hc["test"]
-    joined = " ".join(test) if isinstance(test, list) else str(test)
-    # 必须真的问"隧道连上了吗"，而不是只判进程活着
-    assert "ready" in joined, f"健康检查没判隧道就绪状态：{joined}"
-    # metrics 端点得开，否则 ready 探针无处可问
-    cmd = svc.get("command") or ""
+    assert "healthcheck" not in svc, (
+        f"cloudflared 又被加了 healthcheck：{svc.get('healthcheck')}\n"
+        "先确认它真的会失败（把隧道断开再看 ExitCode），否则先删掉")
+
+
+def test_cloudflared_keeps_metrics_endpoint():
+    """`--metrics` 要留着：没有它就完全看不到隧道内部状态。"""
+    cmd = _compose()["services"]["cloudflared"]["command"]
     cmd = " ".join(cmd) if isinstance(cmd, list) else cmd
-    assert "--metrics" in cmd, f"没开 metrics 端点，/ready 探不到：{cmd}"
+    assert "--metrics" in cmd, cmd
+
+
+def test_tunnel_example_config_forces_http2_not_quic():
+    """**示例配置必须写 `protocol: http2`。**
+
+    2026-11-26 这台机器两次整站 1033：4 条 QUIC 连接全部
+    `timeout: no recent network activity`，cloudflared 一直重试但再也连不上
+    （容器还活着、`docker ps` 显示 Up）。换 http2 走 TCP 后立刻稳定。
+
+    cloudflared 的 precheck 会报 "QUIC connection successful"——
+    建连时是通的，是长时间运行后卡死，别被 precheck 骗。
+    """
+    import pathlib
+
+    cfg = pathlib.Path("deploy/cf/config.yml.example").read_text(encoding="utf-8")
+    assert "protocol: http2" in cfg, (
+        "cf 示例配置没有指定 protocol: http2，新环境会踩 QUIC 卡死")

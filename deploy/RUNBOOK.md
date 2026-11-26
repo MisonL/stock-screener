@@ -591,11 +591,20 @@ curl -s https://stock.431695.xyz/healthz      # 应返回 {"ok":true,...}
 而这个故障里容器一直活着（进程没崩），Docker 不会动它。
 `cloudflared` 镜像基于 distroless（没有 `sh`/`wget`），也放不了自愈脚本。
 
-**现在能看见它了**：`cloudflared` 加了 healthcheck（读 metrics 的 `/ready`），
-隧道断了会显示 `(unhealthy)`，而不是像以前一样显示 `Up`：
+**⚠️ 不要给它加 healthcheck**：试过 `cloudflared tunnel --metrics ... ready`，
+实测**恒为 exit 0**——隧道已全断、公网 1033 时，`docker inspect` 仍显示
+`ExitCode: 0` / `Status: healthy` / `FailingStreak: 0`。
+"出事时说没事"的探针比没有更糟。镜像是 distroless（无 sh/curl/wget），
+也写不出别的探针。
+
+**根治办法（已落地）**：`cf/config.yml` 里写 `protocol: http2`，走 TCP 而不是
+默认的 QUIC（UDP）。本机 UDP 长时间运行后会卡死——**precheck 报
+"QUIC connection successful" 也不能说明它稳**，那是刚建连时测的。
+改 http2 后连续观察均正常。
 
 ```bash
-docker ps --format '{{.Names}} {{.Status}}' | grep cloudflared
+grep protocol ~/stock-screener/cf/config.yml     # 应为 http2
+docker logs stock-screener-cloudflared-1 --tail 8
 ```
 
 **⚠️ 一个必须知道的结构性弱点**：`ntfy` 推送走的是**同一条隧道**。

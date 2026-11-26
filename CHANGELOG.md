@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.2.142] - 2026-11-26
+
 ###修复（我自己引入的：compose 重复键让构建与回滚同时失效）
 
 给 `cloudflared` 加 `command:` 加 metrics 时，**那个服务本来就有 `command:`**，

@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.2.146] - 2026-11-26
+
 ###修复（部署从没重建过 cloudflared / ntfy，而且一个字都没提）
 
 `deploy.py` 的 `--services` 默认只有 `api jobs agent`，所以

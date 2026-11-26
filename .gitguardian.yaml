@@ -1,0 +1,18 @@
+# GitGuardian 配置
+#
+# 2026-11-26：GitGuardian 对文档/测试里的**示例值**报 "Generic High Entropy
+# Secret" —— 那些例子分别是连号、梗、字母表分段（具体值见 scan_secrets.py
+# 的白名单注释，这里不再复制一遍：复制就等于再造一个"含样本的文件"）。
+# 核对了全历史 246 个 commit：仓库里从来没进过真凭据。
+#
+# 处置分两层：
+#   1. Python 源里的示例行用行内 `# ggignore` 标注（精确到行）；
+#   2. CHANGELOG 是**发布记录**，成段引用当时的示例值，无法逐行标注 ——
+#      整个文件忽略。它不承载可执行代码，泄漏面为零。
+#
+# ⚠️ 不要在这里加 `scripts/` 或 `tests/` 目录：那两个文件恰恰是最容易被
+# 顺手贴上真凭据的地方，本仓库自己的门禁已经改成**照扫**（见 ci.yml），
+# 外部 GitGuardian 也必须照扫它们。
+version: 2
+paths-ignore:
+  - CHANGELOG.md

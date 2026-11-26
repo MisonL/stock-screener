@@ -17,9 +17,31 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# **测试容器里没有 `git`**（`pytest` 跑在 python:3.12-slim 里）：这两个用例要真调
-# `git status` / 读脚本源码，只能在宿主机跑。`make test` 会带上它们。
-HAS_GIT = shutil.which("git") is not None
+def _git_usable() -> bool:
+    """`git` 在这个工作区里**真的能用**吗？
+
+    ⚠️⚠️ 判据必须"真的跑一次"，不能看两个代理指标（2026-11-26 修了两次）：
+      · 第一版 `shutil.which("git") is not None` —— CI 容器里装了 git，
+        但 `/app` 里没有 `.git`，跳过不生效、`git status` 退出 128；
+      · 第二版再加 `(ROOT / ".git").exists()` —— 这次 `.git` 挂进去了，
+        但容器里 `/app` 的所有者与运行用户不同，git 报
+        `detected dubious ownership`，**同样退出 128**。
+    两次都是"闸门在≠闸门生效"：指标（有 git / 有 .git）不等于能力（能查这个
+    工作区）。直接问 git 本人：`rev-parse --is-inside-work-tree` 成功才跑。
+    """
+    if shutil.which("git") is None:
+        return False
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
+HAS_GIT = _git_usable()
 
 
 def _run(*args: str) -> subprocess.CompletedProcess:

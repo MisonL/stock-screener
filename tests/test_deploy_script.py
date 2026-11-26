@@ -17,9 +17,16 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# **测试容器里没有 `git`**（`pytest` 跑在 python:3.12-slim 里）：这两个用例要真调
-# `git status` / 读脚本源码，只能在宿主机跑。`make test` 会带上它们。
-HAS_GIT = shutil.which("git") is not None
+# 这两个用例要真调 `git status`，只能在**有 .git 的工作区**里跑。
+#
+# ⚠️ 判据是"是不是 git 工作区"，**不是**"有没有 git 可执行文件"
+# （2026-11-26 修）：CI 的 `后端测试` 把工作区 `-v` 进容器，镜像里装了 git
+# 但没挂 `.git`（checkout 的 .git 不在挂载点里）。于是 `which("git")` 为真、
+# 跳过条件不生效，而 `git rev-parse` 退出 128 —— main 上的 CI 因此长期红，
+# 报的却是"工作区不干净"没出现，看着像脚本坏了。
+# 判据落在"git 存在"而不是"git 能用"，就是「闸门在≠闸门生效」。
+HAS_GIT = (shutil.which("git") is not None
+           and (ROOT / ".git").exists())
 
 
 def _run(*args: str) -> subprocess.CompletedProcess:

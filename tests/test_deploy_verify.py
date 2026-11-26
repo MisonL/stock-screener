@@ -1028,6 +1028,12 @@ def test_dry_run_is_never_blocked(monkeypatch, capsys):
                         lambda now: "每日备份")
     monkeypatch.setattr(deploy, "build_archive", _fake_archive)
     # 工作区可能真的有改动（本仓库日常状态），用 --allow-dirty 隔离掉
+    #
+    # ⚠️ 取 HEAD 也要桩掉（2026-11-26）：本用例断言的是"窗口校验不影响
+    # --dry-run"，与仓库状态无关。原来真去跑 `git rev-parse`，CI 的容器里
+    # 有 git 却没有 `.git`，于是退出 128 —— 一条**窗口**用例被**仓库**环境
+    # 拖红（main 上长期如此）。与被测行为无关的依赖一律桩掉。
+    monkeypatch.setattr(deploy, "_sha", lambda: "deadbeef")
     assert deploy.main(["--host", "h", "--dir", "/srv/app", "--dry-run",
                         "--allow-dirty"]) == 0
 

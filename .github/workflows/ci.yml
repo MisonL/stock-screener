@@ -96,18 +96,29 @@ jobs:
       # **不要在 YAML 里写一条大正则**：版本号和私网地址在文本上长得一样，
       # 误报会把这条门禁变成噪音，最后没人看。脚本用 ipaddress 模块解析，
       # 天生不会把版本号当 IP。
-      # 扫描器自身和它的测试里含有「应该被抓到」的样本行（规则文本、示例 IP），
-      # 扫自己必然误报。排除这两个文件；它们的行为由 tests/test_scan_secrets.py 保证。
+      # ⚠️⚠️ **不按文件名排除**（2026-11-26 修）。
+      #
+      # 原实现整份跳过 `scripts/scan_secrets.py` 与 `tests/test_scan_secrets.py`，
+      # 理由是"扫自己必然误报"。后果是这两个文件变成**扫描盲区** ——
+      # 而它们恰恰是最容易被贴上真实凭据的地方（写规则要举例、写测试要造样本）。
+      # `[实测]` 2026-11-26：GitGuardian 报的正是这两份文件里的示例行
+      # （假值、误报），而**本仓库自己的门禁对它们是全盲的**：真凭据贴进
+      # 同一个位置，CI 一声不响，只能指望外部的 GitGuardian。
+      #
+      # 现在改成**按整行白名单**（`scan_secrets._SAMPLE_LINES`，存 sha256）：
+      # 文件照扫，只有那份已知示例行白名单豁免（`_SAMPLE_LINES`）。
+      # 判据从"文件名"收窄到"整行内容"，
+      # 有人在示例里贴真凭据时照样报。
       - name: 扫描工作区
         run: |
           set -euo pipefail
-          git ls-files \
-            | grep -v -E '^(scripts/scan_secrets\.py|tests/test_scan_secrets\.py)$' \
-            | xargs cat | python3 scripts/scan_secrets.py
+          git ls-files | xargs cat | python3 scripts/scan_secrets.py
 
+      # ⚠️ `--pretty=format:` 只留 diff、去掉提交头与提交说明。
+      # 2026-11-26：第一次全量扫描就红了 —— 命中的不是代码，而是**我自己的
+      # commit message**（里面为了说明误报，引用了 PEM 私钥头这个字面串）。
+      # 提交说明不是"曾经进过仓库的文件内容"，把它并进来只会让人不敢描述问题；
+      # 真要管提交说明，得另设机制，而不是混进这条"扫文件历史"的门禁里。
       - name: 扫描全部历史
         run: |
-          # 同样排除那两个文件（历史里的 diff 也含样本行）
-          git log --all -p -- . \
-            ':!scripts/scan_secrets.py' ':!tests/test_scan_secrets.py' \
-            | python3 scripts/scan_secrets.py
+          git log --all -p --pretty=format: -- . | python3 scripts/scan_secrets.py

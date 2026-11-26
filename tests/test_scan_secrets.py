@@ -80,9 +80,10 @@ def test_the_repository_itself_is_clean():
         if not p.is_file() or SKIP & set(p.relative_to(ROOT).parts):
             continue
         name = str(p.relative_to(ROOT))
-        # 本文件和扫描器自己都包含「应该被抓到」的样本/规则文本，不参与扫描
-        if name in ("tests/test_scan_secrets.py", "scripts/scan_secrets.py"):
-            continue
+        # ⚠️⚠️ 2026-11-26：**不再跳过扫描器和它自己的测试**。
+        # 原先这里排除这两个文件（"含样本行，扫必然误报"），与 CI 的文件名
+        # 排除是同一个洞 —— 而这两个文件恰恰最容易被顺手贴上真凭据。
+        # 现在样本行由 `_SAMPLE_LINES` 精确豁免，文件照扫。
         p = ROOT / name
         if not p.is_file():
             continue
@@ -106,10 +107,10 @@ def test_catches_this_projects_own_credential_formats():
     """
     from scripts.scan_secrets import find
 
-    assert find("NTFY_TOKEN=tk_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6")
-    assert find("export SS_WEB_PASS=Hunter2MySecret")
-    assert find("WESTOCK_ACCESS_TOKEN=eyJhbGciOiJIUzI1NiJ9.abcdefghij.klmnopqrst")
-    assert find('password: "s3cr3t-very-long-password"')
+    assert find("NTFY_TOKEN=tk_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6")  # ggignore
+    assert find("export SS_WEB_PASS=Hunter2MySecret")  # ggignore
+    assert find("WESTOCK_ACCESS_TOKEN=eyJhbGciOiJIUzI1NiJ9.abcdefghij.klmnopqrst")  # ggignore
+    assert find('password: "s3cr3t-very-long-password"')  # ggignore
 
 
 def test_does_not_flag_placeholders_and_variable_references():
@@ -230,3 +231,162 @@ def test_code_line_regex_does_not_swallow_real_config_keys():
     # 真正的代码形态仍要识别
     assert ss._looks_like_code_line("secret = ensure_secret(conn)")
     assert ss._looks_like_code_line("def issue_session(secret: bytes, exp_ts: int) -> str:")
+# ---------------------------------------------------------------------------
+# 门禁**不能把自己排除在外**（2026-11-26，GitGuardian 报出来的那次）
+# ---------------------------------------------------------------------------
+# 原 CI 是"按文件名跳过这两个文件"，理由是扫自己必然误报。代价是这两个
+# 文件成了扫描盲区，而它们正是最容易顺手贴真凭据的地方（写规则要举例、
+# 写测试要造样本）。GitGuardian 报的就是这两份文件里的假值样本。
+# 下面这组用例把"文件照扫、只有已知样本行豁免"这条判据钉住。
+#
+# ⚠️ 本段**不写字面样本串**，一律用拼接构造：写了就又得给自己加白名单，
+# 白名单里再写、再报 —— 无限自指（实测第一版就是这么红的）。
+
+#: `tk_` 之后是一串顺序数字，真 token 不长这样
+_TK = "tk_" + "a1b2c3d4e5f6g7h8i9j0" + "k1l2m3n4o5p6"
+#: 与白名单里那行逐字一致的"示例行"（运行时拼出来，源码里没有这个字面量）
+_SAMPLE_LINE = '    assert find("NTFY_TOKEN=%s")  # ggignore' % _TK
+
+
+def _scanner_files():
+    """两个曾经被整份排除的文件。"""
+    return [ROOT / "scripts" / "scan_secrets.py",
+            ROOT / "tests" / "test_scan_secrets.py"]
+
+
+def test_sample_whitelist_covers_both_files():
+    """两个曾经被排除的文件，逐行过扫描器必须**零命中**。
+
+    ⚠️ 这条是"去掉文件级排除"的回归保护：只要有人在里面贴了新东西
+    （真凭据或新样本），这里立刻红 —— 而不是等 GitGuardian 来报。
+    """
+    bad = []
+    for f in _scanner_files():
+        assert f.exists(), f"{f} 不存在"
+        for i, line in enumerate(f.read_text(encoding="utf-8").split("\n"), 1):
+            if find(line):
+                bad.append(f"{f.name}:{i}: {find(line)}")
+    assert bad == [], ("这两个文件里出现了未被白名单覆盖的疑似凭据：\n"
+                       + "\n".join(bad))
+
+
+def test_whitelist_is_exact_line_not_prefix():
+    """白名单是**整行**比对，不是前缀/包含 —— 拼接一行真凭据必须被抓。
+
+    若改成包含匹配，「示例行 + 真 token」这种拼接行会整行豁免，
+    刚好给"顺手贴真值"留了门。
+    """
+    assert find(_SAMPLE_LINE) == [], "已知样本行应被豁免"
+    _real = "tk_" + "z9y8x7w6v5u4t3s2r1q0p9o8" + "n7m6l5k4"
+    assert find(_SAMPLE_LINE + " " + _real), \
+        "样本行末尾拼接真 token 时必须报（白名单不能退化成前缀匹配）"
+
+
+def test_whitelist_does_not_cover_real_looking_values():
+    """与样本只差一个字符 → 必须抓（白名单不能按"值前缀"放宽）。"""
+    assert find("NTFY_TOKEN=" + _TK[:-1] + "7"), \
+        "只差最后一个字符的真值没被抓到 —— 白名单粒度太粗"
+    # 裸的私钥头（真实凭据文件里就是这样一行）必须报，
+    # 尽管样本行里带着引号逗号的那一版被豁免了。
+    assert find("-----BEGIN " + "RSA PRIVATE KEY-----"), \
+        "裸私钥头被样本行白名单误豁免了 —— 真私钥会漏过门禁"
+
+
+def test_ci_secrets_job_scans_the_scanner_files():
+    """CI 的 secrets job **必须把扫描器两个文件纳入扫描范围**。
+
+    ⚠️ 不查"有没有这三种排除写法"（Sourcery 2026-11-26）：换一种
+    grep / pathspec / 命令拼写就能绕过。直接断言 secrets job 的命令
+    **没有**把这两个文件从输入里拿掉 —— 任何"排除它们"的写法都会让
+    命令文本里出现这两个文件名作为排除目标。
+    """
+    import re
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    # 取出 secrets job 的 run 块（从 `name: 敏感信息扫描` 到下一个顶层 job）
+    m = re.search(r"name:\s*敏感信息扫描\n(.*?)(?=\n  [a-z]|$)", ci, re.S)
+    assert m, "ci.yml 里找不到「敏感信息扫描」job"
+    body = m.group(1)
+    # 命令本身必须出现这两个文件的**正向引用**（`git ls-files` 不排除时，
+    # 文件名不会出现在命令里；排除时才会出现）。所以判据是：
+    #   · 命令文本里**没有**把这两个文件当排除目标；
+    #   · 且 secrets job 确实在跑 `scripts/scan_secrets.py`。
+    assert "scripts/scan_secrets.py" in body, "secrets job 没在跑扫描器"
+    for _pat in (
+        r"grep\s+-v[^\n]*scan_secrets",
+        r":!scripts/scan_secrets\.py",
+        r":!tests/test_scan_secrets\.py",
+        r"--exclude[^\n]*scan_secrets",
+        r"pathspec[^\n]*scan_secrets",
+    ):
+        assert not re.search(_pat, body), (
+            f"secrets job 又在按文件名排除扫描器（命中 {_pat!r}）—— "
+            f"那两个文件会重新变成盲区")
+
+
+def test_hash_lines_mode_emits_digests_from_sample_files_only():
+    """`--hash-lines` 必须**真正输出**示例行摘要，且只读 `_SAMPLE_FILES`。
+
+    ⚠️ 不查"源码里有没有 `--hash-lines` 这几个字"（Sourcery 2026-11-26）：
+    文档里也会出现，把处理器删成 no-op 照样绿。直接跑一次，断言：
+      · 输出至少 1 条 64 位 hex；
+      · 输出里的每一条都在当前 `_SAMPLE_LINES` 里（生成器与白名单一致）；
+      · 它**不接受 stdin**：管一段真凭据进去，输出不变。
+    """
+    import hashlib
+    import subprocess
+    import sys
+    from scripts.scan_secrets import _SAMPLE_FILES, _SAMPLE_LINES, _line_hash
+
+    _py = sys.executable
+    _script = str(ROOT / "scripts" / "scan_secrets.py")
+
+    def _run(stdin_text=""):
+        r = subprocess.run(
+            [_py, _script, "--hash-lines"],
+            input=stdin_text, capture_output=True, text=True, timeout=60,
+            cwd=str(ROOT),
+        )
+        assert r.returncode == 0, f"--hash-lines 失败：{r.stderr}"
+        return [l.strip().strip(',"') for l in r.stdout.splitlines()
+                if l.strip().startswith('"')]
+
+    out = _run()
+    assert out, "--hash-lines 输出为空 —— 生成器坏了或样本文件读不到"
+    for h in out:
+        assert len(h) == 64 and all(c in "0123456789abcdef" for c in h), (
+            f"输出不是 sha256 摘要：{h!r}")
+        assert h in _SAMPLE_LINES, (
+            f"生成器吐出了白名单里没有的摘要 {h} —— "
+            f"要么白名单过时，要么生成器读到了 `_SAMPLE_FILES` 之外的文件")
+
+    # 管一段**真凭据**进去：输出必须完全不变（证明不读 stdin）
+    _poison = "NTFY_TOKEN=tk_" + "z" * 32 + "\n"
+    out2 = _run(_poison)
+    assert out2 == out, (
+        "--hash-lines 读了 stdin —— 真凭据会被哈希进白名单"
+        "（这正是 Sourcery 指出的那个洞）")
+
+    # `_SAMPLE_FILES` 必须只覆盖那三个文件（安全边界本身）
+    assert set(_SAMPLE_FILES) == {
+        "scripts/scan_secrets.py",
+        "tests/test_scan_secrets.py",
+        "CHANGELOG.md",
+    }, f"_SAMPLE_FILES 被扩大了：{_SAMPLE_FILES!r} —— 安全边界被拆掉"
+
+
+def test_repo_clean_scan_does_not_skip_the_scanner_itself():
+    """`test_the_repository_itself_is_clean` **不许**再把这两个文件排除掉。
+
+    2026-11-26：CI 按文件名排除了 `scripts/scan_secrets.py` 与
+    `tests/test_scan_secrets.py`，测试里也有同一份排除 —— 两层门禁同时
+    对最容易被贴真凭据的两个文件失明。样本行现在由 `_SAMPLE_LINES`
+    精确豁免，文件必须照扫。
+
+    ⚠️ 要检查的字符串**拼接构造**：直接写字面量，这段源码本身就含该串，
+    断言必然假红（与 `_SAMPLE_LINE` 同一个自指陷阱）。
+    """
+    src = (ROOT / "tests" / "test_scan_secrets.py").read_text(encoding="utf-8")
+    _skip = ("if name in (" + '"tests/test_scan_secrets.py"'
+             + ", " + '"scripts/scan_secrets.py")')
+    assert _skip not in src, (
+        "仓库自检又在按文件名跳过扫描器自己 —— 那两个文件会重新变成盲区")

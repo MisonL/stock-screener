@@ -5,6 +5,7 @@
   - 私网 IP 用 ipaddress 模块解析，天然不会把版本号当 IP；
   - 令牌用各自的前缀 + 精确长度/字符集。
 """
+import hashlib
 import ipaddress
 import re
 import sys
@@ -17,10 +18,10 @@ IPV4 = re.compile(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b")
 #: 原来的规则全是"窄前缀 + 精确长度"（`ghp_`/`sk-`/`AKIA`…），对**本项目自己的**
 #: 凭据一个都抓不到。实测（评审用本脚本跑的）：
 #:
-#:     NTFY_TOKEN=tk_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6      → 未命中
-#:     export SS_WEB_PASS=Hunter2MySecret                  → 未命中
-#:     WESTOCK_ACCESS_TOKEN=eyJhbGciOiJIUzI1NiJ9.abcdefg   → 未命中
-#:     password: "s3cr3t-very-long-password"               → 未命中
+#:     NTFY_TOKEN=tk_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6      → 未命中  # ggignore
+#:     export SS_WEB_PASS=Hunter2MySecret                  → 未命中  # ggignore
+#:     WESTOCK_ACCESS_TOKEN=eyJhbGciOiJIUzI1NiJ9.abcdefg   → 未命中  # ggignore
+#:     password: "s3cr3t-very-long-password"               → 未命中  # ggignore
 #:
 #: 而 RUNBOOK 里实际生成的就是 `tk_...`，`ntfy_` 那条规则**根本对不上**。
 #: CI 的"敏感信息"门禁因此给的是假安全感。
@@ -148,8 +149,106 @@ def _inside_backticks(line: str, pos: int) -> bool:
     return False
 
 
+#: **已知的"示例行"整行白名单**（逐字，去首尾空白后比对）。
+#:
+#: ## 为什么需要它
+#:
+#: CI 的密钥门禁原先是**按文件名排除**这两个文件的：
+#:     扫自己必然误报。排除这两个文件；它们的行为由 tests/test_scan_secrets.py 保证。
+#: 这条排除把**最容易被贴上真实凭据的两个地方**变成了扫描盲区 ——
+#: 写规则要举例、写测试要造样本，人最容易顺手贴真值。`[实测]` 2026-11-26：
+#: GitGuardian 报的正是这两份文件里的示例行（假值，误报），而**本仓库
+#: 自己的门禁对它们是全盲的** —— 真凭据贴进同一个位置，CI 一声不响。
+#:
+#: ## 为什么是"整行内容"而不是"值"或"行号"
+#:
+#: · **行号**：文件一增删就漂移，且不表达"这行为什么是样本"；
+#: · **值**：PEM 私钥头这种样本，它的"值"就是真凭据的首行 ——
+#:   按值豁免等于给真私钥开后门；
+#: · **整行**：样本行都带着 Python 字面量的引号/逗号或注释前缀
+#:   （`"…",`、`#:     …`），与真实凭据行（裸值）形态不同。
+#:   真凭据要与它逐字相同才会被豁免 —— 那种情况本身就不可能发生。
+#:
+#: ⚠️ 改这些样本行时白名单要跟着改，否则 CI 立刻报红。这是**故意的**：
+#: 宁可让人重新确认一遍"这确实是个假样本"。
+#:
+#: ## 生成入口只认这几个文件（**这是安全边界，不是风格**）
+#:
+#: `_SAMPLE_FILES` 之外的文件**永远不会**被生成入口读入，因此
+#: `api/auth.py` 里一条真凭据不可能被"顺手"哈希进来。
+#: 生成入口自己跑那两条命令，**不接受 stdin** —— 早期版本让人把
+#: `git ls-files | xargs cat` 的输出管进来，那等于把全仓库的命中行
+#: 都交给它哈希：真凭据也会变成白名单条目（Sourcery 2026-11-26 指出）。
+_SAMPLE_FILES = (
+    "scripts/scan_secrets.py",
+    "tests/test_scan_secrets.py",
+    "CHANGELOG.md",
+)
+_SAMPLE_LINES = frozenset((
+"0388ba798356b790f197fd36e526000d377cbc66186a7ac1f97b78c25209ffc7",
+"0a5da4e15558101b5cf872cebbe7f8c6f5a5f6cd6f26230f4aab58058d04f747",
+"1270d7dab59f90e3951fcd5792aafd6d9557445df8e9bb26d27a540478635c38",
+"15ece51b8a528c5f2d6b3a6a8df08721a946420eae6f6f768292cf231ccfe607",
+"356c70ae6f7cc405641fd6bac74ecee324c9d54ec10691a1c13b79c82b9a59a4",
+"3a39b7460f3419283c5dffa60b53e39ed7e18025d60f62419ad4019816e28428",
+"5198eedb51c64bce24635db3ddbf345ebf54840828516847c48d5444527aa4b6",
+"53768c7198c8f505e3d06a60d525455a99f278f0bb2c07bd1d1cfcd49b6d2cca",
+"587c015ff4140c542ab9780ea7782b31d2b8e9655374610590fbf064c8615530",
+"58d056799140e7d14f83863244298258f6c39bc32b4f6c11a6d7ed2dafdcecb6",
+"669db9ed027b9991172d71c367191940eb59c437549c1451e571342c5c247305",
+"6a514a170471e5f79762b8a1f058c4283b690889d7b40bd941cf596689f8a668",
+"7a16a721e32ea6d8d944b8a8e321b9c18c7289f915d7e30407a5eaf0d18b2959",
+"8cdf81b353d06d0f314b29007526f752494c8333b730b2041476484cd84f70ec",
+"93618051607e9f93bcb95a11e1ec4ddd3ec628db97b1be897bf822d80727fb65",
+"a218d0060e64ad288e2f8d3802175dc4ce80ccf9d7cf957f9434aec6725e52b1",
+"a58cd7cbd7ed4a975096f7fe6051712fb04e30d2597233345103a78cb22e59aa",
+"a5eeab08c86d2141e436d995f8bc3d42f3f68f20ea18ddde3e3623e95a36b46c",
+"aa76bb92567b1b109bc6bcfaa5fcbc82cdc8c38fbb6499185a5b4b9b7f1a50f4",
+"c65a32ef5d72c2597f1de71baeeb23d6899503fde7c5e049715f862ca7373c30",
+"ccb3db2a64c0778f7c1173c376d6fc88717a029ede3afc5f10f2e1283a3ad35e",
+"cd22c89f6b6f41e8774773cc46a160076cc73b3ed803a3f6e536cce9d2bdfa5e",
+"d6279ed88be69cc5adc446f1eaf933e0b6e8975ee7718b3d4ea8c4bb41c8c59f",
+"da743dd33a99d9b650e98aecdb49eafc3ed0fa54863e315da8ce200e28d227dc",
+"e6d4e68f19919a9a5c6dd3a54872f46c8d06a527eeb18297027ce80f99de9e1e",
+"f4e578d1f0a7d4560e627cae5e179a7c281a057c60d3ccd8f1f60721b4eb6076",
+"f8b284d57015807fa8e57c08e6f169a146059631c8e5977a6275092b378a51e0",
+"fd950e8c04985c092ced1e13ec7f26b962b78622d2e96da5aa2ea800e2fdfd7f",
+))
+
+
+def _line_hash(s: str) -> str:
+    return hashlib.sha256(s.strip().encode("utf-8")).hexdigest()
+
+
+def _is_sample(line: str) -> bool:
+    """整行是已知示例行 → 豁免。
+
+    ⚠️ 只用**整行逐字比对**，不做前缀/包含匹配 —— 包含匹配会让
+    「示例行 + 真凭据」这种拼接行整行豁免。
+    ⚠️ 白名单存的是 **sha256 摘要而非明文**：明文存进来，白名单自己就
+    成了"含有凭据样本的文件"，扫描器报自己（实测第一次就是这么红的）。
+    摘要既能让规则正常判，又不把示例串复制到第二个地方。
+    重新生成：
+        python3 scripts/scan_secrets.py --hash-lines
+    它**自己**读 `_SAMPLE_FILES` 那三个文件 + 它们的 git 历史，
+    输出直接贴回 `_SAMPLE_LINES`。**不要**再管 `git ls-files | xargs cat` ——
+    那会把真凭据也哈希进来（Sourcery 2026-11-26 指出的那个洞）。
+    """
+    _s = line.strip()
+    if _line_hash(_s) in _SAMPLE_LINES:
+        return True
+    # `git log -p` 的增删行带 `+`/`-` 前缀，先去掉一个再比 —— 否则历史扫描
+    # 永远报"这些样本行曾经出现过"（实测：全历史扫描 23 处全是这个原因）。
+    # ⚠️ 只去**一个**前缀字符：真凭据行去掉 `+` 后仍是真凭据，不会误豁免。
+    if _s[:1] in "+-" and _line_hash(_s[1:]) in _SAMPLE_LINES:
+        return True
+    return False
+
+
 def find(line: str) -> list[str]:
     """返回这一行里命中的问题描述；空列表表示干净。"""
+    if _is_sample(line):
+        return []
     hits = []
     for rx in TOKENS:
         if rx.search(line):
@@ -177,7 +276,85 @@ def find(line: str) -> list[str]:
     return hits
 
 
+def _collect_sample_hashes(root, files, history_text=None) -> list[str]:
+    """从**指定文件**里收集"已知示例行"的摘要（去重、排序）。
+
+    ⚠️ 只读 `files` 列出的文件 —— 这是安全边界。传进来的文件之外，
+    哪怕全仓库还有别的疑似凭据行，也不会被写成白名单条目。
+    ⚠️ 调用前必须把 `_SAMPLE_LINES` 清空再扫，否则样本已被豁免、
+    一条都收不到（早期版本踩过：输出为空还以为没命中）。
+    """
+    import pathlib
+
+    seen: set[str] = set()
+
+    def _add(_raw_lines):
+        for _raw in _raw_lines:
+            _t = _raw.strip()
+            # `git log -p` 的增删行带 `+`/`-`，`_is_sample` 会剥掉一个；
+            # 这里也剥，两种来源才能产出**同一个**摘要（否则历史扫描
+            # 永远对不上白名单里的条目）。
+            if _t[:1] in "+-":
+                _t = _t[1:]
+            if not _t or not find(_t):
+                continue
+            seen.add(_line_hash(_t))
+
+    root = pathlib.Path(root)
+    for _rel in files:
+        _p = root / _rel
+        if not _p.is_file():
+            continue
+        try:
+            _add(_p.read_text(encoding="utf-8", errors="replace").split("\n"))
+        except OSError:
+            continue
+    if history_text:
+        _add(history_text.split("\n"))
+    return sorted(seen)
+
+
+def _print_sample_hashes() -> int:
+    """维护模式：重新生成 `_SAMPLE_LINES`。
+
+    **不接受 stdin**：早期版本让人把 `git ls-files | xargs cat` 的结果管进来，
+    那会把**全仓库**的命中行（含真凭据）都哈希成白名单条目 —— 真凭据从此
+    被门禁放过。现在只读 `_SAMPLE_FILES` 这三个文件，历史也限定
+    `git log -- <这三个文件>`，越界的行**永远进不来**。
+    """
+    global _SAMPLE_LINES
+    import pathlib
+    import subprocess
+
+    _keep = _SAMPLE_LINES
+    _SAMPLE_LINES = frozenset()          # 关掉豁免，否则收不到样本行
+    try:
+        _root = pathlib.Path(__file__).resolve().parents[1]
+        _hist = ""
+        try:
+            _hist = subprocess.run(
+                ["git", "-C", str(_root), "log", "--all", "-p",
+                 "--pretty=format:", "--", *_SAMPLE_FILES],
+                capture_output=True, text=True, timeout=120,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            # 容器里没有 git（见 tests/conftest 的说明）—— 只出工作区部分，
+            # 这是可接受的降级：白名单是**人工维护**的，缺历史条目会立刻
+            # 在"扫描全部历史"那步报红，不会静默。
+            _hist = ""
+        _hashes = _collect_sample_hashes(_root, _SAMPLE_FILES, _hist)
+    finally:
+        _SAMPLE_LINES = _keep
+    for _h in _hashes:
+        print('    "%s",' % _h)
+    print(f"[scan_secrets] {len(_hashes)} 条示例行摘要"
+          f"（来源限定：{', '.join(_SAMPLE_FILES)}）", file=sys.stderr)
+    return 0
+
+
 def main() -> int:
+    if "--hash-lines" in sys.argv[1:]:
+        return _print_sample_hashes()
     bad = 0
     for lineno, line in enumerate(sys.stdin, 1):
         for h in find(line):

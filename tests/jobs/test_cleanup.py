@@ -1,6 +1,6 @@
 
 
-def test_disk_check_alerts_before_the_disk_is_full(conn):
+def test_disk_check_alerts_before_the_disk_is_full(conn, tmp_path, monkeypatch):
     """**磁盘告警必须提前，而不是等到写不进去**（v0.2.108）。
 
     2026-11-21：Docker 虚拟磁盘写满，PostgreSQL 报
@@ -11,7 +11,8 @@ def test_disk_check_alerts_before_the_disk_is_full(conn):
 
     现在 `check_disk()` 每 10 分钟跑一次，并且 **75% 就提前喊**。
     """
-    from jobs.cleanup import check_disk
+    from jobs import cleanup
+    from jobs.cleanup import DISK_WARN_PCT, check_disk, disk_used_pct
 
     calls = []
 
@@ -19,14 +20,32 @@ def test_disk_check_alerts_before_the_disk_is_full(conn):
         def alert(self, kind, text, level="P1"):
             calls.append((kind, level))
 
-    check_disk(conn, dispatcher=D(), path="/")
-    # 用真实的 `/` 水位：只要没到 75% 就不该喊
-    import shutil
-    used = shutil.disk_usage("/").used / shutil.disk_usage("/").total * 100
-    if used < 75:
+    check_disk(conn, dispatcher=D(), path=tmp_path)
+    # **这里必须用 `disk_used_pct()` 的判据**（2026-11-26 修）。
+    # 原来用 `shutil.disk_usage().used/total` 自己算一遍，而实现用的是
+    # `used/(used+free)`（不含 ext4 给 root 保留的 5%，见 `disk_used_pct`
+    # 的注释）。两个百分比差 4 个点左右，于是**磁盘一涨过 75% 这条用例就必红**
+    # ——红的时候报的是「磁盘才 74% 就喊了」，把人引向阈值逻辑，
+    # 而真正错的是这条用例自己的算式。
+    used = disk_used_pct(str(tmp_path))
+    assert used is not None, "拿不到水位，后面的断言没有意义"
+    if used < DISK_WARN_PCT:
         assert calls == [], f"磁盘才 {used:.0f}% 就喊了：{calls}"
     else:
         assert calls, f"磁盘已 {used:.0f}% 却没喊"
+
+    # **阈值边界必须确定性地验一遍**，不能只靠"当前这台机器恰好没满"：
+    # 水位由 `monkeypatch` 直接给定，与本机磁盘无关。
+    # `None`（读不到水位）**必须告警**：静默才是真正危险的形态。
+    for pct, should_alert in [(50.0, False), (74.9, False),
+                              (75.0, True), (96.0, True), (None, True)]:
+        monkeypatch.setattr(cleanup, "disk_used_pct", lambda _p, v=pct: v)
+        calls.clear()
+        cleanup.check_disk(conn, dispatcher=D(), path=str(tmp_path))
+        if should_alert:
+            assert calls, f"水位 {pct}% 却没告警"
+        else:
+            assert calls == [], f"水位 {pct}% 却告警了：{calls}"
 
 
 def test_disk_thresholds_are_ordered_and_low_enough():

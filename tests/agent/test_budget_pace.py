@@ -110,12 +110,45 @@ def test_missing_config_uses_defaults():
 
 
 def test_event_turns_are_never_paced():
-    """**事件回合永远放行**——源码级确认：配速只出现在心跳分支里。"""
+    """**事件回合永远放行**：让路让的是心跳与闹钟，不是真行情。
+
+    源码级确认：`_paced_out` 在 `_once()` 里必须出现在**事件派发之后**——
+    事件分支（`self._trigger("event"`）之前不应该有任何配速判断。
+    """
     import inspect
     from agent.main import AgentMain
 
     src = inspect.getsource(AgentMain._once)
-    line = [l for l in src.splitlines() if "_paced_out(" in l]
-    assert line, "心跳分支里没有配速判断"
-    assert all("heartbeat" in l or "retry" in l or "record_paced_skip" in l for l in line), (
-        f"配速跑到了心跳以外的地方：{line}")
+    before_events = src.split('_trigger("event"', 1)[0]
+    assert "_paced_out" not in before_events, (
+        "配速判断出现在事件派发之前，事件回合会被误伤")
+
+
+# ---- 闹钟也要配速 -------------------------------------------------------
+
+def test_alarm_turns_are_also_paced():
+    """**成本大头是 alarm，不是 heartbeat。**
+
+    近 3 日实测：275 个 alarm 回合吃掉 719 万 token，是心跳（154 万）的 4.7 倍。
+    只掐心跳等于没掐——真正把额度烧光的是"自己给自己排的回访"。
+    """
+    import inspect
+    from agent.main import AgentMain
+
+    src = inspect.getsource(AgentMain._once)
+    assert "for alarm in" in src, "找不到闹钟循环"
+    alarm_region = src.split("for alarm in", 1)[1]
+    # 循环守卫（在真正派发 alarm 回合之前）必须引用 paced
+    guard = alarm_region.split('_trigger("alarm"', 1)[0]
+    assert "paced" in guard, f"闹钟循环没有配速判断，alarm 会继续烧光预算：{guard[:120]}"
+
+
+def test_paced_alarms_are_not_claimed():
+    """配速时**不能认领**闹钟：认领了又不跑，它会永远停在 fired 状态。"""
+    import inspect
+    from agent.main import AgentMain
+
+    src = inspect.getsource(AgentMain._once)
+    idx = src.index("paced = self._paced_out(now)")
+    after = src[idx:idx + 400]
+    assert "after_alarm" not in after, "配速分支里出现了认领，闹钟会被漏跑"

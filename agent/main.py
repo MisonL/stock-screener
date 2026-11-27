@@ -485,8 +485,9 @@ class AgentMain:
             return True
         return self._budget_unavailable()
 
-    def _record_paced_skip(self, now) -> None:
-        """记一行「心跳因预算配速让路」——**不调模型**，只落库。
+    def _record_paced_skip(self, now, *, wake_kind: str = "heartbeat",
+                           count_only: bool = False) -> None:
+        """记一行「因预算配速让路」——**不调模型**，只落库。
 
         必须留痕：否则"今天心跳变少了"没有任何依据可查，运维会以为是卡死。
         计数写 `job_state: agent.paced_skip.<day>`，明细写 `agent_turn`。
@@ -494,11 +495,12 @@ class AgentMain:
         day = self.clock.today()
         try:
             with self.deps.conn:
-                self.deps.conn.execute(
-                    "INSERT INTO agent_turn(ts, wake_kind, context_digest, rounds, decision,"
-                    " why, fallback, market) VALUES (?,?,?,?,?,?,?,?)",
-                    (now.isoformat(), "heartbeat", "预算配速：心跳让路", 0, "silent",
-                     f"预算已用 {self._pace_used():.0%}，超过时间进度", 0, "cn_main"))
+                if not count_only:
+                    self.deps.conn.execute(
+                        "INSERT INTO agent_turn(ts, wake_kind, context_digest, rounds, decision,"
+                        " why, fallback, market) VALUES (?,?,?,?,?,?,?,?)",
+                        (now.isoformat(), wake_kind, "预算配速：让路", 0, "silent",
+                         f"预算已用 {self._pace_used():.0%}，超过时间进度", 0, "cn_main"))
                 self.deps.conn.execute(
                     "INSERT INTO job_state(name, value) VALUES (?, '1')"
                     " ON CONFLICT(name) DO UPDATE SET"
@@ -861,7 +863,18 @@ class AgentMain:
         # 单条闹钟回合上限 6 轮、墙钟上限 600 秒——串行 10 条最坏 100 分钟连续回合。
         # 这正是 `sweep_stale_alarms` docstring 里列为"要防的事故"那种形状。
         # 每轮只跑 2 条：积压仍会被消化（每 2 秒一轮），但不会一口气烧光预算。
-        for alarm in ([] if self.budget_exhausted
+        # **闹钟也要配速**（v0.2.156）：实测 alarm 回合是**最大的一笔开销**——
+        # 近 3 日 275 个 alarm 回合吃掉 719 万 token，是心跳（154 万）的 4.7 倍；
+        # 今日 63 个 alarm 回合 235 万 token，平均每个 3.33 轮。
+        # 只掐心跳等于没掐：真正把额度烧光的是"自己给自己排的回访"。
+        #
+        # **不认领、不运行**：闹钟留在 `pending`，等时间进度追上来（`allowed` 随
+        # elapsed 增长）自然恢复；到收盘仍未跑的由 `sweep_stale_alarms` 标 gave_up，
+        # 用户能看到"今天这些回访没做"，而不是悄悄消失。
+        paced = self._paced_out(now)
+        if paced and due_alarms(self.deps.conn, now):
+            self._record_paced_skip(now, wake_kind="alarm", count_only=True)
+        for alarm in ([] if (self.budget_exhausted or paced)
                       else due_alarms(self.deps.conn, now)[:ALARM_MAX_PER_ONCE]):
             # **先认领再跑**：不认领的话，60 秒的闹钟回合期间 2 秒后的下一轮会把同一个
             # 闹钟再取出一次，形成重复回合

@@ -1,6 +1,8 @@
-import { changeColor } from "../lib/colors";
+import { colorVar } from "../lib/colors";
 import { usePoll } from "../lib/api";
 import type { Market } from "../lib/market";
+import { Link } from "../components/Link";
+import { ErrorNote, Loading } from "../components/Status";
 
 type Status = {
   services: Record<
@@ -121,7 +123,8 @@ export function agentActivityOf(status: Status | null): {
 
 export function Home({ market }: { market: Market }) {
   const { data: status } = usePoll<Status>("/api/status", 10_000);
-  const { data: pool } = usePoll<{ rows: PoolRow[] }>(`/api/pool?market=${market}`, 3_000);
+  const { data: pool, error: poolError, state: poolState } =
+    usePoll<{ rows: PoolRow[] }>(`/api/pool?market=${market}`, 3_000);
   // 顶层没有再从日志 summary 兜底（Task 13：不臆造字段名，读不到按 false）
   const { data: log } = usePoll<AgentLogBody>("/api/agent-log", 60_000);
   const top = (pool?.rows ?? []).slice(0, 10);
@@ -149,21 +152,29 @@ export function Home({ market }: { market: Market }) {
       </div>
 
       <h2>池子 Top 10</h2>
+      {poolState === "loading" && <Loading label="正在拉取观察池…" />}
+      {poolState === "error" && poolError && <ErrorNote error={poolError} what="观察池" />}
       <ul className="list">
         {top.map((r) => {
-          // 红涨绿跌必须按**涨幅**上色：价格恒大于 0，`close - 1` 会让所有票都显示红色
-          const chg = r.prev_close ? ((r.close / r.prev_close - 1) * 100) : 0;
+          // 红涨绿跌必须按**涨幅**上色：价格恒大于 0，`close - 1` 会让所有票都显示红色。
+          // `prev_close` 缺失时给 null 并显示「—」：那是「没算过」，不是「没涨没跌」。
+          const chg = r.prev_close ? (r.close / r.prev_close - 1) * 100 : null;
           return (
             <li key={r.code}>
-              <a href={`/stock/${r.code}`}>{r.code}</a>
-              <span style={{ color: `var(${changeColor(chg, market)})` }}>
-                {r.close?.toFixed(2)}（{chg >= 0 ? "+" : ""}{chg.toFixed(2)}%）
+              <Link to={`/stock/${r.code}`}>{r.code}</Link>
+              <span style={chg === null ? undefined : { color: colorVar(chg, market) }}>
+                {r.close?.toFixed(2)}
+                {chg === null ? "" : `（${chg >= 0 ? "+" : ""}${chg.toFixed(2)}%）`}
               </span>
               <span>{r.score.toFixed(0)} 分</span>
             </li>
           );
         })}
-        {top.length === 0 && <li className="muted">今天还没有池子</li>}
+        {/* 加载中/取数失败时都**不能**写「今天还没有池子」——
+            那是把"没取到"说成"没有"，比报错更误导（它不响） */}
+        {poolState === "ok" && top.length === 0 && (
+          <li className="muted empty">今天还没有池子（选股任务可能还没跑）</li>
+        )}
       </ul>
     </section>
   );

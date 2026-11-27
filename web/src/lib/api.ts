@@ -17,7 +17,20 @@ export async function postJson<T>(path: string, body: unknown): Promise<T> {
   return (await resp.json()) as T;
 }
 
-export function usePoll<T>(path: string, intervalMs: number): { data: T | null; error: string | null } {
+/**
+ * 取数处于哪一步。
+ *
+ * **`loading` 和「确实没有数据」必须分开**：以前两者都表现为 `data === null`
+ * + 空数组，于是首屏还没拉到东西时，页面照常渲染空态，写出「今天还没有池子」
+ * ——用户看到的就是「系统说今天没选股」，而真相只是请求还在路上。
+ * 这类「没取到 ≠ 没有」的错报比报错更糟：它不响，也没人去查。
+ */
+export type PollState = "loading" | "ok" | "error";
+
+export function usePoll<T>(
+  path: string,
+  intervalMs: number,
+): { data: T | null; error: string | null; state: PollState } {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
   const alive = useRef(true);
@@ -43,5 +56,8 @@ export function usePoll<T>(path: string, intervalMs: number): { data: T | null; 
     };
   }, [path, intervalMs]);
 
-  return { data, error };
+  // 已有一份数据后又失败：仍算 `ok`（旧数据继续显示），error 另行提示，
+  // 不让一次抖动把整页内容擦成空白。
+  const state: PollState = data !== null ? "ok" : error !== null ? "error" : "loading";
+  return { data, error, state };
 }

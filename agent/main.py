@@ -630,10 +630,59 @@ class AgentMain:
         self.deps.conn.commit()
         return cur.rowcount
 
+    def _answer_missed_alarms(self, now, today: int) -> None:
+        """把当天**没跑成**的闹钟，用真实收盘数据合成一条补答。
+
+        2026-11-27：14:32 预算断粮后 19 个闹钟停在 `pending`，问的几乎都是
+        "飞利信是否收在 3.9954 上方""涨停家数守没守住 300"——而答案 15:05
+        就在库里了。原机制次日按日期作废，**永远没人回答**。
+
+        **不调模型**：`agent/review.py` 直接从日线与快照拼事实清单。零成本、
+        可复核，也不会把刚恢复的预算再烧一次。
+
+        幂等：`job_state: review.missed_alarms.<day>` 记过就不再推。
+        通道 B 豁免总日上限：这是收尾通知，不该挤占行情提醒的额度。
+        """
+        conn = self.deps.conn
+        key = f"review.missed_alarms.{today}"
+        if conn.execute("SELECT 1 FROM job_state WHERE name = ?", (key,)).fetchone():
+            return
+        rows = conn.execute(
+            "SELECT target, note FROM agent_schedule"
+            " WHERE substr(due_at, 1, 10) = ? AND status = 'pending'"
+            " ORDER BY due_at", (now.date().isoformat(),)).fetchall()
+        if not rows:
+            return
+        from agent import review
+
+        body, _codes = review.build(conn, [r[1] for r in rows], today,
+                                    targets=[r[0] for r in rows if r[0]])
+        if not body:
+            return                     # 没有收盘数据就不推，绝不发空消息
+        pusher = getattr(self.deps, "pusher", None)
+        if pusher is None:
+            return
+        from agent.decision import TurnDecision
+
+        decision = TurnDecision(
+            kind="speak", speak=True, level="P2",
+            body=f"今日有 {len(rows)} 条回访没跑成（额度用尽）。{body}")
+        pusher.agent_note(decision, None, None, None,
+                          exempt_from_total_cap=True, critical=True)
+        with conn:
+            conn.execute("INSERT OR REPLACE INTO job_state(name, value) VALUES (?, '1')",
+                         (key,))
+
     def close_sweep(self):
         conn = self.deps.conn
         now = self.clock.now()
         today = self.clock.today()
+        # **先把当天没跑成的闹钟补答掉**（v0.2.157）：它们问的多是"收盘价守没守 X"，
+        # 而收盘数据此刻已经落地。不做的话，次日按日期作废，永远没人回答。
+        try:
+            self._answer_missed_alarms(now, today)
+        except Exception:                              # noqa: BLE001
+            logging.getLogger("agent").warning("盘后回访补答失败（不影响清扫）", exc_info=True)
         rows = conn.execute(
             "SELECT id FROM event_log WHERE agent_status = 'pending_retry'"
             " AND trade_date <= ?", (today,)).fetchall()

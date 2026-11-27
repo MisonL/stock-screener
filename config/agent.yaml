@@ -50,15 +50,12 @@ fatigue:
   step: 5
   raise: 0.5
 
-# ⚠️ **这三个键目前没有任何读取点**（`core/config.py` 只做类型校验与默认值）。
-# 它们看着像"记忆驱动的焦点抑制"，实际并不生效——`ignored_focus: 0.7` 尤其容易误导。
-# 保留键名只是为了不改动「必填键」契约（删掉会让既有配置文件加载失败）。
-# 记忆的读路径是 `agent/memory.py::recall()`（上限 MAX_RECALL=3，只在事件回合加载）；
-# 写路径目前不存在，当日连续性由 `【我说过】` 与 `get_own_history` 工具覆盖。
-memory:
-  judgment_days: 5            # 未生效
-  per_target: 3               # 未生效
-  ignored_focus: 0.7          # 未生效
+# ⚠️ **记忆功能整体未接线**（v0.2.152 核实）：`agent/memory.py::recall()` 有实现、
+# 上下文里有【相关记忆】块，但**写路径 `write()` 全仓没有任何调用点**，生产上
+# `agent_memory` 表一行都没有 → 召回恒为空。原先在这里的三个键
+# （judgment_days / per_target / ignored_focus）因此连调参对象都不存在，已删除。
+# 当日连续性目前由【我说过】与 `get_own_history` 工具覆盖，不依赖这张表。
+# 旧站点的 agent.yaml 若还留着这三行，加载时会被忽略（多余键不报错）。
 
 pending_action_ttl_h: 24
 

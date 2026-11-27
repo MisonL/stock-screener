@@ -78,4 +78,12 @@ _dispatcher = Dispatcher(
     NtfyClient(_cfg.notify.ntfy_url, _cfg.notify.topic, os.environ.get("NTFY_TOKEN")),
     _cfg, _clock,
 )
+# **LLM 故障转移必须有人看得见**（v0.2.152）：客户端只发信号，落账在这里做。
+# 不注册的话 `last_failover` 只活在内存和日志里——11-27 那次就是"换了供应商没人知道"。
+from llm.client import set_failover_sink  # noqa: E402
+from llm.failover import record as _record_failover  # noqa: E402
+
+set_failover_sink(lambda info: _record_failover(
+    _conn, info, _clock.today(), _dispatcher))
+
 app = create_app(_cfg, _factory, _clock, dispatcher=_dispatcher)

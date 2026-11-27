@@ -850,6 +850,13 @@ def main(conn_factory=None, clock=None, every_s: int = 30) -> None:
     deps.conn_factory = conn_factory
     deps.dispatcher = Dispatcher(conn, ntfy, cfg, clock)
     deps.alert = deps.dispatcher.alert
+    # LLM 故障转移落账（与 api 同一份实现）：agent 才是真正跑模型的地方，
+    # 只让 api 注册的话，凌晨/盘中 agent 静默切换时依然没人知道。
+    from llm.client import set_failover_sink
+    from llm.failover import record as _record_failover
+
+    set_failover_sink(lambda info: _record_failover(
+        conn, info, clock.today(), deps.dispatcher))
 
     boss = AgentMain(deps, clock)
     # **心跳必须有**：compose 跑的是 `python -m agent.main`。没有心跳线程，

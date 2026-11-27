@@ -234,8 +234,10 @@ _REQUIRED_AGENT = {
     # 让所有老站点在升级当天起不来。读取方全部用 `getattr(..., 默认值)`，
     # 缺键时行为与 `_EMPTY_AGENT` 一致。
     "fatigue": {"free": None, "step": None, "raise": None},
-    # memory 三键已移除（全仓无读取点），保留允许列表条目仅为兼容旧配置文件
-    "memory": {"judgment_days": None, "per_target": None, "ignored_focus": None},
+    # **`memory` 三键已彻底移除**（v0.2.152）：`agent/memory.py::write()` 全仓
+    # 没有任何调用点，`agent_memory` 表生产上**一行都没有**，`recall()` 恒返回空，
+    # 上下文的【相关记忆】块永远不出现。三个键连"调参"的对象都不存在。
+    # 旧站点的 `agent.yaml` 里若还留着这三行，加载时被忽略——多余键不报错。
     "pending_action_ttl_h": None,
     "llm_down": {"consecutive": None, "minutes": None},
     "attention": {"shadow_mode": None},
@@ -285,7 +287,6 @@ _EMPTY_AGENT = {
     # 两条普通便签之间的最小间隔（秒）；0 = 不限制
     "agent_note_min_gap_s": 45,
     "fatigue": {"free": 10, "step": 5, "raise": 0.5},
-    "memory": {"judgment_days": 5, "per_target": 3, "ignored_focus": 0.7},
     "pending_action_ttl_h": 24,
     "llm_down": {"consecutive": 5, "minutes": 10},
     "attention": {"shadow_mode": True},

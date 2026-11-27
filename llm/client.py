@@ -113,6 +113,33 @@ class Usage:
 
 log = logging.getLogger(__name__)
 
+#: 故障转移的"落账"回调。**由进程启动时注册**（api 与 agent 各注册一份），
+#: 客户端本身不碰数据库——`LlmClient` 会被单测直接构造，不该背 DB 依赖。
+#:
+#: 2026-11-27 的教训：v0.2.150 加了故障转移，`last_failover` 只写在内存 + 一行
+#: WARNING 日志里，**没有任何消费方**。也就是说供应商真的被换掉时，没人会知道——
+#: 与"LLM_MODEL 写了没人读"是同一类错误：机制存在，但不为人知。
+_FAILOVER_SINK: Any = None
+
+
+def set_failover_sink(sink) -> None:
+    """注册故障转移回调：`sink(dict)`，参数同 `LlmClient.last_failover`。
+
+    回调抛异常**一律吞掉**：落账失败不能让一次已经成功的模型调用失败。
+    """
+    global _FAILOVER_SINK
+    _FAILOVER_SINK = sink
+
+
+def _notify_failover(info: dict) -> None:
+    sink = _FAILOVER_SINK
+    if sink is None:
+        return
+    try:
+        sink(dict(info))
+    except Exception:                            # noqa: BLE001
+        log.warning("LLM 故障转移落账失败（不影响本次调用）", exc_info=True)
+
 
 #: 主渠道连续失败后，多久之内把它排到队尾（秒）。到点自动恢复尝试，
 #: **不需要人工切回**——"切过去就回不来"是比不切换更糟的故障。
@@ -409,6 +436,8 @@ class LlmClient:
                 log.warning("LLM 端点不可用，切到备用：%s(%s) -> %s(%s) 原因=%s",
                             ep.base_url, ep.model, nxt.base_url, nxt.model,
                             type(exc).__name__)
+                # **必须有人能看见**：只打日志等于"悄悄换了供应商"。
+                _notify_failover(dict(self.last_failover))
         raise last_exc if last_exc is not None else RuntimeError("没有可用的 LLM 端点")
 
     async def _chat_at(self, ep: "_Endpoint",

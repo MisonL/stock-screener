@@ -347,6 +347,9 @@ _ALERT_TITLE = {
     "backup_stale": "备份断档",
     "jobs_down": "盘中监控已停止",
     "llm_down": "LLM 连续不可用",
+    # 故障转移不是故障，是**降级**：主渠道 401/403 后已切到备用。
+    # 必须让人知道——否则"悄悄换了供应商"，而备用渠道可能更贵/更慢/结论更差。
+    "llm_failover": "LLM 已切换备用端点",
     # 进程内自报（agent/main.py、api/routes.py）
     "agent_main_crash": "agent 主循环异常",
     "confirm": "确认执行失败",

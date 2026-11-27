@@ -15,8 +15,8 @@ import { Signals } from "./pages/Signals";
 import { AgentLog } from "./pages/AgentLog";
 import { Chat } from "./pages/Chat";
 import { usePoll } from "./lib/api";
-
-type Quote = { code: string; price: number; prev_close: number };
+import { IndexBar, type QuoteRow } from "./components/IndexBar";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 
 const stockCodeOf = (route: string) => route.startsWith("/stock/") ? route.slice("/stock/".length) : null;
 
@@ -47,8 +47,9 @@ export function App() {
   // 个股页跟随个股自己的市场，不跟切换器：切到港股后翻 A 股仍按 A 股规则显示
   const shownMarket = marketFromCode(stockCodeOf(route)) ?? market;
 
-  const { data: quotes } = usePoll<{ rows: Quote[] }>("/api/quotes", 30_000);
-  const indexRows = (quotes?.rows ?? []).filter((r) => r.code.startsWith("sh000001")).slice(0, 4);
+  // 指数栏按**当前市场**选指数（`IndexBar` 内部决定）；这里不请求 `?market=`
+  // —— 指数在快照里的市场分类是「指数」，带上市场参数反而会被筛掉。
+  const { data: quotes } = usePoll<{ rows: QuoteRow[] }>("/api/quotes", 30_000);
 
   const choose = (m: Market) => {
     setCurrent(m);
@@ -73,13 +74,11 @@ export function App() {
         </label>
       </header>
 
-      <div className="indexbar">
-        {indexRows.map((r) => (
-          <span key={r.code}>上证 {(r.price ?? 0).toFixed(2)}</span>
-        ))}
-      </div>
+      <IndexBar rows={quotes?.rows ?? []} market={shownMarket} />
 
       <main>
+        {/* 用当前路由做 key：切页时边界自动重置，上一页的错误不会留在下一页 */}
+        <ErrorBoundary key={route}>
         {route === "/" && <Home market={shownMarket} />}
         {route === "/quotes" && <Quotes />}
         {route === "/pool" && <Pool market={shownMarket} />}
@@ -93,6 +92,7 @@ export function App() {
         {route.startsWith("/stock/") && (
           <Stock code={route.slice("/stock/".length)} market={shownMarket} />
         )}
+        </ErrorBoundary>
       </main>
 
       <nav>

@@ -390,3 +390,19 @@ def test_repo_clean_scan_does_not_skip_the_scanner_itself():
              + ", " + '"scripts/scan_secrets.py")')
     assert _skip not in src, (
         "仓库自检又在按文件名跳过扫描器自己 —— 那两个文件会重新变成盲区")
+
+
+def test_attribute_chains_are_not_literals():
+    """`api_key=ep.api_key` 是"把属性赋给参数"，不是把密钥写进代码。
+
+    2026-11-27 加故障转移时，`_client_for()` 里这行被误报成"疑似密钥赋值"。
+    判据只认**完整的点分标识符**（整串匹配），不能放宽成"含点就算代码"——
+    上一轮就是因为放宽到"含 `conn`/`None` 就算代码"而漏掉了真配置。
+    """
+    from scripts.scan_secrets import find as scan_line
+
+    assert not scan_line("            api_key=ep.api_key,"), "属性链被当成密钥"
+    assert not scan_line("        key = self._secret.value"), "属性链被当成密钥"
+    # 但字面量必须照抓
+    assert scan_line('api_key="sk-abcdefgh1234"'), "带引号的字面量漏了"
+    assert scan_line("PASSWORD=Hunter2MySecret"), "真口令漏了"

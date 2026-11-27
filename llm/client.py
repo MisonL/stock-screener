@@ -17,6 +17,7 @@ import json
 import os
 import random
 import asyncio
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -108,6 +109,27 @@ class Usage:
         self.completion_tokens += int(getattr(usage, "completion_tokens", 0) or 0)
         self.total_tokens = self.prompt_tokens + self.completion_tokens
         return self
+
+
+log = logging.getLogger(__name__)
+
+
+#: 主渠道连续失败后，多久之内把它排到队尾（秒）。到点自动恢复尝试，
+#: **不需要人工切回**——"切过去就回不来"是比不切换更糟的故障。
+FAILOVER_COOLDOWN_S = 300.0
+
+
+@dataclass(frozen=True)
+class _Endpoint:
+    """一个可用的 LLM 端点：地址 + 模型 + 密钥。
+
+    三者必须绑定在一起：不同供应商的模型名不互通（`deepseek-v4.1-flash` 在
+    A 家是`国模`分组、在 B 家是另一套计费），只换地址不换模型会 404。
+    """
+
+    base_url: str
+    model: str
+    api_key: str
 
 
 @dataclass
@@ -220,24 +242,79 @@ class LlmClient:
         self._base_url = base_url
         self._api_key = api_key
         self._http_client = http_client
-        self._client = None                   # 惰性：首次调用才付 openai 的导入成本
+        self._clients: dict[str, Any] = {}    # base_url -> AsyncOpenAI（每个端点一个）
+        #: 主渠道 + 备用渠道。**主渠道永远排第一**，是否临时跳过由 `_skip_until` 决定。
+        self.endpoints: list[_Endpoint] = self._build_endpoints(base_url, api_key)
+        #: `base_url -> 跳过到这个时刻（monotonic）`。只影响"先试谁"，不影响正确性：
+        #: 到点之后主渠道会**自动**被重新尝试，不需要人工切回。
+        self._skip_until: dict[str, float] = {}
+        #: 最近一次故障转移的记录，供上层写审计/告警（`None` 表示没切过）。
+        self.last_failover: dict[str, Any] | None = None
 
-    @property
-    def client(self):
+    def _build_endpoints(self, base_url: str, api_key: str) -> list["_Endpoint"]:
+        """主渠道 + `llm.fallbacks`。**配置错了不影响主渠道**。
+
+        2026-11-27 的教训：供应商把密钥所属分组的权限一收，`/chat/completions`
+        对**每一个**模型都返回 403，agent 当场整段静默 24 小时。重试帮不上忙
+        （权限错误重试一万次也不会变好），缺的是**换一个供应商**。
+
+        `fallbacks` 是**可选**的，写错/写空都不抛：主渠道该能用还是能用，
+        不能因为"备用配置写错了"把正常调用一起弄坏。
+        """
+        eps = [_Endpoint(base_url=base_url, model=self.model, api_key=api_key)]
+        raw = getattr(getattr(self.cfg, "llm", None), "fallbacks", None) or []
+        if not isinstance(raw, list):
+            return eps
+        for item in raw:
+            try:
+                url = (item.get("base_url") or "").strip()
+                model = (item.get("model") or "").strip() or self.model
+                env_name = (item.get("api_key_env") or "").strip()
+                key = (os.environ.get(env_name, "") if env_name else api_key) or api_key
+            except AttributeError:
+                continue                      # 列表里混了非映射项，跳过
+            if not url or any(e.base_url == url and e.model == model for e in eps):
+                continue                      # 空地址、或与已有端点完全重复
+            eps.append(_Endpoint(base_url=url, model=model, api_key=key))
+        return eps
+
+    def _client_for(self, ep: "_Endpoint"):
         """惰性构造 `AsyncOpenAI`（首次访问时才 `import openai`，见文件顶部说明）。"""
-        if self._client is None:
+        cli = self._clients.get(ep.base_url)
+        if cli is None:
             from openai import AsyncOpenAI
 
-            self._client = AsyncOpenAI(
-                base_url=self._base_url,
-                api_key=self._api_key,
+            cli = AsyncOpenAI(
+                base_url=ep.base_url,
+                api_key=ep.api_key,
                 max_retries=0,                  # 我们的重试次数已经算过账，SDK 别再乘一次
                 # 单次调用的超时由 `default_timeout()` 每次决定（配置 0 时用
                 # `SAFETY_TIMEOUT_S` 兜底）。这里给 `None` 是为了**不让 client
                 # 级默认值盖掉每次请求传的值**；真正生效的是请求上的 timeout。
                 http_client=self._http_client or httpx.AsyncClient(trust_env=not _direct_http(), timeout=None),
             )
-        return self._client
+            self._clients[ep.base_url] = cli
+        return cli
+
+    @property
+    def client(self):
+        """主渠道的 client（保留旧接口，测试与故障演练都在用）。"""
+        return self._client_for(self.endpoints[0])
+
+    def _ordered_endpoints(self) -> list["_Endpoint"]:
+        """按"当前该先试谁"排序：不在冷却期的按原顺序，冷却中的排到最后。
+
+        **排序不等于跳过**：冷却中的主渠道仍会被尝试（只是排在最后），
+        所以主渠道恢复后第一次调用就会重新用上它——不需要任何"切回"操作。
+        """
+        now = time.monotonic()
+        fresh, cooling = [], []
+        for ep in self.endpoints:
+            if self._skip_until.get(ep.base_url, 0.0) > now:
+                cooling.append(ep)
+            else:
+                fresh.append(ep)
+        return fresh + cooling
 
     async def aclose(self) -> None:
         """自己建的连接自己关；调用方传进来的 httpx 实例归调用方管。"""
@@ -288,7 +365,58 @@ class LlmClient:
                    max_tokens: int | None = None, timeout_s: float | None = None,
                    deduct: Any = None, est_in: int = 0,
                    on_attempt: Any = None) -> LlmResult:
-        """一次完整调用（含截断翻倍与重试）。
+        """一次完整调用：**先主渠道，失败再换端点**（每个端点内部各自重试）。
+
+        ## 为什么要这一层
+
+        2026-11-27 生产：供应商把密钥所属分组的权限一收，
+        `/chat/completions` 对**每一个**模型都返回 403，agent 整段静默 24 小时。
+
+        **重试救不了这种事**：`403` 在 `retry.never_retry` 里是刻意的——
+        权限错误重试一万次也不会变好，只会把日志刷满。真正缺的是**换端点**。
+
+        ## 触发条件
+
+        只有"这个端点**没救了**"才换：
+        · `NonRetryable`（401/403/404 等 `never_retry` 里的状态码）；
+        · `RetriesExhausted`（重试次数用完，说明持续不可用）。
+
+        **`BudgetExceeded` 绝不触发切换**——那会让备用端点绕过预算，
+        等于给额度上限开后门。
+
+        ## 切回
+
+        失败端点进入 `FAILOVER_COOLDOWN_S` 冷却，冷却期内排到队尾；
+        到点后**自动重新尝试**主渠道。没有"粘住"状态，不需要人工切回。
+        """
+        last_exc: BaseException | None = None
+        eps = self._ordered_endpoints()
+        for idx, ep in enumerate(eps):
+            try:
+                return await self._chat_at(ep, messages, tools, max_tokens,
+                                           timeout_s, deduct, est_in, on_attempt)
+            except (NonRetryable, RetriesExhausted) as exc:
+                last_exc = exc
+                if idx == len(eps) - 1:
+                    raise                    # 已经没有下家了，原样抛给上层
+                self._skip_until[ep.base_url] = time.monotonic() + FAILOVER_COOLDOWN_S
+                nxt = eps[idx + 1]
+                self.last_failover = {
+                    "from_base_url": ep.base_url, "from_model": ep.model,
+                    "to_base_url": nxt.base_url, "to_model": nxt.model,
+                    "reason": f"{type(exc).__name__}: {exc}",
+                }
+                log.warning("LLM 端点不可用，切到备用：%s(%s) -> %s(%s) 原因=%s",
+                            ep.base_url, ep.model, nxt.base_url, nxt.model,
+                            type(exc).__name__)
+        raise last_exc if last_exc is not None else RuntimeError("没有可用的 LLM 端点")
+
+    async def _chat_at(self, ep: "_Endpoint",
+                       messages: list[dict], tools: list[dict] | None = None,
+                       max_tokens: int | None = None, timeout_s: float | None = None,
+                       deduct: Any = None, est_in: int = 0,
+                       on_attempt: Any = None) -> LlmResult:
+        """在**一个**端点上完成一次调用（含截断翻倍与重试）。
 
         **每次先扣额度、扣了不退**：`deduct(est_in, max_tokens)` 在每条网络请求
         发出前调用，成功才发。调用结束后**没有任何退款路径**——这是硬上限的全部
@@ -318,7 +446,7 @@ class LlmClient:
             if deduct is not None and not deduct(est, budget):
                 raise BudgetExceeded("预算不足以再发一次请求")
             try:
-                attempt = await self._once(messages, tools, budget, timeout)
+                attempt = await self._once(ep, messages, tools, budget, timeout)
             except NonRetryable:
                 raise
             except GeneratorExit:
@@ -359,9 +487,10 @@ class LlmClient:
         raise RetriesExhausted(last_error, attempts, usage=total)
 
 
-    async def _once(self, messages, tools, max_tokens, timeout_s) -> _Attempt:
+    async def _once(self, ep: _Endpoint, messages, tools, max_tokens,
+                    timeout_s) -> _Attempt:
         body: dict[str, Any] = {
-            "model": self.model,
+            "model": ep.model,
             "messages": messages,
             "max_tokens": max_tokens,
             # 唯一注入点：漏了它就会先烧推理 token，还会让 max_tokens 小的请求返回空正文
@@ -373,7 +502,7 @@ class LlmClient:
             body["tools"] = tools
         # **`None` 才是"不设超时"**：传 `timeout=None` 时 SDK 会保留
         # `client.timeout`（我们建 client 时也给了 None），于是整条链路无上限。
-        resp = await self.client.chat.completions.create(
+        resp = await self._client_for(ep).chat.completions.create(
             **body, timeout=float(timeout_s))
         choices = getattr(resp, "choices", None) or []
         if not choices:

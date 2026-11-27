@@ -50,6 +50,11 @@ _NOT_A_SECRET_WORDS = frozenset({
 })
 
 
+#: 完整的点分标识符：`ep.api_key`、`self._secret.value`。
+#: **必须整串匹配**：带引号/空格/数字的值不会被它吞掉。
+_DOTTED_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+")
+
+
 def _looks_like_secret_value(val: str) -> bool:
     """右侧这一串是不是真的像密钥。
 
@@ -66,6 +71,14 @@ def _looks_like_secret_value(val: str) -> bool:
     if val.strip().lower() in _NOT_A_SECRET_WORDS:
         return False
     if len(val) < 8:
+        return False
+    # **纯属性链不是密钥**（2026-11-27）：`api_key=ep.api_key` 这种
+    # "把某个对象的属性赋给另一个参数"的写法，右边是代码不是字面量。
+    # 只排除**完整的点分标识符**（`a.b` / `self._x.y`），不做更宽的模糊匹配——
+    # 一轮评审里正因为放宽到"含 conn/None 就算代码"而漏掉了真配置（见 _CODE_LINE）。
+    # 抓到的值常带尾部标点（`ep.api_key,` / `x.y;`）——先剥掉再整串比对，
+    # 否则 `fullmatch` 永远不命中，这条例外等于没写。
+    if _DOTTED_IDENT.fullmatch(val.strip().rstrip(" ,;:")):
         return False
     # 反斜杠排除：`"TOKEN=abc\n"` 里的 `\n` 是**转义文本**，不是值的一部分。
     if "\\" in val:

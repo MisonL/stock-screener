@@ -4,6 +4,16 @@ llm:
   # （官方 API、自建网关、本地 ollama 都行）。也可以用环境变量 `LLM_BASE_URL` 覆盖。
   # 不要把别人部署的中转站写进默认值——新用户不核对就会把自己的 API key 发过去。
   base_url: https://api.example.com/v1
+  # **备用渠道（可选）**：主渠道 401/403/404 或重试用尽时自动切换。
+  # 2026-11-27 生产：供应商收回分组权限，`/chat/completions` 对每个模型都 403，
+  # agent 整段静默 24 小时。重试救不了这种（权限错误不会自愈），要的是换端点。
+  # 地址/模型必须成对写：不同供应商的模型名不互通，只换地址会 404。
+  # `api_key_env` 省略时沿用主渠道的密钥。
+  # 失败端点冷却 5 分钟后自动重新尝试，不需要人工切回。
+  # fallbacks:
+  #   - base_url: http://llm-gateway.example:13000/v1
+  #     model: deepseek-v4.1-flash
+  #     api_key_env: DEEPSEEK_API_KEY
   api_key_env: DEEPSEEK_API_KEY     # 密钥从环境变量读，yaml 里只放变量名
   model: deepseek-flash
   thinking: disabled                # 默认关闭；要开时 max_tokens 须 ≥2000

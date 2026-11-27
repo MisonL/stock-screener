@@ -521,7 +521,9 @@ def test_thinking_type_reaches_extra_body():
     # 不是 `cfg.llm` —— 第一次就错在这里，fake 根本没被调用。
     cfg2 = SimpleNamespace(llm=llm_ns, retry=cfg.retry)
     c = LlmClient(cfg2)
-    c._client = SimpleNamespace(chat=_FakeChat())   # 属性缓存的就是这个
+    # **端点 client 现在按 base_url 缓存**（支持故障转移后每个端点一个），
+    # 所以要把 fake 塞进 `_clients`，而不是旧的单值 `_client`。
+    c._clients[c.endpoints[0].base_url] = SimpleNamespace(chat=_FakeChat())
     try:
         asyncio.run(c.chat([{"role": "user", "content": "hi"}], max_tokens=100))
     except Exception:                                   # noqa: BLE001

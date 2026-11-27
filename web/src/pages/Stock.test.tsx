@@ -47,3 +47,42 @@ test("折半标记读的是 pool.factors.a_group_discounted，不是顶层字段
   render(<Stock code="sh600519" market="cn_main" />);
   expect(await screen.findByText(/A 组已折半/)).toBeTruthy();
 });
+
+// ---- 缺字段不许白屏（2026-11-27 实机复现）------------------------------
+test("pool 行缺 box_high_raw/box_low_raw 时，个股页照常渲染（不许整页崩）", async () => {
+  // 实机复现：`/api/pool` 的行没有箱体字段时，boxOverlay 返回
+  // `{value: undefined}`，KLineChart 的 `o.value.toFixed(2)` 抛错，
+  // **整个个股页面白屏** —— 用户只看到一片空白，没有任何提示。
+  const rows = [{
+    trade_date: 20261030, market: "cn_main", code: "sh600519", rank: 1, score: 82.9,
+    box_days: 40, close: 10.04, close_raw: 10.04, prev_close: 10.0,
+    box_vol_mean: 6e6, pos_in_box: 0.5,
+    factors: { a_group_discounted: false },
+    // 故意不给 box_high_raw / box_low_raw
+  }];
+  vi.stubGlobal("fetch", vi.fn(async (input: string) => {
+    const path = String(input);
+    if (path.startsWith("/api/kline/")) {
+      return { ok: true, json: async () => ({ bars }) };
+    }
+    return { ok: true, json: async () => ({ trade_date: 20261030, rows }) };
+  }));
+  const { container } = render(<Stock code="sh600519" market="cn_main" />);
+  // 图照画
+  expect(await screen.findByRole("img", { name: "K 线" })).toBeTruthy();
+  // 但没有箱体线（也不能有 "undefined" 字样）
+  expect(container.textContent).not.toContain("箱顶");
+  expect(container.textContent).not.toContain("undefined");
+});
+
+test("overlays 里混进无效值也不许崩，有效的那条照画", () => {
+  const bad = [
+    { kind: "hline" as const, value: undefined as unknown as number, label: "坏线" },
+    { kind: "hline" as const, value: 10.5, label: "箱顶" },
+  ];
+  const { container } = render(<KLineChart bars={bars} overlays={bad} />);
+  const svg = container.querySelector('svg[aria-label="K 线"]');
+  expect(svg).not.toBeNull();
+  expect(container.textContent).toContain("箱顶");
+  expect(container.textContent).not.toContain("坏线");
+});

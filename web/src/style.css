@@ -45,3 +45,51 @@ a { color: #1a73e8; text-decoration: none; }
   main { padding-left: 24px; padding-right: 24px; }
   .list li { padding: 12px 16px; }
 }
+
+/* ---- 加载 / 错误 / 空态（2026-11-27）--------------------------------- */
+/* 这三种状态以前压根没有：首屏数据没到时，页面照常渲染空态，
+   写出「今天还没有池子」——把「没取到」说成「没有」。 */
+.loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--flat);
+  font-size: 13px;
+  padding: 10px 0;
+}
+.spinner {
+  width: 13px; height: 13px;
+  border: 2px solid var(--line);
+  border-top-color: var(--flat);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .spinner { animation: none; border-top-color: var(--line); }
+}
+
+.errbox {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  margin: 6px 0 12px;
+  border-left: 3px solid var(--up);
+  background: #fce8e6;
+  border-radius: 4px;
+  font-size: 13px;
+}
+.errbox code { font-size: 12px; color: #5f1d17; word-break: break-all; }
+.errbox .muted { font-size: 12px; }
+
+.empty { padding: 14px 8px; text-align: center; font-size: 13px; }
+
+/* ---- 指数栏 --------------------------------------------------------- */
+.indexitem { display: inline-flex; align-items: baseline; gap: 6px; white-space: nowrap; }
+.indexname { color: var(--flat); font-size: 12px; }
+.indexprice { font-variant-numeric: tabular-nums; font-weight: 600; }
+.indexpct { font-size: 12px; font-variant-numeric: tabular-nums; }
+
+/* ---- 列表选中态 ----------------------------------------------------- */
+.list li.selected { background: #e8f0fe; }

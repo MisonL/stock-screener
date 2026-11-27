@@ -25,8 +25,13 @@ const PAD = 40;
 export function KLineChart({ bars, overlays }: { bars: KBar[]; overlays: { value: number; label: string }[] }) {
   if (bars.length < 2) return <p className="muted">没有足够的 K 线</p>;
 
-  const top = Math.max(...bars.map((b) => b.high), ...overlays.map((o) => o.value));
-  const bottom = Math.min(...bars.map((b) => b.low), ...overlays.map((o) => o.value));
+  // **无效的 overlay 必须在算坐标轴之前就滤掉**：
+  // `Math.max(..., undefined)` 是 NaN，top/bottom 一起变 NaN，
+  // 于是每根蜡烛的 y 都是 NaN —— 图不会崩，但**整张图是空的**，
+  // 比崩还难查（没有任何报错）。
+  const lines = overlays.filter((o) => Number.isFinite(o.value));
+  const top = Math.max(...bars.map((b) => b.high), ...lines.map((o) => o.value));
+  const bottom = Math.min(...bars.map((b) => b.low), ...lines.map((o) => o.value));
   const span = top - bottom || 1;
   const step = (W - PAD) / bars.length;
   const bodyW = Math.max(1.5, step * 0.6);
@@ -38,7 +43,9 @@ export function KLineChart({ bars, overlays }: { bars: KBar[]; overlays: { value
 
   return (
     <svg viewBox={`0 0 ${W} ${H}`} role="img" aria-label="K 线">
-      {overlays.map((o) => (
+      {/* 第二道防护：`overlays` 是调用方传进来的，取不到有限数值就整条跳过。
+          以前这里直接 `o.value.toFixed(2)`，一个 undefined 就把整页画崩了。 */}
+      {lines.map((o) => (
         <g key={o.label}>
           <line x1={PAD} x2={W} y1={y(o.value)} y2={y(o.value)} stroke="#999" strokeDasharray="4 4" />
           <text x={W - 60} y={y(o.value) - 4} fontSize="11" fill="#666">{o.label} {o.value.toFixed(2)}</text>

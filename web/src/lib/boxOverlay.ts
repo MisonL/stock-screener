@@ -26,9 +26,22 @@ export type PoolRow = {
 export type KBar = { date: number; open: number; high: number; low: number; close: number; volume: number };
 export type Overlay = { kind: "hline"; value: number; label: string };
 
+/** 两条都要是有限数字才画：半条箱体线会让人以为另一半在图外。 */
+function _finite(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v);
+}
+
 export function boxOverlay(pool: PoolRow, bars: KBar[]): Overlay[] {
   if (!pool || bars.length === 0) return [];
   void bars;
+  // **缺字段就什么都不画**，绝不能把 `undefined` 放进 Overlay。
+  //
+  // 2026-11-27 实机复现：`/api/pool` 的行一旦没有 `box_high_raw`（旧数据、
+  // 迁移中途、某列 NULL 都可能），这里返回 `{value: undefined}`，
+  // 下游 `KLineChart` 的 `o.value.toFixed(2)` 直接抛异常 →
+  // **整个个股页面白屏**。不是少画一条线，是整页没了。
+  // 画图函数的输入是外部数据，必须假定字段可能缺。
+  if (!_finite(pool.box_high_raw) || !_finite(pool.box_low_raw)) return [];
   return [
     { kind: "hline", value: pool.box_high_raw, label: "箱顶" },
     { kind: "hline", value: pool.box_low_raw, label: "箱底" },

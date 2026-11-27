@@ -41,7 +41,7 @@ export function Pool({ market }: { market: string }) {
               return (
                 <Fragment key={r.code}>
                   <tr onClick={() => setOpen(open === r.code ? null : r.code)}
-                      className={discounted ? "discounted" : undefined}
+                      className={`clickable${discounted ? " discounted" : ""}`}
                       style={discounted ? { background: "#f1f3f4" } : undefined}
                       title={discounted ? "A 组已折半" : "点击查看因子明细"}>
                     <td>{r.rank}</td>

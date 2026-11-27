@@ -44,7 +44,7 @@ export function Sector() {
         {rows.map((s) => (
           <li key={s.code}
               onClick={() => open(s.code)}
-              className={picked === s.code ? "selected" : undefined}
+              className={`clickable${picked === s.code ? " selected" : ""}`}
               title="点击查看成分股">
             <span>{s.name}</span>
             <span style={s.chg === null ? undefined : { color: colorVar(s.chg) }}>

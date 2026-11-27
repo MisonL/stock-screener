@@ -72,6 +72,18 @@ class WakeGroup:
     events: list[EventRow] = field(default_factory=list)
     channel: Literal["A", "B"] = "B"
     salience: float = 0.0
+    #: 组里是否有**自选股**（`watch_rule`）事件。
+    #: 自选股不吃疲劳阈值——见 `poll()` 里放行条件处的说明。
+    watch: bool = False
+
+
+def _is_watch(e: EventRow) -> bool:
+    """这条事件是否来自**自选股**（`watch_rule`）。
+
+    只认 kind，不看 payload 里的 `watch` 字段：`watch_rule` 全部由
+    `core/intraday/watch_rules.py::eval_watch()` 产出，语义唯一。
+    """
+    return e.kind == "watch_rule"
 
 
 class AttentionLayer:
@@ -148,7 +160,8 @@ class AttentionLayer:
                     groups.append(WakeGroup(
                         id=f"merged-{run[0].id}-{len(run)}", market=run[0].market,
                         kind="merged", events=list(run), channel=channel_of(kind),
-                        salience=_merged_salience(run, self.cfg)))
+                        salience=_merged_salience(run, self.cfg),
+                        watch=any(_is_watch(e) for e in run)))
                     i = j + 1                   # 整段消费掉
                 else:
                     # **只追加锚点这一条**。整段 extend 的话，`i += 1` 后下一轮
@@ -226,7 +239,8 @@ class AttentionLayer:
                                      "30 分钟内已升级过同类事件", commit=False)
 
         singles_groups = [WakeGroup(id=f"event-{e.id}", market=e.market, kind="event",
-                                    events=[e], channel=channel_of(e.kind), salience=e.salience)
+                                    events=[e], channel=channel_of(e.kind), salience=e.salience,
+                                    watch=_is_watch(e))
                           for e in kept]
 
         if shadow:
@@ -258,7 +272,17 @@ class AttentionLayer:
         allowed: list[WakeGroup] = []
         suppressed: list[int] = []
         for g in singles_groups + merged:
-            if g.channel == "A" or g.salience >= threshold:   # ④ 通道 A 不看疲劳
+            # ④ 通道 A 不看疲劳
+            #
+            # **自选股也不看疲劳**（2026-11-27）：`watch_rule` 的显著度是
+            # `base 0.45 × focus.watch 1.3 = 0.585`，而疲劳阈值在当天推满 13 条后
+            # 就涨到 0.65 以上——**自选股告警在历史上一条都没推出去过**
+            # （全库 `event_log` 只有 2 条 `watch_rule`，全被 suppressed，
+            # `push_log` 里 0 条）。用户手动加的票是**最高意图**，
+            # 不该被"今天已经说够了"这类全局疲惫度压住；
+            # 刷屏风险由 30 分钟去重（`notify.dedupe_min`）与通道 B 日上限兜住
+            # ——实测茅台一天触发 2 次，去重后只剩 1 次。
+            if g.channel == "A" or g.watch or g.salience >= threshold:
                 allowed.append(g)
             else:
                 suppressed.extend(e.id for e in g.events)

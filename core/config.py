@@ -189,6 +189,7 @@ _REQUIRED_STRATEGY = {
         "breadth": {"stock": None, "sector_merged_3": None, "market": None},
         "focus": {k: None for k in ("outside", "pool", "watch", "market", "sector")},
         "salience_min": None,
+        "salience_critical": None,
     },
     "by_market": {m: dict(_MARKET_PARAMS) for m in ("cn_main", "cn_gem", "cn_star", "cn_bse")},
 }
@@ -227,6 +228,11 @@ _REQUIRED_AGENT = {
     "context": {"max_chars": None, "sector_events": None, "own_history": None},
     # `context.own_history_trim` 已移除（v0.2.105）：全仓无读取点，也无明确语义
     "channel_b_daily_cap": None,
+    # **`channel_b_critical_extra` / `agent_note_min_gap_s` 故意不列在这里**：
+    # `config/agent.yaml` 是站点保留文件（PRESERVE_ON_TARGET），旧站点没有这两个键，
+    # 而 `load_config()` 对必填键缺失是**直接抛 ConfigError** 的——列进来等于
+    # 让所有老站点在升级当天起不来。读取方全部用 `getattr(..., 默认值)`，
+    # 缺键时行为与 `_EMPTY_AGENT` 一致。
     "fatigue": {"free": None, "step": None, "raise": None},
     # memory 三键已移除（全仓无读取点），保留允许列表条目仅为兼容旧配置文件
     "memory": {"judgment_days": None, "per_target": None, "ignored_focus": None},
@@ -274,6 +280,10 @@ _EMPTY_AGENT = {
     "heartbeat_turn": {"rounds": 6, "deadline_s": 0},
     "context": {"max_chars": 6000, "sector_events": 8, "own_history": 10},
     "channel_b_daily_cap": 15,
+    # 极端行情可突破日上限的**额外**条数（见 agent/push.py::agent_note）
+    "channel_b_critical_extra": 3,
+    # 两条普通便签之间的最小间隔（秒）；0 = 不限制
+    "agent_note_min_gap_s": 45,
     "fatigue": {"free": 10, "step": 5, "raise": 0.5},
     "memory": {"judgment_days": 5, "per_target": 3, "ignored_focus": 0.7},
     "pending_action_ttl_h": 24,

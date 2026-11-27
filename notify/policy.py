@@ -93,6 +93,19 @@ def pushed_today(conn, kinds=None, channel: str | None = None, exclude_segments=
     return int(conn.execute(sql, params).fetchone()[0])
 
 
+def last_agent_note_at(conn, day: int | None = None) -> str | None:
+    """今天最后一条**已发出**的通道 B 便签时间（无则 `None`）。
+
+    与 `channel_b_today()` 同一口径（`agent_note` / `segment=1` / pending|accepted）：
+    计数与间隔判断必须看同一批行，否则"算进去但不算间隔"会让节流忽紧忽松。
+    """
+    today = day if day is not None else _today()
+    row = conn.execute(
+        "SELECT max(ts) FROM push_log WHERE kind = 'agent_note' AND segment = 1"
+        " AND trade_date = ? AND status IN ('pending','accepted')", (today,)).fetchone()
+    return str(row[0]) if row and row[0] else None
+
+
 def channel_b_today(conn, day: int | None = None) -> int:
     """今天**已推出去的**通道 B 条数（决定 B9/D8）。
 

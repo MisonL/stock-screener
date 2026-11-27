@@ -560,15 +560,37 @@ async def _finalize(decision: TurnDecision, rounds: int, tool_calls: list[dict],
                 push.second_segment, trigger.group.events[0].id, decision, base.grounded)
         elif trigger.wake_kind == "event":
             base.push_seq = await asyncio.to_thread(
-                push.agent_note, decision, base.grounded, code, target)
+                push.agent_note, decision, base.grounded, code, target,
+                critical=_is_critical(ev, deps.cfg))
         elif trigger.wake_kind == "open":
             base.push_seq = await asyncio.to_thread(
                 push.open_second_segment, deps.clock.today(), decision, base.grounded)
         elif trigger.wake_kind in ("heartbeat", "alarm"):
             base.push_seq = await asyncio.to_thread(
-                push.agent_note, decision, base.grounded, code, target)
+                push.agent_note, decision, base.grounded, code, target,
+                critical=_is_critical(ev, deps.cfg))
     base.level = decision.level
     return base
+
+
+def _is_critical(ev, cfg) -> bool:
+    """这条便签是不是**极端行情**（可突破通道 B 日上限）。
+
+    判据只有显著度：`salience >= strategy.attention.salience_critical`。
+    2026-11-27：指数事件实测显著度 1.12，而当天 15 条额度 13:22 就打满，
+    13:43 的「涨停破 250」被静默丢弃——用户在最猛的行情里一条没收到。
+
+    读不到配置时**返回 False**（保守）：宁可少放几条，也不能因为配置写错
+    把日上限整个打开。
+    """
+    if ev is None:
+        return False
+    try:
+        threshold = float(cfg.strategy.attention.salience_critical)
+        salience = float(getattr(ev, "salience", 0) or 0)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return salience >= threshold
 
 
 def _result(decision: TurnDecision, rounds: int, tool_calls: list[dict], rendered: Rendered,

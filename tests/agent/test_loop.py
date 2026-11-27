@@ -85,7 +85,9 @@ class FakePusher:
         self.grounded.append(grounded)
         return "push-2"
 
-    def agent_note(self, decision, grounded, code=None, target=None):
+    def agent_note(self, decision, grounded, code=None, target=None, *, critical=False):
+        # `critical` 是 v0.2.151 加的（极端行情可突破通道 B 日上限）：
+        # 假件签名必须同步，否则真实调用一到就 TypeError。
         self.agent_note_calls += 1
         self.grounded.append(grounded)
         self.agent_note_args.append((code, target))

@@ -171,7 +171,37 @@ def test_agent_note_seq_id_normalises_code(env):
     assert code6_of("sh600519") == "600519" and code6_of("600519") == "600519"
 
 
+def _cfg_without_gap(cfg):
+    """把 `agent_note_min_gap_s` 覆盖成 0 的只读代理。
+
+    `CFG` 是**只读视图**（`monkeypatch.setattr` 会抛「配置是只读的」），
+    所以用代理包一层，而不是就地改属性。
+    """
+
+    class _Agent:
+        def __init__(self, base):
+            object.__setattr__(self, "_b", base)
+
+        def __getattr__(self, name):
+            if name == "agent_note_min_gap_s":
+                return 0                      # 本条测的是编号规则，不是节流
+            return getattr(self._b, name)
+
+    class _Root:
+        def __init__(self, base):
+            object.__setattr__(self, "_b", base)
+            object.__setattr__(self, "agent", _Agent(base.agent))
+
+        def __getattr__(self, name):
+            return getattr(self._b, name)
+
+    return _Root(cfg)
+
+
 def test_agent_note_seq_id_variants(env):
+    # **本条只测 seq 编号规则，与突发节流无关**：不关掉 `agent_note_min_gap_s`
+    # 时，同一 FixedClock 下第 2 条起全被节流拦下（实测只剩 1 条）。
+    env.pusher.cfg = _cfg_without_gap(env.cfg)
     env.pusher.agent_note(_decision(), Recorder("a"), code="sh600519")
     env.pusher.agent_note(_decision(), Recorder("b"), target="pt半导体")
     env.pusher.agent_note(_decision(), Recorder("c"), target="sh000300")
@@ -243,6 +273,7 @@ def test_agent_note_dedupes_to_second_segment(env):
 def test_agent_note_falls_back_when_prev_has_no_event_id(env):
     """event_id 为 NULL 的原条必须回落为新 note：`second_segment(None)` 永不命中，
     会把这条提醒无声吞掉且不计入 channel_b_today（§7.2 去重表）。"""
+    env.pusher.cfg = _cfg_without_gap(env.cfg)      # 本条测去重回落，与突发节流无关
     env.conn.execute(
         "INSERT INTO push_log(ts, code, kind, level, seq_id, segment, body, event_id,"
         " trade_date, status) VALUES (?,?,?,?,?,?,?,?,?,?)",

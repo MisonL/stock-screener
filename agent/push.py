@@ -18,8 +18,15 @@ import os
 
 from core.clock import SH
 from notify.policy import (NON_PUSH_KINDS, agent_notes_today, channel_b_today,
+                           last_agent_note_at,
                            pushed_today, recent_independent_push)
 from notify.templates import Message, render_confirm_card
+
+#: 缺键时的默认值，**必须与 `core/config.py::_EMPTY_AGENT` 一致**。
+#: 站点 `agent.yaml` 是保留文件，升级时可能还没有这两个键；写 0 等于
+#: 功能默认关闭，而运维以为已经开了。2026-11-27 的两条 UX 修复都靠它。
+_CRITICAL_EXTRA_DEFAULT = 3
+_NOTE_GAP_DEFAULT = 45
 
 AGENT_NOTE_KIND = "agent_note"       # channel_b_today / recent_independent_push 都按它识别
 CONFIRM_KIND = "confirm_card"
@@ -220,8 +227,8 @@ class AgentPusher:
     # ---- 通道 B ----------------------------------------------------------
 
     def agent_note(self, decision, grounded, code: str | None = None,
-                   target: str | None = None, *, exempt_from_total_cap: bool = False
-                   ) -> str | None:
+                   target: str | None = None, *, exempt_from_total_cap: bool = False,
+                   critical: bool = False) -> str | None:
         """通道 B 便签。
 
         `exempt_from_total_cap`：**运维性通知**（"N 条回访被放弃"）不占
@@ -246,11 +253,35 @@ class AgentPusher:
         # `BEGIN IMMEDIATE` 先拿写锁再读，读到的就是别人已提交的最新值。
         conn.execute("BEGIN IMMEDIATE")
         try:
-            if channel_b_today(conn, today) >= cap:
+            used_b = channel_b_today(conn, today)
+            # **极端行情可突破日上限，但只有有限额度**（`critical` 由调用方按
+            # 事件显著度判定）。硬上限会在最强的那天挡掉最重要的消息：
+            # 2026-11-27 涨停 250→306，15 条额度 13:22 打满，13:43「涨停破 250」
+            # 被静默丢弃。额度仍然要有——只是不能"前面说了 15 条"就把
+            # "今天最该说的那条"永久挡死。
+            extra = int(getattr(self.cfg.agent, "channel_b_critical_extra",
+                                 _CRITICAL_EXTRA_DEFAULT) or 0)
+            if used_b >= cap + (extra if critical else 0):
                 # **超限时只写 agent_turn，不写 push_log**：写 suppressed 行会污染 seq 计数
                 conn.rollback()
                 self._audit_cap("通道 B 日上限")
                 return None
+            # **突发节流**：实测 13:01:24-13:02:30 66 秒内推了 5 条，把一天的
+            # 额度烧掉三分之一；额度本该留给后面的真行情。极端行情不受此限。
+            if not critical:
+                gap = int(getattr(self.cfg.agent, "agent_note_min_gap_s",
+                                  _NOTE_GAP_DEFAULT) or 0)
+                last = last_agent_note_at(conn, today)
+                if gap > 0 and last:
+                    from datetime import datetime as _dt
+                    try:
+                        elapsed = (self.clock.now() - _dt.fromisoformat(last)).total_seconds()
+                    except (TypeError, ValueError):
+                        elapsed = float(gap)          # 解析不了就别拦
+                    if elapsed < gap:
+                        conn.rollback()
+                        self._audit_cap(f"通道 B 间隔 {gap}s")
+                        return None
             if not exempt_from_total_cap:
                 total_cap = int(self.cfg.notify.daily_cap)
                 used = pushed_today(conn, channel=None, exclude_segments=(2,),
@@ -304,12 +335,26 @@ class AgentPusher:
         return f"note-market-{market[0] if market else 'cn_main'}-{today}-{n}"
 
     def _audit_cap(self, why: str) -> None:
+        """记一条「这条本该发、但被门控拦下」。
+
+        **同时累加当天计数**（`job_state: push.dropped.<day>.<why>`）：
+        原来只在 `agent_turn` 里留一行 `why`，而 `agent_turn` 是回合流水，
+        没人会去数"今天被丢了多少条"。2026-11-27 复盘时我查了半天才发现
+        13:43 那条根本没进 `push_log`——**被静默丢弃且没有任何可见痕迹**。
+        计数落库后，`/api/status` 与复盘脚本都能直接读到。
+        """
+        now = self.clock.now()
+        key = f"push.dropped.{self.clock.today()}.{why}"
         with self.conn:
             self.conn.execute(
                 "INSERT INTO agent_turn(ts, wake_kind, context_digest, rounds, decision, why,"
                 " fallback, market) VALUES (?,?,?,?,?,?,?,?)",
-                (self.clock.now().isoformat(), "heartbeat", f"通道B被压 {why}", 1, "speak",
+                (now.isoformat(), "heartbeat", f"通道B被压 {why}", 1, "speak",
                  f"超{why}", 0, "cn_main"))
+            self.conn.execute(
+                "INSERT INTO job_state(name, value) VALUES (?, '1')"
+                " ON CONFLICT(name) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
+                (key,))
 
     # ---- 确认卡 ----------------------------------------------------------
 

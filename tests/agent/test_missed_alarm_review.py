@@ -142,3 +142,30 @@ def test_stale_snapshot_is_not_reported_as_today(conn):
                      ("2026-11-26T15:05:00+08:00",))
     body, _ = review.build(conn, ["涨停家数守住没"], 20261127)
     assert "涨停" not in body, f"拿昨天的广度冒充今天：{body}"
+
+
+def test_stocks_are_prioritised_over_indexes(conn):
+    """**个股优先**：2026-11-27 实测 19 条闹钟里 4 条挂在指数上，把 6 个名额
+    占满，真正被反复问的「飞利信」「史丹利」一个都没出现。
+
+    指数涨多少用户自己看得见；个股守没守住某条线才是 agent 答应回访的事。
+    """
+    with conn:
+        conn.execute("INSERT INTO daily_bars(code, date, open, high, low, close, volume,"
+                     " amount, source) VALUES ('sh000001', 20261127, 3500, 3610, 3467, 3606, 1, 1, 't')")
+        conn.execute("INSERT INTO daily_bars(code, date, open, high, low, close, volume,"
+                     " amount, source) VALUES ('sz399006', 20261127, 2200, 2444, 2199, 2443, 1, 1, 't')")
+    body, codes = review.build(
+        conn, ["看飞利信", "看华鲁恒升", "创业板指回撤"], 20261127,
+        targets=["sh000001", "sz399006", "sz300287", "sh600426"])
+    assert codes[:2] == ["sz300287", "sh600426"], f"指数占了前面的名额：{codes}"
+    assert any(c.startswith(("sh000", "sz399")) for c in codes[2:]), "指数被整个丢掉了"
+
+
+def test_index_only_still_reports(conn):
+    """只有指数时也要能出内容，不能因为"个股优先"就整条不推。"""
+    with conn:
+        conn.execute("INSERT INTO daily_bars(code, date, open, high, low, close, volume,"
+                     " amount, source) VALUES ('sh000001', 20261127, 3500, 3610, 3467, 3606, 1, 1, 't')")
+    body, codes = review.build(conn, ["看大盘"], 20261127, targets=["sh000001"])
+    assert "sh000001 收 3606" in body

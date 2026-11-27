@@ -114,8 +114,22 @@ def build(conn, notes, trade_date: int, *, targets=()) -> tuple[str, list[str]]:
     返回 `(body, codes)`；没有可用数据时 `body` 为空——**不推空消息**。
     """
     notes = list(notes)
-    codes = list(dict.fromkeys(list(targets) + codes_in(notes) + named_codes(conn, notes)))
-    codes = [c for c in codes if c and isinstance(c, str)][:6]
+    # **个股优先于指数**（v0.2.158，今日实测踩到）：原来的顺序是
+    # `targets + 代码 + 名字` 截前 6 个，结果 19 条闹钟里有 4 条挂在指数上
+    # （sh000001 / sh000688 / sz399001 / sz399006），把名额占满——
+    # 而真正被反复问的「飞利信」「史丹利」一个都没出现。
+    #
+    # 补答的价值在个股：指数涨多少用户自己看得见，个股守没守住某条线才是
+    # agent 真正答应要回访的事。所以先排个股，指数放到最后。
+    raw = list(dict.fromkeys(list(targets) + codes_in(notes) + named_codes(conn, notes)))
+    raw = [c for c in raw if c and isinstance(c, str)]
+    try:
+        from core.market import INDEX, classify_market
+        indexes = [c for c in raw if classify_market(c) == INDEX]
+        stocks = [c for c in raw if classify_market(c) != INDEX]
+    except Exception:                            # noqa: BLE001
+        stocks, indexes = raw, []
+    codes = (stocks + indexes)[:6]
     lines: list[str] = []
 
     if codes:

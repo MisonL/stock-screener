@@ -448,7 +448,14 @@ curl -s https://stock.example.com/healthz          # {"ok":true,"version":"x.y.z
 make check-version                    # 先确认没有漂移（纯文本检查，不用 Docker）
 make release VERSION=x.y.z            # 干跑，看它打算改什么
 make release VERSION=x.y.z APPLY=1    # 真执行（**只有 1 算真**，0/false 都是干跑）
-git push && git push --tags
+```
+
+`APPLY=1` 会**连推送一起做**（commit + tag 都推）。不需要再手动
+`git push && git push --tags` —— 原来那一步靠人记得，`v0.2.141/142/144/147`
+四次 CI 变红全是「tag 打了没推」。要只做本地不推，加 `--no-push`：
+
+```bash
+python3 scripts/release.py x.y.z --apply --no-push
 ```
 
 部署新版本：

@@ -45,8 +45,10 @@ check-version:
 	python3 -m pytest -q tests/test_version.py
 
 # 发布：make release VERSION=0.2.1
-# 默认干跑；只有 APPLY=1 才真执行。
+# 默认干跑；只有 APPLY=1 才真执行（改版本号、提交、打 tag、**推送**）。
+# 要只做本地不推：make release VERSION=0.2.1 APPLY=1 NOPUSH=1
 # **不能用 $(if $(APPLY),...)**：make 把任何非空串当真值，APPLY=0 / APPLY=false
 # 都会展开成 --apply 而触发真实发布（复核实测过）。
 release:
-	python3 scripts/release.py $(VERSION) $(if $(filter 1,$(APPLY)),--apply,)
+	python3 scripts/release.py $(VERSION) $(if $(filter 1,$(APPLY)),--apply,) \
+		$(if $(filter 1,$(NOPUSH)),--no-push,)

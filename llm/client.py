@@ -202,10 +202,20 @@ def classify(src: _Attempt | Exception, fatal_status=None, retry_on=None) -> Ver
 class LlmClient:
     def __init__(self, cfg, http_client: httpx.AsyncClient | None = None):
         self.cfg = cfg
-        base_url = os.environ.get("LLM_BASE_URL", cfg.llm.base_url)
+        # **空串必须当成"没设"**（2026-11-27）：原来写
+        # `os.environ.get("LLM_BASE_URL", cfg.llm.base_url)`——
+        # 只要变量**存在**（哪怕是空串）就返回它，于是 `.env` 里留一行
+        # `LLM_BASE_URL=` 会把 base_url 变成空串，所有请求打到相对地址上。
+        # `or` 才算"没给值就用 yaml"。
+        base_url = (os.environ.get("LLM_BASE_URL") or "").strip() \
+            or cfg.llm.base_url
         api_key = os.environ.get("LLM_API_KEY") or os.environ.get(
             str(cfg.llm.api_key_env), "") or "not-needed"
-        self.model = cfg.llm.model
+        # **`LLM_MODEL` 原来完全没被读**（2026-11-27 发现）：站点 `.env` 里一直
+        # 写着 `LLM_MODEL=`，改它却毫无效果，只有 `config/llm.yaml` 生效——
+        # 排查时会以为"已经换了模型"而实际还在用旧的。三个变量（key/base_url/
+        # model）现在都按同一套语义解析：空串等于没设，回退到 yaml。
+        self.model = (os.environ.get("LLM_MODEL") or "").strip() or cfg.llm.model
         self._owns_http = http_client is None
         self._base_url = base_url
         self._api_key = api_key

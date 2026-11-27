@@ -1,5 +1,47 @@
 ## [Unreleased]
 
+###修复（`LLM_MODEL` 从来没被读取过）
+
+生产上 agent 自 11-27 起全部 `error: LLM 状态码 403`。真因是**供应商账号**
+——密钥所属分组失去了「国模」组的权限（`/v1/models` 能列出 15 个模型、
+`/chat/completions` 对**每一个**模型都 403）。已换渠道恢复。
+
+但排查过程中暴露了一个**我们自己的**真 bug：
+
+```
+nginx → .env 里改了 LLM_MODEL → agent 仍然用模型 A
+```
+
+因为 `llm/client.py` 里 `self.model = cfg.llm.model`，**`LLM_MODEL` 这个
+环境变量根本没有读取点**。而站点 `~/.config/stock-screener/llm.env` 里一直
+写着它——**写了三年、从来没生效过**。改它的人会以为换成了新模型，实际还在用
+yaml 里的那个，于是"越改越不对"。
+
+- `LLM_MODEL` 现在真的生效，语义与另外两个变量统一：
+  **非空就用 env，否则回退 yaml**。
+- 顺手修掉同类问题：`LLM_BASE_URL` 原来是
+  `os.environ.get(k, cfg.llm.base_url)`——只要变量**存在**（哪怕是空串）
+  就返回它，于是 `.env` 里留一行 `LLM_BASE_URL=` 会把 base_url 变成空串，
+  所有请求打到相对地址上。改成空串/空白都回退 yaml。
+- 用例覆盖 8 种组合（未设 / 空串 / 纯空白 / 有值 × base_url / model）。
+  变异验证：把 `base_url` 改回旧写法，2 条立刻红。
+
+###文档
+
+新增 `RUNBOOK §9.3.2.1 LLM 鉴权失败`。这次排查真正花时间的不是"哪里坏了"，
+而是**"改了为什么不生效"**：配置分散在两处（仓库外的 `llm.env` 与站点保留的
+`config/llm.yaml`），且其中一处的一个键还是哑的。章节里写清了三件事：
+
+1. `/v1/models` 能列出模型但 `/chat/completions` 全 403 = **账号分组权限问题**，
+   不是 key 无效、也不是代码；
+2. 改配置必须**两处都改**，改完 `--force-recreate agent api`（两个都要）；
+3. `403` 在 `retry.never_retry` 里是**故意的**——权限错误重试一万次也不会好。
+   这里缺的是 failover（换供应商），不是重试。
+
+###测试
+
+81.4 全量 **1513 passed, 3 skipped**。
+
 ### 修复（发版脚本默认推送 —— "别忘了 push --tags" 连漏四次）
 
 `v0.2.141 / 142 / 144 / 147` 四次 main CI 变红，全是同一条：

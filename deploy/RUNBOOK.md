@@ -645,6 +645,59 @@ root 权限交给一个容器，与"最小暴露面"的取舍冲突，目前**�
 仍会被杀，所以在源头挡住。备份本身另有启动补跑兜底
 （`jobs/backup.py::catch_up_missed_backup`，见 §9.1）。
 
+### 9.3.2.1 LLM 鉴权失败（agent 整段静默）
+
+**症状**：网页对话报错、agent 不再发言，`event_log`/`push_log` 里出现
+`llm_down`；`agent_turn.decision` 连续是 `error`，`why` 是
+`LLM 状态码 403`（或 401）。
+
+**2026-11-27 实例**（值得记住，因为排查看起来像代码问题，其实是账号权限）：
+
+```
+HTTP 403 {"error":{"message":"No permission to access group 国模 ..."}}
+```
+
+关键判断：**`/v1/models` 能列出模型 → 密钥本身有效**，
+只是它所属的**分组没有该模型组的访问权限**（new-api 网关：分组、欠费、换套餐）。
+逐个试 `deepseek-flash` / `deepseek-v4.1-flash` / `glm-5.3-flash` **全是同一个 403**，
+就说明是账号级、不是模型级的。
+
+排查与恢复：
+
+```bash
+# 1. 在 agent 容器里直接打一次（不打印 key）
+docker exec stock-screener-agent-1 python3 - <<'PY'
+import json, os, urllib.request, urllib.error
+base = os.environ["LLM_BASE_URL"].rstrip("/")
+req = urllib.request.Request(base + "/models",
+        headers={"Authorization": "Bearer " + os.environ["DEEPSEEK_API_KEY"]})
+try:
+    print("models OK:", len(json.loads(urllib.request.urlopen(req, timeout=20).read())["data"]))
+except urllib.error.HTTPError as e:
+    print("HTTP", e.code, e.read()[:200])
+PY
+```
+
+- `/models` 也 401/403 → key 无效或被禁用，换 key；
+- `/models` 能列、`/chat/completions` 全 403 → **分组权限问题**（本文这次）；
+
+**改配置必须改两个地方，缺一个都不生效**：
+
+| 位置 | 作用 | 备注 |
+|---|---|---|
+| `~/.config/stock-screener/llm.env` | key（`DEEPSEEK_API_KEY`）、可选 `LLM_BASE_URL` / `LLM_MODEL` | **在仓库外**，不进 git |
+| `<部署目录>/config/llm.yaml` | `base_url` / `model` | 站点保留文件，`deploy.py` 不会覆盖 |
+
+改完要 `up -d --force-recreate agent api`（**两个都要**：网页对话走 api）。
+
+**`LLM_MODEL` 曾经完全不被读取**（v0.2.149 修）：以前只有 `config/llm.yaml`
+里的 `model` 生效，`.env` 里改它毫无反应——排查时会误以为"已经换模型了"。
+现在三个变量统一：非空就用 env，否则回退 yaml。
+
+**为什么 403 不自动重试**：`config/llm.yaml` 的 `retry.never_retry` 显式包含
+`403`。权限错误重试一万次也不会变好，只会把日志刷满。真正缺的是
+**换供应商**（failover），不是重试——见下方"已知缺口"。
+
 ### 9.3.3 部署互斥
 
 部署会在目标机的 `<部署目录>/.deploy.lock` 上拿一个**内核 `flock`**，

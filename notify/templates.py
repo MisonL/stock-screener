@@ -87,6 +87,17 @@ class CloseStats:
     by_kind: dict[str, int]
     by_level: dict[str, int]
     pool_sizes: dict[str, int]
+    # ---- 当日市场概况（可选：取不到就是 None，摘要不渲染这一行）----
+    # 2026-11-27 的教训：那天涨停 250→306，收盘统计却只写"推送 26 条 | 压制 0 条"，
+    # **对当天的行情只字未提**。用户想知道的核心是"今天是什么日子"，不是推送条数。
+    limit_up: int | None = None
+    limit_down: int | None = None
+    up_n: int | None = None
+    down_n: int | None = None
+    # ---- 因通道上限/节流**被丢弃**的条数（v0.2.151 起有据可查）----
+    # 原来的"压制 0 条"是错的：被日上限丢掉的那些根本不写 push_log，
+    # 于是摘要报 0，而实际当天丢了 31 条。
+    dropped: int = 0
 
 
 _AUCTION_LABEL = {"high_open": "高开", "low_open": "低开", "auction_vol": "竞价放量"}
@@ -327,6 +338,18 @@ def render_close_digest(stats: CloseStats, cfg, trade_date: int = 0,
         " · ".join(f"{k} {v}" for k, v in sorted(stats.by_kind.items())) or "无",
         "池子：" + ("、".join(f"{k} {v}" for k, v in sorted(stats.pool_sizes.items())) or "无"),
     ]
+    # **当日行情放在最前面之前**只有统计没有行情。有数据才渲染：
+    # 快照缺失（节假日/抓取失败）时不能凭空写 0 涨停。
+    if stats.limit_up is not None:
+        breadth = f"涨停 {stats.limit_up}"
+        if stats.limit_down is not None:
+            breadth += f" ｜ 跌停 {stats.limit_down}"
+        if stats.up_n is not None and stats.down_n is not None:
+            breadth += f" ｜ 上涨 {stats.up_n} / 下跌 {stats.down_n}"
+        body.insert(0, breadth)
+    if stats.dropped > 0:
+        # 这条必须显眼：它说明**今天有该说的没说出去**。
+        body.append(f"⚠️ 通道额度已满，丢弃 {stats.dropped} 条发言")
     # **图标只留一处**：标题不写 emoji，交给 `tags` 渲染。
     # 两边都写时手机端显示两个图标（实机验证：两个夕阳）。
     return Message(title="收盘统计", body="\n".join(body), priority=3, tags=["city_sunset"],

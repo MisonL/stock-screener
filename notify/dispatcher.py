@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timedelta
 
 from core.intraday.detector import level_for
@@ -436,9 +437,74 @@ class Dispatcher:
             "SELECT kind, count(*) FROM signals WHERE trade_date=? GROUP BY kind", (day,))}
         by_level = {r[0]: r[1] for r in self.conn.execute(
             "SELECT level, count(*) FROM signals WHERE trade_date=? GROUP BY level", (day,))}
+        breadth = self._close_breadth()
         return CloseStats(pushed=pushed, suppressed=suppressed,
                           signals_n=sum(by_kind.values()),
-                          by_kind=by_kind, by_level=by_level, pool_sizes=self._pool_sizes())
+                          by_kind=by_kind, by_level=by_level, pool_sizes=self._pool_sizes(),
+                          limit_up=breadth.get("limit_up"),
+                          limit_down=breadth.get("limit_down"),
+                          up_n=breadth.get("up"), down_n=breadth.get("down"),
+                          dropped=self._dropped_today())
+
+    def _close_breadth(self) -> dict:
+        """收盘时的市场概况，**读 `snapshot_cache` 里最后一个全市场快照**。
+
+        2026-11-27：涨停 250→306 的强势日，收盘统计只报"推送 26 条 | 压制 0 条"，
+        对当天行情只字未提——用户想知道的是"今天是什么日子"。
+
+        **取不到就返回空字典**：节假日、抓取失败、缓存被清理时不能凭空写
+        "涨停 0"，那比不写更误导。
+        """
+        try:
+            row = self.conn.execute(
+                "SELECT payload FROM snapshot_cache WHERE scope = 'market'").fetchone()
+            if not row or not row[0]:
+                return {}
+            rows = json.loads(str(row[0])).get("rows") or []
+        except (TypeError, ValueError, sqlite3.Error):
+            return {}
+        if not rows:
+            return {}
+
+        def _num(r, key):
+            return r.get(key) if isinstance(r.get(key), (int, float)) else None
+
+        up_n = down_n = limit_up = limit_down = 0
+        for r in rows:
+            price, prev = _num(r, "price"), _num(r, "prev_close")
+            if price is None or prev is None:
+                continue
+            if price > prev:
+                up_n += 1
+            elif price < prev:
+                down_n += 1
+            cap = _num(r, "up")
+            floor = _num(r, "down")
+            if cap is not None and price >= cap:
+                limit_up += 1
+            if floor is not None and price <= floor:
+                limit_down += 1
+        return {"up": up_n, "down": down_n, "limit_up": limit_up, "limit_down": limit_down}
+
+    def _dropped_today(self) -> int:
+        """今天因通道上限/节流被**丢弃**的发言数（`push.dropped.<day>.*` 求和）。
+
+        原来摘要里的"压制 N 条"只数 `push_log.status='suppressed'`，而通道上限丢掉的
+        那些**根本不写 push_log**——2026-11-27 实际丢了 31 条，摘要报的是 0。
+        """
+        try:
+            rows = self.conn.execute(
+                "SELECT value FROM job_state WHERE name LIKE ?",
+                (f"push.dropped.{self.clock.today()}.%",)).fetchall()
+        except sqlite3.Error:
+            return 0
+        total = 0
+        for (v,) in rows:
+            try:
+                total += int(v)
+            except (TypeError, ValueError):
+                continue
+        return total
 
     def close_digest(self) -> None:
         day = self.clock.today()

@@ -169,3 +169,22 @@ def test_index_only_still_reports(conn):
                      " amount, source) VALUES ('sh000001', 20261127, 3500, 3610, 3467, 3606, 1, 1, 't')")
     body, codes = review.build(conn, ["看大盘"], 20261127, targets=["sh000001"])
     assert "sh000001 收 3606" in body
+
+
+def test_most_asked_stock_wins_a_slot(conn):
+    """**按被问次数排**，不是按名字长短。
+
+    11-27 的 19 条闹钟里「飞利信」出现在 12 条上，是绝对主角；按长度排序时
+    它和别的 3 字名一样长，被挤出了 6 个名额（实测）。
+    """
+    with conn:
+        for code, name in (("sh688373", "盟科药业"), ("sz300003", "乐普医疗"),
+                           ("sh601818", "中粮资本")):
+            conn.execute("INSERT INTO stock_meta(code, name, market, industry, updated_at)"
+                         " VALUES (?,?,'cn_main','x','2026-11-27')", (code, name))
+            conn.execute("INSERT INTO daily_bars(code, date, open, high, low, close, volume,"
+                         " amount, source) VALUES (?, 20261127, 10, 11, 9, 10, 1, 1, 't')", (code,))
+    notes = ["看飞利信能否收回上沿"] * 12 + [
+        "盟科药业是否推近上沿", "乐普医疗量比", "中粮资本上沿"]
+    codes = review.named_codes(conn, notes, limit=2)
+    assert codes[0] == "sz300287", f"最常被问的票没排第一：{codes}"

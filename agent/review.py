@@ -56,9 +56,21 @@ def named_codes(conn, notes, limit: int = 6) -> list[str]:
         names = conn.execute("SELECT code, name FROM stock_meta WHERE name IS NOT NULL").fetchall()
     except sqlite3.Error:
         return hits
-    for code, name in sorted(names, key=lambda r: -len(str(r[1]))):
+    # **按"被问了几次"排序**，不是按名字长短（v0.2.159，实测踩到）：
+    # 11-27 的 19 条闹钟里「飞利信」出现在 12 条上，是绝对主角，但按长度排序时
+    # 它和「史丹利」「中粮资本」一样长，被别的 3 字名挤出了 6 个名额。
+    # 频次才是"agent 有多在意这只票"的真实信号。
+    scored = []
+    for code, name in names:
         name = str(name).strip()
-        if len(name) < 2 or name not in text or code in hits:
+        if len(name) < 2 or code in hits:
+            continue
+        n = text.count(name)
+        if n == 0:
+            continue
+        scored.append((n, len(name), code))
+    for _n, _len, code in sorted(scored, key=lambda t: (-t[0], -t[1])):
+        if code in hits:
             continue
         hits.append(code)
         if len(hits) >= limit:

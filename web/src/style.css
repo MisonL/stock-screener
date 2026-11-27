@@ -7,8 +7,8 @@
   --line: #e3e6ea;
   --line-strong: #d3d8de;
   --ink: #1f2328;
-  --ink-2: #57606a;
-  --accent: #1a73e8;
+  --ink-2: #4d545c;
+  --accent: #1565c0;
   --accent-soft: #e8f0fe;
   /* 间距与圆角统一走这里，避免每个 class 各写一套数值 */
   --gap: 12px;
@@ -52,9 +52,9 @@ h2:first-child { margin-top: 4px; }
 h3 { font-size: 13px; font-weight: 600; color: var(--ink-2); margin: 16px 0 8px; }
 section > p { margin: 6px 0; }
 .statusbar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
-.badge { padding: 2px 8px; border-radius: 10px; background: #eef1f5; font-size: 12px; }
-.badge.ok { background: #e6f4ea; color: var(--down); }
-.badge.bad { background: #fce8e6; color: var(--up); }
+.badge { padding: 3px 9px; border-radius: 10px; background: #eef1f5; color: #4e5257; font-size: 12px; }
+.badge.ok { background: #e6f4ea; color: #0f6b2f; }
+.badge.bad { background: #fce8e6; color: #b3261e; }
 .list { list-style: none; padding: 0; margin: 0; }
 .list {
   list-style: none; padding: 0; margin: 0 0 var(--gap);
@@ -230,3 +230,15 @@ pre {
   font-size: 12px; line-height: 1.5;
   border-radius: 8px; max-height: 320px; overflow: auto;
 }
+
+/* ---- 触控目标（2026-11-27 实测 50x22px，手机上很难点中）-----------------
+   WCAG 2.5.8 要求最小 24x24，Apple/Material 建议 44x44。
+   纯文本链接只有 22px 高，用「内边距撑大 + 负外边距抵消」把可点区域拉到
+   44px，**视觉位置和行高都不变**（否则整页会松一大圈）。 */
+.list li > a, table td > a {
+  display: inline-block;
+  padding: 11px 4px;
+  margin: -11px -4px;
+}
+/* 12px 在手机上偏小，指数名与涨跌是盯盘时最常看的两处，提到 13px */
+.indexname, .indexpct { font-size: 13px; }

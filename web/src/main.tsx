@@ -16,6 +16,7 @@ import { AgentLog } from "./pages/AgentLog";
 import { Chat } from "./pages/Chat";
 import { usePoll } from "./lib/api";
 import { IndexBar, type QuoteRow } from "./components/IndexBar";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 
 const stockCodeOf = (route: string) => route.startsWith("/stock/") ? route.slice("/stock/".length) : null;
 
@@ -76,6 +77,8 @@ export function App() {
       <IndexBar rows={quotes?.rows ?? []} market={shownMarket} />
 
       <main>
+        {/* 用当前路由做 key：切页时边界自动重置，上一页的错误不会留在下一页 */}
+        <ErrorBoundary key={route}>
         {route === "/" && <Home market={shownMarket} />}
         {route === "/quotes" && <Quotes />}
         {route === "/pool" && <Pool market={shownMarket} />}
@@ -89,6 +92,7 @@ export function App() {
         {route.startsWith("/stock/") && (
           <Stock code={route.slice("/stock/".length)} market={shownMarket} />
         )}
+        </ErrorBoundary>
       </main>
 
       <nav>

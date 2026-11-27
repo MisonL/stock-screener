@@ -41,18 +41,27 @@ export function Sector() {
       {state === "ok" && rows.length === 0 && <p className="muted empty">今天还没有板块数据</p>}
 
       <ul className="list">
-        {rows.map((s) => (
-          <li key={s.code}
-              onClick={() => open(s.code)}
-              className={`clickable${picked === s.code ? " selected" : ""}`}
-              title="点击查看成分股">
-            <span>{s.name}</span>
-            <span style={s.chg === null ? undefined : { color: colorVar(s.chg) }}>
-              {s.chg === null ? "—" : `${s.chg >= 0 ? "+" : ""}${s.chg.toFixed(2)}%`}
-            </span>
-            <span className="muted">{s.members ?? 0} 只</span>
-          </li>
-        ))}
+        {rows.map((s) => {
+          // **只能用 `Number.isFinite` 判"有没有数值"**。
+          // 接口里的字段可能是 `null`、可能整个键都不存在（`undefined`）、
+          // 也可能是 NaN——`x === null` 挡不住后两种，`x.toFixed()` 照样抛。
+          // 2026-11-27 实测：`/api/sector` 返回的是 `pct` 而不是 `chg`，
+          // 于是这里 `undefined.toFixed(2)` 抛错 → React 卸载整棵树 →
+          // **点"板块"整个应用白屏**（不是这一页空，是整站没了）。
+          const chg = Number.isFinite(s.chg) ? (s.chg as number) : null;
+          return (
+            <li key={s.code}
+                onClick={() => open(s.code)}
+                className={`clickable${picked === s.code ? " selected" : ""}`}
+                title="点击查看成分股">
+              <span>{s.name}</span>
+              <span style={chg === null ? undefined : { color: colorVar(chg) }}>
+                {chg === null ? "—" : `${chg >= 0 ? "+" : ""}${chg.toFixed(2)}%`}
+              </span>
+              <span className="muted">{s.members ?? 0} 只</span>
+            </li>
+          );
+        })}
       </ul>
 
       {picked && (

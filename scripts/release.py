@@ -11,7 +11,8 @@
 用法：
 
     python3 scripts/release.py 0.2.1            # 干跑，只打印将要做什么
-    python3 scripts/release.py 0.2.1 --apply    # 真改并提交打 tag
+    python3 scripts/release.py 0.2.1 --apply    # 真改、提交、打 tag **并推送**
+    python3 scripts/release.py 0.2.1 --apply --no-push   # 同上但不推远端
 """
 
 from __future__ import annotations
@@ -219,6 +220,8 @@ def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description="发布新版本")
     ap.add_argument("version", help="语义化版本号，如 0.2.1")
     ap.add_argument("--apply", action="store_true", help="真的改文件并提交/打 tag")
+    ap.add_argument("--no-push", action="store_true", dest="no_push",
+                    help="只在本地提交并打 tag，不推送（默认会推）")
     args = ap.parse_args(argv)
 
     new = args.version
@@ -296,7 +299,39 @@ def main(argv: list[str]) -> int:
         _log(f"修好原因后执行：git tag -a {tag} -m {tag}", file=sys.stderr)
         raise
 
-    print(f"\n已提交并打 tag {tag}。别忘了 push（含 tag）：git push && git push --tags")
+    # ---- 阶段四：推送 ----
+    #
+    # **默认就推**，不再只印一句"别忘了 push --tags"。
+    #
+    # 为什么：tag 只存在本地时，CI 的版本门禁必红。v0.2.141 / 142 / 144 / 147
+    # 四次 main 变红**全是这个原因** —— tag 早就在本地打好了，只是 push 没带
+    # `--tags`。而 CI 报的是「没有 tag」，和真相之间差一整轮排查。
+    # 靠人记得的事，迟早会漏；四次已经足够说明"记得住"这条路不通。
+    #
+    # 用 `HEAD` 而不是分支名：查分支名要额外跑 `rev-parse`，而它在各种
+    # 测试桩/非常规状态下都可能失败，把一条简单的推送变成新的失败点。
+    if args.no_push:
+        print(f"\n已提交并打 tag {tag}（`--no-push`：**未推送**）。")
+        print(f"⚠️  不推送的话 CI 的版本门禁会红。上线还需：")
+        print(f"      git push origin HEAD")
+        print(f"      git push origin {tag}")
+        return 0
+
+    try:
+        _git("push", "origin", "HEAD")
+        _git("push", "origin", tag)
+    except ReleaseError as e:
+        # commit 与 tag 都已在本地生成 —— 状态是完好的，**不要重置**。
+        # 这里只补上"接下来该做什么"，而不是抛 traceback。
+        print(f"\n⚠️  commit 与 tag 已在**本地**生成，但推送失败：{e}", file=sys.stderr)
+        print("    本地状态是完好的（别 reset、别重跑）。修好网络/权限后补推：",
+              file=sys.stderr)
+        print("      git push origin HEAD", file=sys.stderr)
+        print(f"      git push origin {tag}", file=sys.stderr)
+        print("    ⚠️  只推了 commit 没推 tag，版本门禁同样会红。", file=sys.stderr)
+        return 1
+
+    print(f"\n已提交、打 tag 并推送 {tag}。")
     return 0
 
 

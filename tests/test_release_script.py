@@ -296,3 +296,75 @@ def test_commit_failure_leaves_no_staged_residue(release_sandbox):
     calls = log.read_text(encoding="utf-8").splitlines()
     assert any(c.startswith("git reset") for c in calls), (
         f"commit 失败后没有撤销 `git add` 的暂存，会留下 index/工作区版本不一致：{calls}")
+
+
+# ---------------------------------------------------------------------------
+# 推送（2026-11-27）：默认就该推 —— "别忘了 push --tags" 四次都没记住
+# ---------------------------------------------------------------------------
+
+def test_apply_pushes_commit_and_tag(release_sandbox):
+    """发版成功后**必须把 commit 和 tag 都推到远端**。
+
+    背景：`v0.2.141/142/144/147` 四次 main CI 变红，全是「tag 打了没推」。
+    脚本原来只做到本地 tag，最后印一句「别忘了 push --tags」——
+    靠人记得的事，四次足以证明记不住。CI 那边报的是「没有 tag」，
+    和真相之间差一整轮排查。
+
+    判据落在**行为**上：git 调用序列里必须出现这两个 push，
+    而不是"源码里有 push 这俩字"。
+    """
+    sandbox, fake, log = release_sandbox
+    out = _run("0.3.0", "--apply", cwd=sandbox,
+               env={"PATH": f"{fake}:{_real_path()}", "FAKE_GIT_LOG": str(log)})
+    assert out.returncode == 0, f"发版失败：{out.stdout}{out.stderr}"
+    calls = log.read_text(encoding="utf-8")
+    assert "git push origin HEAD" in calls, \
+        f"没有推送发版提交：\n{calls}"
+    assert "git push origin v0.3.0" in calls, \
+        f"没有推送 tag（这正是 CI 变红的原因）：\n{calls}"
+    # **顺序**：先推 commit 再推 tag。反过来的话 tag 可能指向远端不存在的提交，
+    # 远端会拒收，而错误信息是 "cannot update ref"，与发布八竿子打不着。
+    assert calls.index("push origin HEAD") < calls.index("push origin v0.3.0"), \
+        f"推送顺序错了（tag 必须后推）：\n{calls}"
+
+
+def test_no_push_skips_push_and_says_ci_will_be_red(release_sandbox):
+    """`--no-push` 要真的不推，并且**明确说清**不推的后果。"""
+    sandbox, fake, log = release_sandbox
+    out = _run("0.3.0", "--apply", "--no-push", cwd=sandbox,
+               env={"PATH": f"{fake}:{_real_path()}", "FAKE_GIT_LOG": str(log)})
+    assert out.returncode == 0, f"{out.stdout}{out.stderr}"
+    calls = log.read_text(encoding="utf-8")
+    assert "push" not in calls, f"--no-push 却仍然推送了：\n{calls}"
+    # 本地该做的还是要做完
+    assert "git commit" in calls and "git tag" in calls, f"本地步骤缺失：\n{calls}"
+    text = out.stdout + out.stderr
+    assert "未推送" in text, "没告诉用户这次没有推送"
+    assert "git push origin v0.3.0" in text, "没给补推命令"
+    assert "红" in text, "没提醒不推送会让 CI 变红"
+
+
+def test_push_failure_keeps_local_state_and_gives_next_step(release_sandbox):
+    """推送失败时**不能回滚**本地 commit/tag，要说清补推命令。
+
+    commit 与 tag 已经成立，回滚只会制造"提交说新版、远端还是旧版"的错位，
+    而且 tag 一旦删掉再打，时间戳就变了。正确处理：保留，告知补推。
+    """
+    sandbox, fake, log = release_sandbox
+    (fake / "git").write_text(
+        '#!/bin/sh\n' + SKIP_GLOBAL_OPTS +
+        'if [ "$1" = "rev-parse" ]; then exit 1; fi\n'
+        'if [ "$1" = "push" ]; then echo "fatal: 网络不可达" >&2; exit 1; fi\n'
+        'echo "git $@" >> "$FAKE_GIT_LOG"; exit 0\n', encoding="utf-8")
+    (fake / "git").chmod(0o755)
+    out = _run("0.3.0", "--apply", cwd=sandbox,
+               env={"PATH": f"{fake}:{_real_path()}", "FAKE_GIT_LOG": str(log)})
+    assert out.returncode != 0, "推送失败却返回成功"
+    text = out.stdout + out.stderr
+    assert "本地" in text and "补推" in text, f"没说清本地状态与下一步：\n{text}"
+    assert "git push origin v0.3.0" in text, f"没给 tag 的补推命令：\n{text}"
+    # 本地状态必须完好：版本已是新的，tag 步骤也执行过
+    assert 'VERSION = "0.3.0"' in (sandbox / "core" / "version.py").read_text(encoding="utf-8"), \
+        "推送失败后把已提交的新版本回滚了"
+    calls = log.read_text(encoding="utf-8")
+    assert "git tag" in calls, f"推送失败后 tag 也没了：\n{calls}"

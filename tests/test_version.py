@@ -123,6 +123,20 @@ def test_changelog_unreleased_section_exists():
         "CHANGELOG.md 缺少 `## [Unreleased]` 小节"
 
 
+#: tag 缺失时的排查提示。CI 只能看到**远端** tag，所以"没推"和"没打"
+#: 在它眼里长得一样 —— 而前者发生过四次（v0.2.141/142/144/147），每次都要
+#: 人或 agent 从头查一遍 CHANGELOG 才发现 tag 其实在本地躺着。
+#: 把这条判断写进报错里，下一次不用再想一遍。
+_TAG_MISSING_HINT = (
+    "\n\n"
+    "⚠️ CI 看到的是**远端**的 tag。先分清是哪一种：\n"
+    "  · 本地 `git tag -l v{VERSION}` 能看到 → **打了但没推**，"
+    "补推即可：`git push origin v{VERSION}`（或 `git push --tags`）；\n"
+    "  · 本地也没有 → 真的忘了打："
+    "`git tag -a v{VERSION} -m v{VERSION}` 再推。"
+)
+
+
 def test_git_tag_exists_for_current_version():
     """当前版本必须有对应的 git tag `v{VERSION}`。
 
@@ -133,7 +147,8 @@ def test_git_tag_exists_for_current_version():
     tags = _tags()
     assert f"v{VERSION}" in tags, (
         f"没有 tag `v{VERSION}`（现有：{sorted(tags) or '无'}）。"
-        "发布必须同时打 tag，否则回滚没有落点。")
+        "发布必须同时打 tag，否则回滚没有落点。"
+        + _TAG_MISSING_HINT.format(VERSION=VERSION))
 
 
 def test_every_changelog_version_has_a_tag():
@@ -155,4 +170,6 @@ def test_every_changelog_version_has_a_tag():
     tags = _tags()
     missing = [v for v in relevant if f"v{v}" not in tags]
     assert not missing, (
-        f"CHANGELOG 记了 {missing}，但没有对应 tag。现有 tag：{sorted(tags) or '无'}。")
+        f"CHANGELOG 记了 {missing}，但没有对应 tag。"
+        f"现有 tag：{sorted(tags) or '无'}。"
+        + _TAG_MISSING_HINT.format(VERSION=missing[0]))

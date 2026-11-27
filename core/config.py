@@ -228,6 +228,7 @@ _REQUIRED_AGENT = {
     "context": {"max_chars": None, "sector_events": None, "own_history": None},
     # `context.own_history_trim` 已移除（v0.2.105）：全仓无读取点，也无明确语义
     "channel_b_daily_cap": None,
+    # `budget_pace` 三键同样**故意不列进必填清单**（agent.yaml 是站点保留文件）。
     # **`channel_b_critical_extra` / `agent_note_min_gap_s` 故意不列在这里**：
     # `config/agent.yaml` 是站点保留文件（PRESERVE_ON_TARGET），旧站点没有这两个键，
     # 而 `load_config()` 对必填键缺失是**直接抛 ConfigError** 的——列进来等于
@@ -282,6 +283,8 @@ _EMPTY_AGENT = {
     "heartbeat_turn": {"rounds": 6, "deadline_s": 0},
     "context": {"max_chars": 6000, "sector_events": 8, "own_history": 10},
     "channel_b_daily_cap": 15,
+    # 预算配速：心跳让路、事件优先（见 agent/main.py::_paced_out）
+    "budget_pace": {"enabled": True, "tolerance": 0.15, "floor": 0.35},
     # 极端行情可突破日上限的**额外**条数（见 agent/push.py::agent_note）
     "channel_b_critical_extra": 3,
     # 两条普通便签之间的最小间隔（秒）；0 = 不限制

@@ -95,6 +95,33 @@ def shadow_enabled(cfg) -> bool:
     return getattr(attention, "shadow_mode", True) is not False
 
 
+#: 预算配速的默认值。**必须与 `core/config.py::_EMPTY_AGENT` 一致**：
+#: `agent.yaml` 是站点保留文件，旧站点没有这个键，读取方用 getattr 兜底。
+PACE_TOLERANCE_DEFAULT = 0.15
+#: 开盘后的"免配速"地板：刚开盘允许先把开场的事情做完，不能因为它还没花时间就禁言。
+PACE_FLOOR_DEFAULT = 0.35
+
+#: 交易时段（分钟数合计 260）：09:15–11:30 与 13:00–15:05。
+_SESSIONS = ((9 * 60 + 15, 11 * 60 + 30), (13 * 60, 15 * 60 + 5))
+
+
+def session_elapsed_fraction(now) -> float:
+    """交易时段已过去的比例（0~1）。
+
+    **只看这两段窗口**：盘前算 0、盘后算 1。用 `now` 的上海时区时刻，
+    不依赖 `clock.today()`，所以纯函数、易测。
+    """
+    hm = now.hour * 60 + now.minute
+    total = sum(b - a for a, b in _SESSIONS)
+    done = 0
+    for start, end in _SESSIONS:
+        if hm >= end:
+            done += end - start
+        elif hm > start:
+            done += hm - start
+    return max(0.0, min(1.0, done / total))
+
+
 def heartbeat_service() -> str:
     """心跳服务名：`HEARTBEAT_SERVICE` 覆盖，缺省 `agent`（RUNBOOK §11 演练用）。"""
     return (os.environ.get("HEARTBEAT_SERVICE") or "").strip() or HEARTBEAT_SERVICE_DEFAULT
@@ -458,6 +485,83 @@ class AgentMain:
             return True
         return self._budget_unavailable()
 
+    def _record_paced_skip(self, now) -> None:
+        """记一行「心跳因预算配速让路」——**不调模型**，只落库。
+
+        必须留痕：否则"今天心跳变少了"没有任何依据可查，运维会以为是卡死。
+        计数写 `job_state: agent.paced_skip.<day>`，明细写 `agent_turn`。
+        """
+        day = self.clock.today()
+        try:
+            with self.deps.conn:
+                self.deps.conn.execute(
+                    "INSERT INTO agent_turn(ts, wake_kind, context_digest, rounds, decision,"
+                    " why, fallback, market) VALUES (?,?,?,?,?,?,?,?)",
+                    (now.isoformat(), "heartbeat", "预算配速：心跳让路", 0, "silent",
+                     f"预算已用 {self._pace_used():.0%}，超过时间进度", 0, "cn_main"))
+                self.deps.conn.execute(
+                    "INSERT INTO job_state(name, value) VALUES (?, '1')"
+                    " ON CONFLICT(name) DO UPDATE SET"
+                    " value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
+                    (f"agent.paced_skip.{day}",))
+        except Exception:                              # noqa: BLE001
+            logging.getLogger("agent").warning("记录预算配速跳过失败", exc_info=True)
+
+    def _pace_config(self) -> tuple[bool, float, float]:
+        """读配速配置：`(enabled, tolerance, floor)`，缺键时用默认值。
+
+        `agent.yaml` 是**站点保留文件**，旧站点没有 `budget_pace` 段，
+        所以不能用必填键，只能 getattr 兜底。
+        """
+        pace = getattr(getattr(self.deps.cfg, "agent", None), "budget_pace", None)
+        if pace is None:
+            return True, PACE_TOLERANCE_DEFAULT, PACE_FLOOR_DEFAULT
+        enabled = bool(getattr(pace, "enabled", True))
+        try:
+            tol = float(getattr(pace, "tolerance", PACE_TOLERANCE_DEFAULT))
+            floor = float(getattr(pace, "floor", PACE_FLOOR_DEFAULT))
+        except (TypeError, ValueError):
+            return enabled, PACE_TOLERANCE_DEFAULT, PACE_FLOOR_DEFAULT
+        return enabled, tol, floor
+
+    def _pace_used(self) -> float:
+        """当天 agent 预算已用比例（输入/输出两维取**较大**者）。
+
+        取较大者而不是平均：任一维打满都会让 `deduct()` 直接失败，
+        平均会把"输出先爆"的情况抹平。
+        """
+        try:
+            budget = self.deps.budget
+            used_in, used_out = budget._used()          # noqa: SLF001 —— 同包内部读
+            limit_in = max(1, int(budget.limit_in))
+            limit_out = max(1, int(budget.limit_out))
+        except Exception:                               # noqa: BLE001
+            return 0.0                                  # 读不到就别拦
+        return max(used_in / limit_in, used_out / limit_out)
+
+    def _paced_out(self, now) -> bool:
+        """**预算是否明显超前于时间进度** → 心跳回合该让路。
+
+        起因（2026-11-27 实测）：`budget.agent: [5500000, 700000]` 只够约 400 次模型
+        调用，而 agent 每小时想做 180+ 次。结果是**每天 10 点左右就把预算烧光**，
+        之后全天闭嘴：
+
+            11-26 首次「预算已用完」10:07     11-25 最后成功回合 10:08
+            11-24 10:47                      11-23 10:09      11-20 09:53
+
+        也就是说"下午最猛的行情收不到"，主因不是通道上限，是**agent 上午就死了**。
+
+        配速不是"少花钱"，是**把同一份额度摊到全天**：上午闲聊把额度用完、
+        下午真出事时哑火，是这笔预算最差的用法。
+
+        **只拦心跳**：事件回合（真行情）永远放行——让路让的是心跳。
+        """
+        enabled, tol, floor = self._pace_config()
+        if not enabled:
+            return False
+        allowed = max(session_elapsed_fraction(now), floor) + tol
+        return self._pace_used() > allowed
+
     def heartbeat_housekeeping(self):
         conn = self.deps.conn
         now = self.clock.now()
@@ -697,7 +801,11 @@ class AgentMain:
                 # **心跳回合同样要门控**（第五轮评审 M2）：latch 之后心跳照跑，
                 # 每次在预检里立刻失败、写一行 `rounds=0, latency_ms=0`。
                 # 按 5 分钟节奏，额度尾巴的两个小时能写 20 行。
-                if not self.budget_exhausted:
+                if not self.budget_exhausted and self._paced_out(now) and not retry:
+                    # **心跳让路**：额度花得比时间进度快时，上午的心跳不再消耗预算，
+                    # 把额度留给下午的真行情。有 `retry` 事件时照跑（那是事件级）。
+                    self._record_paced_skip(now)
+                elif not self.budget_exhausted:
                     await self._run(self._trigger("heartbeat", events=retry,
                                                   rounds=self.other_rounds,
                                                   deadline=self.other_deadline))

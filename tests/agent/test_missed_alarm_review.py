@@ -188,3 +188,36 @@ def test_most_asked_stock_wins_a_slot(conn):
         "盟科药业是否推近上沿", "乐普医疗量比", "中粮资本上沿"]
     codes = review.named_codes(conn, notes, limit=2)
     assert codes[0] == "sz300287", f"最常被问的票没排第一：{codes}"
+
+
+def test_answered_alarms_are_closed_immediately(conn):
+    """补答后**立刻关掉闹钟**，别让它挂到下周被静默作废。
+
+    不关的话：用户明明已经收到这 19 条的答案，库里却记成"过期取消"（
+    `sweep_stale_alarms` 按日期作废），对不上账。
+    """
+    with conn:
+        conn.execute("INSERT INTO agent_schedule(due_at, market, status, note, created_at)"
+                     " VALUES ('2026-11-27T14:32:13','cn_main','pending','看飞利信','x')")
+    pushed = []
+    _boss(conn, pushed)._answer_missed_alarms(
+        datetime(2026, 11, 27, 15, 30, tzinfo=SH), 20261127)
+    row = conn.execute("SELECT status, cancelled_reason FROM agent_schedule").fetchone()
+    assert row[0] == "cancelled", "闹钟没关门"
+    assert row[1] == "已用收盘数据补答", f"原因不明确：{row[1]}"
+
+
+def test_other_days_alarms_are_not_touched(conn):
+    """只关当天的，别把别的交易日的 pending 误伤。"""
+    with conn:
+        conn.execute("INSERT INTO agent_schedule(due_at, market, status, note, created_at)"
+                     " VALUES ('2026-11-30T10:00:00','cn_main','pending','下周一要问的','x')")
+        conn.execute("INSERT INTO agent_schedule(due_at, market, status, note, created_at)"
+                     " VALUES ('2026-11-27T14:32:13','cn_main','pending','看飞利信','x')")
+    pushed = []
+    _boss(conn, pushed)._answer_missed_alarms(
+        datetime(2026, 11, 27, 15, 30, tzinfo=SH), 20261127)
+    left = [tuple(r) for r in conn.execute(
+        "SELECT substr(due_at,1,10), status FROM agent_schedule"
+        " WHERE status = 'pending'").fetchall()]
+    assert left == [("2026-11-30", "pending")], f"误伤了别的交易日：{left}"

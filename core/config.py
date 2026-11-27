@@ -271,11 +271,9 @@ def _paths(template: dict, prefix: tuple[str, ...] = ()) -> list[tuple[str, ...]
     return out
 
 
-REQUIRED_KEYS: list[tuple[str, ...]] = (
-    _paths(_REQUIRED_STRATEGY) + _paths(_REQUIRED_MARKETS) + _paths(_REQUIRED_NOTIFY)
-    + [("agent",) + rest for rest in _paths(_REQUIRED_AGENT)]
-    + [("llm",) + rest for rest in _paths(_REQUIRED_LLM)]
-)
+# `REQUIRED_KEYS` 已删除（v0.2.160）：它是所有必填键的合集，但 `load_config()`
+# 早在内部逐文件校验（strategy/markets/notify 用 `_paths(...)`，agent/llm 另走
+# 一个循环），**全仓零引用**。留着只会让人误以为有一条统一的契约入口。
 
 _EMPTY_AGENT = {
     "heartbeat": {"base_min": 5, "tight_min": 2, "max_min": 10, "tight": [], "relaxed": []},

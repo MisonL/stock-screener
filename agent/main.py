@@ -669,7 +669,15 @@ class AgentMain:
             body=f"今日有 {len(rows)} 条回访没跑成（额度用尽）。{body}")
         pusher.agent_note(decision, None, None, None,
                           exempt_from_total_cap=True, critical=True)
+        # **补答后立刻关掉这些闹钟**（v0.2.160）：不关的话它们会一直挂到下一个
+        # 交易日，被 `sweep_stale_alarms()` 按日期静默作废——用户明明已经收到
+        # 这 19 条的答案，库里却记成"过期取消"，对不上账。
+        # `cancelled_reason` 写明是"已补答"，日志页能直接看到。
         with conn:
+            conn.execute(
+                "UPDATE agent_schedule SET status = 'cancelled', cancelled_reason = ?"
+                " WHERE substr(due_at, 1, 10) = ? AND status = 'pending'",
+                ("已用收盘数据补答", now.date().isoformat()))
             conn.execute("INSERT OR REPLACE INTO job_state(name, value) VALUES (?, '1')",
                          (key,))
 

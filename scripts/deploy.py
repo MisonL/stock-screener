@@ -696,6 +696,11 @@ DEPLOY_BLOCK_WINDOWS = (
 #: 而远端可能**已经持着锁**，把别人也一起挡住。
 LOCK_RESULT_TIMEOUT_S = 30
 
+#: 持锁期间向远端发心跳的间隔。远端 `read -t 180`，本地 60 秒续一次：
+#: 正常部署不会被误判超时，而本地机器真失联时远端最多 3 分钟就自己
+#: 退出并把锁还给内核（否则锁会一直被那条半死的会话占着）。
+LOCK_HEARTBEAT_S = 60
+
 #: 远端噪声音符（ANSI 转义）。`~/.ssh/rc`、包装脚本的欢迎语都是写进会话
 #: **stdout** 的，会出现在我们的判定行之前。
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
@@ -755,8 +760,13 @@ def _acquire_deploy_lock(host: str, lock_path: str):
         'exec 9>"$1" || { echo SS_LOCK=NOFILE; exit 0; }',
         "flock -n 9 || { echo SS_LOCK=BUSY; exit 0; }",
         "echo SS_LOCK=GOT",
-        # **持锁**：阻塞读 stdin，直到本地关闭（或在 finally 里 kill）。
-        "while IFS= read -r _line; do :; done",
+        # **持锁**：读 stdin 直到本地关闭（或在 finally 里 kill）。
+        # `-t 180` + 本地心跳=60s：万一本地机器失联（网络分区、休眠）而
+        # 服务端迟迟收不到 FIN，远端的 `read` 会一直阻塞、**锁就一直不释放**。
+        # 加了超时后远端最多 3 分钟就自己退出、内核释放锁。
+        # 正常情况下本地每 60 秒发一个空行续期，所以不会误释放。
+        "while IFS= read -r -t 180 _line; do :; done",
+        "exit 0",
     ])
     argv = [
         "ssh", "-T",
@@ -780,32 +790,50 @@ def _acquire_deploy_lock(host: str, lock_path: str):
     deadline = time.monotonic() + LOCK_RESULT_TIMEOUT_S
     noise = []
     reason = ""
+    # **必须按字节读**（Codex 第三轮指出）：`select` 只保证"有数据可读"，
+    # 不保证"有一个完整行"。远端如果只送来半行（被切断、或包装脚本输出到一半），
+    # `readline()` 会在 `select` 已经返回之后继续死等换行——**30 秒超时形同虚设**，
+    # 而这段代码是拿锁/清锁路径，卡住就等于锁被永久占住。
+    buf = b""
+    fd = proc.stdout.fileno() if hasattr(proc.stdout, "fileno") else None
     while time.monotonic() < deadline:
+        if fd is None:
+            break
         try:
-            ready, _, _ = select.select([proc.stdout], [], [], 1.0)
+            ready, _, _ = select.select([fd], [], [], 1.0)
         except (OSError, ValueError):
             break
         if not ready:
             if proc.poll() is not None:      # 进程已退出，不会有更多输出
                 break
             continue
-        raw = proc.stdout.readline()
-        if not raw:                          # EOF
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:
             break
-        line = _clean_remote_line(raw)
-        if line == "SS_LOCK=GOT":
-            if noise:
-                print("提示：远端在锁结果之前输出了杂行（已忽略）："
-                      + repr(noise[:3]))
-            return proc
-        if line == "SS_LOCK=BUSY":
-            reason = "另一个部署正在进行"
+        if not chunk:                        # EOF
             break
-        if line == "SS_LOCK=NOFILE":
-            reason = f"锁文件所在目录不可创建/不可写：{lock_path}"
-            break
-        if line:
-            noise.append(line[:120])
+        buf += chunk
+        while b"\n" in buf:
+            raw, buf = buf.split(b"\n", 1)
+            line = _clean_remote_line(raw.decode("utf-8", "replace"))
+            if line == "SS_LOCK=GOT":
+                if noise:
+                    print("提示：远端在锁结果之前输出了杂行（已忽略）："
+                          + repr(noise[:3]))
+                _start_lock_heartbeat(proc)
+                return proc
+            if line == "SS_LOCK=BUSY":
+                reason = "另一个部署正在进行"
+                break
+            if line == "SS_LOCK=NOFILE":
+                reason = f"锁文件所在目录不可创建/不可写：{lock_path}"
+                break
+            if line:
+                noise.append(line[:120])
+        else:
+            continue                          # 没有凑齐一行，继续读
+        break                                 # 命中了 BUSY/NOFILE 分支
 
     _shutdown_lock_proc(proc)
     if not reason:
@@ -816,10 +844,45 @@ def _acquire_deploy_lock(host: str, lock_path: str):
     return None
 
 
+def _start_lock_heartbeat(proc) -> None:
+    """每 `LOCK_HEARTBEAT_S` 秒往持锁连接写一个空行。
+
+    远端用的是 `read -t 180`：**没有心跳时，一次超过 3 分钟的部署就会被远端
+    自己判超时并释放锁**，而本地还在构建——正好又是"两个部署能并行"。
+    心跳同时也让这条几乎不发数据的连接不至于被 NAT 判成空闲。
+
+    写失败（连接已断）就静默退出：`_lock_lost()` 会负责发现并中止。
+    """
+    import threading
+
+    stop = threading.Event()
+
+    def beat() -> None:
+        while not stop.wait(LOCK_HEARTBEAT_S):
+            try:
+                if proc.stdin is None or proc.stdin.closed:
+                    return
+                proc.stdin.write("\n")
+                proc.stdin.flush()
+            except (OSError, ValueError):
+                return
+
+    threading.Thread(target=beat, name="deploy-lock-heartbeat",
+                     daemon=True).start()
+    try:
+        proc._hb_stop = stop
+    except AttributeError:
+        pass
+
+
 def _shutdown_lock_proc(proc) -> None:
     """关掉持锁的 ssh：远端读到 EOF 就退出，锁随之释放。"""
     if proc is None:
         return
+    # 先停心跳：否则它可能在 stdin 关闭后继续写，抛错污染日志
+    stop = getattr(proc, "_hb_stop", None)
+    if stop is not None:
+        stop.set()
     try:
         if proc.stdin is not None and not proc.stdin.closed:
             proc.stdin.close()

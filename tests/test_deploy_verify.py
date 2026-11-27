@@ -1737,3 +1737,110 @@ def test_lock_end_to_end_against_a_real_flock(monkeypatch):
     p3.stdin.close()
     p3.wait(timeout=10)
     os.unlink(lock)
+
+
+def test_lock_remote_read_has_a_timeout_backed_by_a_heartbeat(monkeypatch):
+    """**远端 `read` 必须有超时，本地必须有心跳。**
+
+    Codex 第三轮指出：本地机器失联（网络分区、休眠）时，服务端可能迟迟收不到
+    FIN，远端 `read` 会一直阻塞——**锁就永远不释放**。
+
+    但只加超时更糟：一次超过超时的正常部署会**被远端自己释放锁**，本地还在
+    构建，正好又变成"两个部署能并行"。所以超时必须由心跳续期。
+    """
+    captured = {}
+
+    class Fake:
+        def __init__(self, *a, **kw):
+            captured["argv"] = a[0]
+            self.stdin = __import__("io").StringIO()
+            self.stdout = _stdout_pipe(["SS_LOCK=GOT\n"])
+            self.stderr = None
+        def poll(self):
+            return None
+        def wait(self, timeout=None):
+            return 0
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(deploy.subprocess, "Popen", Fake)
+    h = deploy._acquire_deploy_lock("h", "/l")
+    assert h is not None
+    script = " ".join(captured["argv"])
+    assert "read -r -t" in script, f"远端 read 没有超时，失联时锁永不释放：{script}"
+    # 超时必须**明显大于**心跳间隔，否则正常部署会被误判超时
+    assert deploy.LOCK_HEARTBEAT_S * 2 <= 180, (
+        f"心跳 {deploy.LOCK_HEARTBEAT_S}s 相对远端 180s 超时太接近，容易误释放")
+
+
+def test_lock_heartbeat_actually_writes_keepalive(monkeypatch):
+    """心跳要真的往持锁连接写东西，否则远端 180 秒就自己释放锁。"""
+    import io
+    import time as _t
+
+    class Proc:
+        def __init__(self):
+            self.stdin = io.StringIO()
+
+    monkeypatch.setattr(deploy, "LOCK_HEARTBEAT_S", 0.05)
+    p = Proc()
+    deploy._start_lock_heartbeat(p)
+    assert getattr(p, "_hb_stop", None) is not None, "启动心跳没留下停止句柄"
+    _t.sleep(0.2)
+    deploy._shutdown_lock_proc(p) if hasattr(p, "wait") else None
+    assert p.stdin.getvalue().count("\n") >= 1, "心跳没有写出任何东西"
+
+
+def test_lock_survives_a_partial_line_instead_of_hanging(monkeypatch):
+    """**只收到半行时不能死等换行**（Codex 第三轮指出）。
+
+    `select` 只保证"有数据可读"，不保证"有一个完整行"。远端只送来
+    `SS_LOCK=GO`（没有换行）时，`readline()` 会在 `select` 返回之后继续阻塞，
+    **30 秒超时形同虚设**——而这是拿锁路径，卡住等于锁被永久占住。
+    """
+    class Partial:
+        def __init__(self, *a, **kw):
+            self.stdin = __import__("io").StringIO()
+            self.stdout = _stdout_pipe(["SS_LOCK=GO"])     # 没有换行
+            self.stderr = None
+        def poll(self):
+            return None
+        def wait(self, timeout=None):
+            return 0
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(deploy.subprocess, "Popen", Partial)
+    monkeypatch.setattr(deploy, "LOCK_RESULT_TIMEOUT_S", 1)
+    started = __import__("time").monotonic()
+    assert deploy._acquire_deploy_lock("h", "/l") is None
+    elapsed = __import__("time").monotonic() - started
+    assert elapsed < 5, f"半行把拿锁卡住了 {elapsed:.1f} 秒"
+
+
+def test_acquiring_the_lock_actually_starts_the_heartbeat(monkeypatch):
+    """**拿锁时必须真的把心跳启动起来。**
+
+    单独测 `_start_lock_heartbeat()` 只能证明"这个函数写对了"，证明不了
+    "它被调用了"。而漏掉这个调用时，远端 `read -t 180` 会在**每次超过 3 分钟
+    的部署**里自己释放锁——本地还在构建，正好又是两个部署并行。
+    变异验证：删掉 `_acquire_deploy_lock` 里那一行调用，本用例会红。
+    """
+    class Fake:
+        def __init__(self, *a, **kw):
+            self.stdin = __import__("io").StringIO()
+            self.stdout = _stdout_pipe(["SS_LOCK=GOT\n"])
+            self.stderr = None
+        def poll(self):
+            return None
+        def wait(self, timeout=None):
+            return 0
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(deploy.subprocess, "Popen", Fake)
+    h = deploy._acquire_deploy_lock("h", "/l")
+    assert h is not None
+    assert getattr(h, "_hb_stop", None) is not None, \
+        "拿到锁了但没启动心跳，远端 180 秒后会自己释放锁"
+    deploy._shutdown_lock_proc(h)

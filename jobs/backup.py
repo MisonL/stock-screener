@@ -38,7 +38,17 @@ class BackupBusy(RuntimeError):
     """
 
 
-def backup_db(conn, data_dir: Path, keep: int =7, clock=None) -> Path | None:
+#: 保留几份归档备份。原来 7 份 × 1.3 GB ≈ 9.1 GB，是**本项目在磁盘上最大的一块**
+#: （81.4 上 98G 盘用到 83%，其中镜像/构建缓存属于同机的其它项目，动不得）。
+#: 5 份 = 6.5 GB，仍覆盖一周的业务日，足够"发现某天数据坏了再回退"。
+#:
+#: 为什么不压 gzip：恢复手册（RUNBOOK §7.5）是 `cp market-YYYYMMDD.db market.db`，
+#: 压缩要把备份写入、轮换计数、断档检查（glob `market-*.db`）和恢复流程一起改——
+#: 这是**数据安全的最后一道防线**，为一个还没到紧张的磁盘水位不值得。
+BACKUP_KEEP = 5
+
+
+def backup_db(conn, data_dir: Path, keep: int = BACKUP_KEEP, clock=None) -> Path | None:
     """备份到 `data_dir/backups/market-YYYYMMDD.db`；校验失败返回 `None`并发 P0。
 
     **同名 tmp +跨进程互斥**（Codex复核）：临时文件名由日期决定，两个备份
@@ -203,7 +213,7 @@ def _prune(out_dir: Path, keep: int) -> None:
         log.warning("清理旧备份时出错（备份本身已成功）：%s", e)
 
 
-def catch_up_missed_backup(conn, data_dir, clock, *, keep: int =7,
+def catch_up_missed_backup(conn, data_dir, clock, *, keep: int = BACKUP_KEEP,
                            stale_h: int =29) -> Path | None:
     """启动时补一次**错过了的**每日备份；不需要补就返回 `None`。
 
